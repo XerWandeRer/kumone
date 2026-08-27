@@ -124,6 +124,8 @@ final class Console: @unchecked Sendable {
             "styles": Audition.StyleOverride.allCases.map(\.rawValue),
             "stems": Audition.StemOverride.names,
             "duckDefaultDB": Audition.StemOverride.defaultDuckDepthDB,
+            "maxManualOverlap": Audition.PlanOverride.maxOverlap,
+            "minManualOverlap": Audition.PlanOverride.minOverlap,
             "configs": savedConfigNames(),
         ])
     }
@@ -137,10 +139,36 @@ final class Console: @unchecked Sendable {
         }
         do {
             let decision = try decide(outgoing: a, incoming: b, body: body)
-            return .json(try Audition.reportJSON(decision))
+            return .json(try withLyrics(Audition.reportJSON(decision),
+                                        outgoing: expand(a), incoming: expand(b)))
+        } catch let failure as Audition.PlanOverride.Failure {
+            // A rejected hand-written plan is a user mistake, not a server
+            // fault, and the page shows the message verbatim.
+            return .error(failure.errorDescription ?? "planOverride 不合法", status: 400)
         } catch {
             return .error(error.localizedDescription, status: 500)
         }
+    }
+
+    /// Staple the two tracks' timed lyrics onto an encoded decision report.
+    ///
+    /// They are not part of `DecisionReport` because nothing in the decision
+    /// turns on them — they exist so the page's AI bundle can quote what is
+    /// actually being sung on either side of the seam.
+    private func withLyrics(_ report: Data, outgoing: URL, incoming: URL) throws -> Data {
+        guard var object = try JSONSerialization.jsonObject(with: report) as? [String: Any]
+        else { return report }
+        func lines(_ url: URL) -> Any {
+            guard let all = Audition.Lyrics.load(for: url) else { return NSNull() }
+            return [
+                "count": all.count,
+                "head": Audition.Lyrics.head(all, count: 12).map { ["t": $0.time, "text": $0.text] },
+                "tail": Audition.Lyrics.tail(all, count: 12).map { ["t": $0.time, "text": $0.text] },
+            ] as [String: Any]
+        }
+        object["lyrics"] = ["outgoing": lines(outgoing), "incoming": lines(incoming)]
+        return try JSONSerialization.data(withJSONObject: object,
+                                          options: [.prettyPrinted, .sortedKeys])
     }
 
     private func decide(outgoing a: String, incoming b: String,
@@ -169,7 +197,28 @@ final class Console: @unchecked Sendable {
         return try Audition.decide(
             outgoing: expand(a), incoming: expand(b),
             style: style, fade: fade.flatMap { $0 > 0 ? $0 : nil }, stem: stem,
+            plan: try planOverride(body["planOverride"]),
             stems: stems, config: config)
+    }
+
+    /// `{"outPoint": 199.5, "inPoint": "0:02", "overlap": 12}` — every field
+    /// optional, each one either a number of seconds or an `mm:ss(.xx)` string.
+    /// An unparseable value is rejected rather than dropped: silently ignoring
+    /// half of a hand-written plan is worse than refusing it.
+    private func planOverride(_ raw: Any?) throws -> Audition.PlanOverride? {
+        guard let dict = raw as? [String: Any] else { return nil }
+        var override = Audition.PlanOverride()
+        for (key, path) in [("outPoint", \Audition.PlanOverride.outPoint),
+                            ("inPoint", \Audition.PlanOverride.inPoint),
+                            ("overlap", \Audition.PlanOverride.overlap)] {
+            guard let value = dict[key], !(value is NSNull) else { continue }
+            guard let seconds = Audition.PlanOverride.seconds(fromJSON: value) else {
+                throw Audition.PlanOverride.Failure.notANumber(field: key,
+                                                               given: String(describing: value))
+            }
+            override[keyPath: path] = seconds
+        }
+        return override.isEmpty ? nil : override
     }
 
     private func expand(_ path: String) -> URL {
@@ -186,6 +235,9 @@ final class Console: @unchecked Sendable {
         // thresholds land, and a stem pass per pair would cost minutes.
         var body = body
         body["stem"] = nil
+        // A plan override names one seam in one pair; it means nothing for the
+        // other pairs, so the sweep never sees it.
+        body["planOverride"] = nil
         let pairs = adjacentPairs
         guard !pairs.isEmpty else { return .error("corpus has fewer than two tracks") }
 
@@ -256,6 +308,8 @@ final class Console: @unchecked Sendable {
         let decision: Audition.Decision
         do {
             decision = try decide(outgoing: a, incoming: b, body: body)
+        } catch let failure as Audition.PlanOverride.Failure {
+            return .error(failure.errorDescription ?? "planOverride 不合法", status: 400)
         } catch {
             return .error(error.localizedDescription, status: 500)
         }
@@ -269,6 +323,9 @@ final class Console: @unchecked Sendable {
         hasher.combine(decision.styleDescription)
         hasher.combine(decision.overlapDuration)
         hasher.combine(decision.planKind)
+        // A moved seam is a different render even when nothing else changed.
+        hasher.combine(decision.outPoint ?? -1)
+        hasher.combine(decision.inPoint ?? -1)
         for (k, v) in decision.config.sorted(by: { $0.key < $1.key }) {
             hasher.combine(k); hasher.combine(v)
         }

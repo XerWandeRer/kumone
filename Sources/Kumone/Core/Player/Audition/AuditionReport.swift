@@ -100,6 +100,15 @@ extension Audition {
         public let intakeCapacity: TimeInterval?
         public let ceiling: TimeInterval?
         public let tierCap: TimeInterval
+        /// A hand-written plan override for this pair: which of the three
+        /// fields it named, and where the planner itself had landed — so the
+        /// console can draw "199.50 → 186.00" rather than just the result.
+        public let overrideFields: [String]
+        public let plannerOutPoint: TimeInterval?
+        public let plannerInPoint: TimeInterval?
+        public let plannerOverlap: TimeInterval?
+        /// The ceiling a hand-written overlap is held to.
+        public let maxManualOverlap: TimeInterval
     }
 
     public struct StyleReport: Encodable, Sendable {
@@ -524,6 +533,41 @@ extension Audition {
             detail: styleReport(d, config: c).reason,
             outcome: "→ \(d.styleDescription)",
             fired: true))
+        // 8. A hand-written hand-over geometry, if one was given. This is the
+        // one step that is not a rule at all — it is a person (or an AI) saying
+        // "on this pair, put the seam here" — so it is quoted as a diff.
+        if let po = d.planOverride {
+            func t(_ s: TimeInterval?) -> String {
+                guard let s else { return "—" }
+                return String(format: "%d:%05.2f", Int(s) / 60, s.truncatingRemainder(dividingBy: 60))
+            }
+            var moves: [String] = []
+            if po.outPoint != nil {
+                moves.append("出点 \(t(d.plannerOutPoint)) → \(t(d.outPoint))")
+            }
+            if po.inPoint != nil {
+                moves.append("入点 \(t(d.plannerInPoint)) → \(t(d.inPoint))")
+            }
+            if po.overlap != nil {
+                moves.append(String(format: "叠加 %.2f → %.2f 秒",
+                                    d.plannerOverlap, d.overlapDuration))
+            }
+            let kept = ["outPoint": "出点", "inPoint": "入点", "overlap": "叠加长度"]
+                .filter { !po.specifiedFields.contains($0.key) }
+                .map(\.value).sorted()
+            steps.append(ChainStep(
+                stage: "plan", title: "这一对的交接点是人工/AI 指定的",
+                rule: "planOverride 只作用于这一对：给出点、入点、叠加长度中的任意几项，"
+                    + "没给的沿用规划器算出来的值。"
+                    + String(format: "唯一的硬约束是两边都装得下，且叠加不超过 %.0f 秒。",
+                             PlanOverride.maxOverlap),
+                detail: moves.joined(separator: " · ")
+                    + (kept.isEmpty ? "" : "；\(kept.joined(separator: "、"))沿用规划器的值。"),
+                outcome: String(format: "→ 出点 %@ · 入点 %@ · 叠加 %.2f 秒（接法仍是 %@）。",
+                                t(d.outPoint), t(d.inPoint), d.overlapDuration, d.planKind),
+                fired: true))
+        }
+
         if d.overridden {
             steps.append(ChainStep(
                 stage: "style", title: "这一版是手动改过的",
@@ -652,7 +696,12 @@ extension Audition {
             kind: d.planKind, outPoint: d.outPoint, inPoint: d.inPoint,
             overlapDuration: d.overlapDuration, overlapBars: d.overlapBars,
             outgoingRate: d.outgoingRate, incomingRate: d.incomingRate,
-            tailCapacity: tail, intakeCapacity: intake, ceiling: ceiling, tierCap: tierCap)
+            tailCapacity: tail, intakeCapacity: intake, ceiling: ceiling, tierCap: tierCap,
+            overrideFields: d.planOverride?.specifiedFields ?? [],
+            plannerOutPoint: d.plannerOutPoint,
+            plannerInPoint: d.plannerInPoint,
+            plannerOverlap: d.plannerOverlap,
+            maxManualOverlap: PlanOverride.maxOverlap)
     }
 
     private static func styleReport(

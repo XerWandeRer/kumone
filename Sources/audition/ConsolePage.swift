@@ -75,6 +75,7 @@ button:disabled{opacity:.45;cursor:default}
   display:flex;justify-content:space-between;gap:.5rem}
 .tl h4 span{color:var(--dim);font-weight:400;font-size:.78rem}
 .tl svg{width:100%;height:auto;display:block;border-radius:8px;background:var(--panel2)}
+.tl svg.pick{cursor:crosshair}
 .ruler{position:relative;height:1.1rem;margin-top:.1rem;font-size:.65rem;color:var(--dim);
   overflow:hidden}
 .ruler .tick{position:absolute;top:0;transform:translateX(2px);white-space:nowrap}
@@ -178,6 +179,35 @@ audio{width:100%;margin:.4rem 0;height:38px}
     <div class="err" id="err"></div>
   </div>
 
+  <h2>这一对的交接点 <span class="muted" id="planOvState">跟着规划器走</span></h2>
+  <div class="card">
+    <p class="muted">上面的 35 个旋钮是全局的：一动，整个语料的每一对都跟着变。
+      如果你只是想给<b>这一对</b>换个交接点——比如让出曲的人声多唱完一句，
+      或让入曲从更早的纯伴奏前奏进来——在这里直接写死就行。
+      留空的那一项沿用规划器算出来的值。也可以直接在下面的时间轴上点一下：
+      点出曲设出点，点入曲设入点。</p>
+    <div class="row">
+      <div class="grow">
+        <label class="muted" for="ovOut">出点（出曲，秒或 mm:ss）</label>
+        <input type="text" id="ovOut" placeholder="规划器的值" inputmode="decimal">
+      </div>
+      <div class="grow">
+        <label class="muted" for="ovIn">入点（入曲，秒或 mm:ss）</label>
+        <input type="text" id="ovIn" placeholder="规划器的值" inputmode="decimal">
+      </div>
+      <div class="grow">
+        <label class="muted" for="ovLen">叠多久（秒）</label>
+        <input type="text" id="ovLen" placeholder="规划器的值" inputmode="decimal">
+      </div>
+    </div>
+    <div class="row" style="margin-top:.5rem">
+      <button id="ovApply" class="go">用这个交接点</button>
+      <button id="ovReset">回到规划器的选择</button>
+      <span class="muted" id="ovHint"></span>
+    </div>
+    <div class="err" id="ovErr" style="margin-top:.35rem"></div>
+  </div>
+
   <h2>两首歌长什么样</h2>
   <div id="timelines"></div>
   <p class="legend">
@@ -251,8 +281,10 @@ audio{width:100%;margin:.4rem 0;height:38px}
   <h2>让 AI 帮你调</h2>
   <div class="card">
     <p class="muted">把这一页现在看到的一切——系统怎么决策、每个参数各是什么意思和当前取值、
-      这一对歌的五项信号和判断过程、你改动过哪些参数——打包成一段纯文本，
-      贴给任意一个 AI 聊天窗口，它回一段 JSON，再贴回来就能应用。</p>
+      这一对歌的五项信号和判断过程、你改动过哪些参数，加上两首歌的逐 2 秒音量/人声曲线、
+      小节线、乐句起点和带时间戳的歌词——打包成一段纯文本，
+      贴给任意一个 AI 聊天窗口，它回一段 JSON，再贴回来就能应用。
+      它既可以改全局参数，也可以只给<b>这一对</b>指定出点、入点和叠加长度。</p>
     <div class="row">
       <button id="copyAI" class="go">复制给 AI</button>
       <span class="muted" id="copyInfo"></span>
@@ -294,6 +326,8 @@ const TIER_TEXT = {
   clash: "差异很大，快进快出",
 };
 const tierText = t => TIER_TEXT[t] || t;
+
+const OV_LABEL = {outPoint: "出点", inPoint: "入点", overlap: "叠加长度"};
 
 const fmt = (v, d = 2) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
 const mmss = t => (t === null || t === undefined) ? "—"
@@ -419,13 +453,144 @@ function paintDuck() {
 
 function requestBody() {
   const fade = parseFloat($("#fadeOv").value) || 0;
-  return {
+  const body = {
     outgoing: $("#outSel").value, incoming: $("#inSel").value,
     config: CONFIG, style: $("#styleSel").value, fade: fade,
     stem: $("#stemSel").value,
     stems: $("#stemsReady").checked,
     duckDB: -Math.abs(parseFloat($("#duckDB").value) || 9),
   };
+  const ov = {};
+  for (const k of ["outPoint", "inPoint", "overlap"]) {
+    if (PLAN_OV[k] !== null && PLAN_OV[k] !== undefined) ov[k] = PLAN_OV[k];
+  }
+  if (Object.keys(ov).length) body.planOverride = ov;
+  return body;
+}
+
+// ------------------------------------------------- plan-level override
+//
+// The 35 knobs are global; this is the one control that speaks about a single
+// seam. It rides the same request the sliders do, so a hand-placed out point
+// re-plans, re-explains and re-renders exactly like a knob move.
+
+let PLAN_OV = {outPoint: null, inPoint: null, overlap: null};
+
+/// `199.5`, `"199.5"`, `"3:19.5"`, `"1:03:19"` → seconds; null otherwise.
+/// Same grammar the server accepts, so the preview never promises something
+/// the server will refuse.
+function secondsFrom(raw) {
+  const text = String(raw).trim();
+  if (!text) return null;
+  if (!text.includes(":")) {
+    const v = Number(text);
+    return isFinite(v) && v >= 0 ? v : null;
+  }
+  const parts = text.split(":");
+  if (parts.length < 2 || parts.length > 3) return null;
+  let total = 0;
+  for (let i = 0; i < parts.length; i++) {
+    // `Number("")` is 0, not NaN — "3:" must not read as three minutes flat.
+    if (!parts[i].trim()) return null;
+    const v = Number(parts[i]);
+    if (!isFinite(v) || v < 0) return null;
+    if (i > 0 && v >= 60) return null;
+    total = total * 60 + v;
+  }
+  return total;
+}
+
+/// The rules the server enforces, mirrored so a bad number is refused before
+/// it costs a round trip. Returns an error string, or null when it is fine.
+function planOverrideError(ov) {
+  if (!REPORT) return null;
+  const outDur = REPORT.outgoing.duration, inDur = REPORT.incoming.duration;
+  const maxOv = BOOT.maxManualOverlap ?? 40, minOv = BOOT.minManualOverlap ?? 0.5;
+  const o = ov.outPoint ?? REPORT.plan.plannerOutPoint ?? REPORT.plan.outPoint;
+  const i = ov.inPoint ?? REPORT.plan.plannerInPoint ?? REPORT.plan.inPoint;
+  const d = ov.overlap ?? Math.max(REPORT.plan.plannerOverlap ?? 0, minOv);
+  if (o === null || o === undefined || i === null || i === undefined) return null;
+  if (o >= outDur) return `出点 ${mmss(o)} 超出了出曲的时长 ${mmss(outDur)}。`;
+  if (i >= inDur) return `入点 ${mmss(i)} 超出了入曲的时长 ${mmss(inDur)}。`;
+  if (d > maxOv) return `叠加 ${fmt(d)} 秒，超过 ${maxOv} 秒的上限。`;
+  if (d < minOv) return `叠加 ${fmt(d)} 秒，短于 ${minOv} 秒的下限。`;
+  if (outDur - o + 1e-6 < d)
+    return `出点 ${mmss(o)} 之后只剩 ${fmt(outDur - o)} 秒，放不下 ${fmt(d)} 秒的叠加。`;
+  if (inDur - i + 1e-6 < d)
+    return `入点 ${mmss(i)} 之后只剩 ${fmt(inDur - i)} 秒，放不下 ${fmt(d)} 秒的叠加。`;
+  return null;
+}
+
+/// Read the three boxes into `PLAN_OV`. Returns false (and paints the error)
+/// when something does not parse or does not fit.
+function readPlanOverride() {
+  const fields = [["#ovOut", "outPoint"], ["#ovIn", "inPoint"], ["#ovLen", "overlap"]];
+  const next = {outPoint: null, inPoint: null, overlap: null};
+  for (const [sel, key] of fields) {
+    const raw = $(sel).value.trim();
+    if (!raw) continue;
+    const v = secondsFrom(raw);
+    if (v === null) {
+      $("#ovErr").textContent = `「${raw}」看不懂：用秒（199.5）或 mm:ss（3:19.5）。`;
+      return false;
+    }
+    next[key] = v;
+  }
+  const err = planOverrideError(next);
+  if (err) { $("#ovErr").textContent = err; return false; }
+  $("#ovErr").textContent = "";
+  PLAN_OV = next;
+  return true;
+}
+
+function paintPlanOverride() {
+  const on = ["outPoint", "inPoint", "overlap"].filter(k => PLAN_OV[k] !== null);
+  $("#planOvState").innerHTML = on.length
+    ? `<b class="chip clash">这一对的 ${on.length} 项是手动指定的</b>`
+    : "跟着规划器走";
+  if (!REPORT) return;
+  const p = REPORT.plan;
+  $("#ovOut").placeholder = mmss(p.plannerOutPoint ?? p.outPoint);
+  $("#ovIn").placeholder = mmss(p.plannerInPoint ?? p.inPoint);
+  $("#ovLen").placeholder = fmt(p.plannerOverlap ?? p.overlapDuration);
+  const maxOv = BOOT.maxManualOverlap ?? 40;
+  const moves = [];
+  if (PLAN_OV.outPoint !== null)
+    moves.push(`出点 ${mmss(p.plannerOutPoint)} → ${mmss(p.outPoint)}`);
+  if (PLAN_OV.inPoint !== null)
+    moves.push(`入点 ${mmss(p.plannerInPoint)} → ${mmss(p.inPoint)}`);
+  if (PLAN_OV.overlap !== null)
+    moves.push(`叠加 ${fmt(p.plannerOverlap)} → ${fmt(p.overlapDuration)} 秒`);
+  $("#ovHint").innerHTML = moves.length
+    ? "已覆盖：" + moves.join(" · ")
+    : `出曲 ${mmss(REPORT.outgoing.duration)} · 入曲 ${mmss(REPORT.incoming.duration)}`
+      + ` · 叠加上限 ${maxOv} 秒`;
+}
+
+/// Apply a patch to the override — from a timeline click, or from an AI reply.
+/// A patch that does not fit is refused outright rather than half-applied, so
+/// `PLAN_OV` never holds a geometry the server would reject.
+function setPlanOverride(patch, replan = true) {
+  const next = Object.assign({}, PLAN_OV, patch);
+  const err = planOverrideError(next);
+  $("#ovErr").textContent = err || "";
+  if (err) return false;
+  PLAN_OV = next;
+  $("#ovOut").value = PLAN_OV.outPoint === null ? "" : PLAN_OV.outPoint.toFixed(2);
+  $("#ovIn").value = PLAN_OV.inPoint === null ? "" : PLAN_OV.inPoint.toFixed(2);
+  $("#ovLen").value = PLAN_OV.overlap === null ? "" : PLAN_OV.overlap.toFixed(2);
+  paintPlanOverride();
+  if (replan) plan();
+  return true;
+}
+
+$("#ovApply").onclick = () => { if (readPlanOverride()) { paintPlanOverride(); plan(); } };
+$("#ovReset").onclick = () => {
+  $("#ovOut").value = $("#ovIn").value = $("#ovLen").value = "";
+  setPlanOverride({outPoint: null, inPoint: null, overlap: null});
+};
+for (const sel of ["#ovOut", "#ovIn", "#ovLen"]) {
+  $(sel).addEventListener("keydown", e => { if (e.key === "Enter") $("#ovApply").click(); });
 }
 
 async function plan() {
@@ -437,7 +602,7 @@ async function plan() {
     REPORT = r;
     $("#err").textContent = "";
     $("#planTime").textContent = `重算 ${Math.round(performance.now() - t0)} ms`;
-    paintVerdict(); paintTimelines(); paintSignals(); paintChain();
+    paintVerdict(); paintPlanOverride(); paintTimelines(); paintSignals(); paintChain();
   } catch (e) {
     if (seq === planSeq) $("#err").textContent = String(e.message || e);
   }
@@ -465,6 +630,9 @@ function paintVerdict() {
     ${rates}
     ${r.demotedByKey ? '<span class="chip neutral">因为和声不合降了一级</span>' : ""}
     ${r.overridden ? '<span class="chip clash">这一版是手动改过的</span>' : ""}
+    ${(r.plan.overrideFields || []).length
+      ? `<span class="chip clash">交接点是人工/AI 指定的（${
+          r.plan.overrideFields.map(f => OV_LABEL[f] || f).join("、")}）</span>` : ""}
     <span class="muted" style="font-size:.72rem">（内部术语：${r.tier} / ${r.plan.kind}）</span>`;
   $("#nearMisses").innerHTML = r.nearMisses.length
     ? "⚠︎ 这几项就卡在门槛边上，参数稍微一动结论就会翻过去：" + r.nearMisses.join(" · ") : "";
@@ -540,8 +708,29 @@ function timeline(t, role, r) {
     ruler += `<span class="cue" style="left:${p}%;transform:translateX(${shift})">${
       role === "out" ? "out" : "in"} ${mmss(start)}</span>`;
   }
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+  // `data-*` is what the click handler reads: clicking anywhere on the
+  // outgoing timeline sets the out point, the incoming one the in point.
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" class="pick"
+           data-role="${role}" data-duration="${t.duration}" data-pad="${PAD}"
            style="height:132px">${g}</svg><div class="ruler">${ruler}</div>`;
+}
+
+/// Click a timeline to move that side's cue. The same path the number boxes
+/// and the AI's `planOverride` take — this is just a faster way to type a
+/// number you can see.
+function timelineClick(e) {
+  const svg = e.target.closest("svg.pick");
+  if (!svg || !REPORT) return;
+  const box = svg.getBoundingClientRect();
+  if (box.width <= 0) return;
+  const W = 1000, PAD = Number(svg.dataset.pad) || 4;
+  const duration = Number(svg.dataset.duration);
+  const vx = ((e.clientX - box.left) / box.width) * W;
+  const seconds = ((vx - PAD) / (W - 2 * PAD)) * duration;
+  const clamped = Math.max(0, Math.min(duration - 0.05, seconds));
+  setPlanOverride(svg.dataset.role === "out"
+    ? {outPoint: Number(clamped.toFixed(2))}
+    : {inPoint: Number(clamped.toFixed(2))});
 }
 
 function paintTimelines() {
@@ -556,6 +745,7 @@ function paintTimelines() {
       ${timeline(t, role, r)}
     </div>`;
   $("#timelines").innerHTML = block(r.outgoing, "out", "出 ") + block(r.incoming, "in", "入 ");
+  $("#timelines").onclick = timelineClick;
 }
 
 // ---------------------------------------------------------------- signals
@@ -721,6 +911,104 @@ function aiSystemPrompt() {
   }
   lines.push("");
   lines.push("超出范围的取值会被系统自动收进范围内；不认识的参数名会被忽略。");
+  lines.push("");
+  lines.push("## 你还能直接指挥这一次过渡（planOverride）");
+  lines.push("上面 35 个参数是**全局**的：改一个，语料里每一对歌的结论都会跟着变。");
+  lines.push("所以「这一对该从哪儿切」不该靠拧全局阈值去凑。你可以直接给这一对写死交接几何：");
+  lines.push("- outPoint：出曲从第几秒开始交接");
+  lines.push("- inPoint：入曲从第几秒进来（想从纯伴奏前奏更早进入，就把它调小）");
+  lines.push("- overlap：两首歌叠多久（秒）");
+  lines.push("三项都可省略，省略的沿用规划器算出来的值；单位是秒，也接受 \"3:19.5\" 这种写法。");
+  lines.push("硬约束：出点/入点必须落在各自曲长以内，出点之后和入点之后都要装得下整段叠加，"
+    + `叠加长度在 ${BOOT.minManualOverlap ?? 0.5}–${BOOT.maxManualOverlap ?? 40} 秒之间。`
+    + "越界会被拒绝并给出原因。");
+  lines.push("接法（对拍 / 交叉淡入淡出）不变：只有几何被改写。"
+    + "对拍那一档会按原来的节拍周期重新折算小节数。");
+  lines.push("");
+  lines.push("下面的上下文里有两首歌的逐 2 秒 rms/人声曲线、小节第一拍、乐句起点和带时间戳的歌词，"
+    + "足够你自己挑一个切点——比如让出曲人声收完最后一句、入曲从伴奏段先铺底。");
+  lines.push("如果你判断问题出在**选点逻辑**（规划器总把入点锁死在某处、不肯从更早的纯伴奏进入）"
+    + "而不是某个参数值，请直接写进 rationale，别硬凑参数。");
+  return lines.join("\n");
+}
+
+// The page draws two timelines; text has to carry the same information, or the
+// AI is being asked to place a seam it cannot see. Only the windows that
+// matter go in — the outgoing tail and the incoming head — sampled every 2 s,
+// which keeps the whole block a couple of kilobytes.
+
+const TL_OUT_TAIL = 90, TL_IN_HEAD = 60, TL_STEP = 2;
+
+function tlWindow(t, role) {
+  const from = role === "out" ? Math.max(0, t.duration - TL_OUT_TAIL) : 0;
+  const to = role === "out" ? t.duration : Math.min(t.duration, TL_IN_HEAD);
+  return [from, to];
+}
+
+/// The 1 s grids sampled onto a 2 s one, as `t=182s rms=0.62 voc=0.41`.
+function tlRows(t, from, to) {
+  const at = (grid, s) => {
+    const i = Math.round(s);
+    return (i >= 0 && i < grid.length) ? grid[i] : null;
+  };
+  const rows = [];
+  for (let s = Math.ceil(from); s <= to; s += TL_STEP) {
+    const rms = at(t.rms, s), voc = at(t.vocal, s);
+    if (rms === null && voc === null) continue;
+    rows.push(`t=${Math.round(s)}s rms=${fmt(rms)} voc=${fmt(voc)}`);
+  }
+  return rows;
+}
+
+function aiTimelines() {
+  const r = REPORT;
+  const lines = [];
+  lines.push("## 时间轴（逐 2 秒）");
+  lines.push("rms 已按各首歌自己的峰值归一化到 0–1；voc 是 0–1 的人声活跃度"
+    + "（上面「人声密度」那项信号是它相对全曲均值的倍数）。"
+    + `出曲只给结尾 ${TL_OUT_TAIL} 秒，入曲只给开头 ${TL_IN_HEAD} 秒——`
+    + "交接只发生在这两段里。");
+  for (const [role, label, t] of [["out", "出曲", r.outgoing], ["in", "入曲", r.incoming]]) {
+    const [from, to] = tlWindow(t, role);
+    const mean = t.vocal.length
+      ? t.vocal.reduce((a, b) => a + b, 0) / t.vocal.length : 0;
+    lines.push("");
+    lines.push(`### ${label} ${t.name}　${mmss(from)}–${mmss(to)}`
+      + `（全曲 voc 均值 ${fmt(mean)}）`);
+    lines.push(tlRows(t, from, to).join("\n"));
+    const beats = (t.downbeats || []).filter(d => d >= from && d <= to);
+    // Every fourth downbeat is one every four bars — enough to see where the
+    // grid sits without pasting three hundred numbers.
+    const shown = beats.filter((_, i) => i % 4 === 0).slice(0, 24);
+    lines.push(`小节第一拍（每 4 个取 1）：${
+      shown.length ? shown.map(d => fmt(d, 2)).join(" ") : "（这段里没有）"}`);
+    const phrases = (t.phraseBoundaries || []).filter(p => p >= from && p <= to)
+      .sort((a, b) => a - b).slice(0, 20);
+    lines.push(`乐句起点（规划器认可的候选交接点）：${
+      phrases.length ? phrases.map(p => `${mmss(p)}(${fmt(p)})`).join("　") : "（这段里没有）"}`);
+  }
+  return lines.join("\n");
+}
+
+/// Timed lyrics from the corpus `.lrc` sidecars, so "let the outgoing singer
+/// finish the line" is a decision the AI can actually make.
+function aiLyrics() {
+  const r = REPORT;
+  const lines = ["## 歌词（带时间戳）"];
+  const block = (label, t, side, which) => {
+    if (!side) {
+      lines.push(`${label} ${t.name}：无歌词（语料里没有同名 .lrc）`);
+      return;
+    }
+    const rows = side[which] || [];
+    lines.push(`${label} ${t.name}（共 ${side.count} 行，这里是${
+      which === "tail" ? "最后" : "开头"} ${rows.length} 行）：`);
+    for (const l of rows) lines.push(`  [${mmss(l.t)}] ${l.text}`);
+  };
+  const ly = r.lyrics || {};
+  block("出曲", r.outgoing, ly.outgoing, "tail");
+  lines.push("");
+  block("入曲", r.incoming, ly.incoming, "head");
   return lines.join("\n");
 }
 
@@ -735,6 +1023,10 @@ function aiContext() {
       + ` · intro 到 ${mmss(t.introEnd)}`
       + ` · ${t.outroFadeStart != null ? "自带淡出，从 " + mmss(t.outroFadeStart) + " 起" : "结尾没有自带淡出"}`);
   }
+  lines.push("");
+  lines.push(aiTimelines());
+  lines.push("");
+  lines.push(aiLyrics());
   lines.push("");
   lines.push("## 五项信号");
   for (const s of r.signals) {
@@ -801,6 +1093,7 @@ const AI_OUTPUT_SPEC = `## 请这样回复
 
 \`\`\`json
 {
+  "planOverride": {"outPoint": 199.5, "inPoint": 2.0, "overlap": 12.0},
   "config": {"参数名": 新值, "另一个参数名": 新值},
   "styleOverride": "auto | plain | sweep | echo | staged",
   "stem": "none | acapella | instrumental | duck",
@@ -809,9 +1102,14 @@ const AI_OUTPUT_SPEC = `## 请这样回复
 \`\`\`
 
 约束：
-- "config" 里只放你真的想改的参数，用上面表格里的准确名称，值必须是数字。
-- "styleOverride" 和 "stem" 可以省略；省略就表示保持现状。
-- "rationale" 用中文，说清楚你想让听感往哪个方向走。
+- 四个字段全都可以省略；省略就表示保持现状。
+- "planOverride" 只作用于当前这一对歌：里面 outPoint / inPoint / overlap 三项也各自可省。
+  单位是秒（也接受 "3:19.5"）。想编排一次具体的过渡（比如让出曲人声收完最后一句、
+  入曲先从伴奏铺底），用它，而不是去拧全局参数。
+- "config" 里只放你真的想改的参数，用上面表格里的准确名称，值必须是数字；
+  它会影响整个语料，所以只在你确实想改**规则**时才用。
+- "rationale" 用中文，说清楚你想让听感往哪个方向走；
+  如果你认为该改的是选点逻辑而不是参数，也写在这里。
 - 只给一个 JSON 块，不要给多个候选方案。`;
 
 function aiBundle() {
@@ -941,7 +1239,45 @@ $("#parseAI").onclick = () => {
     else bad.push(`stem=${JSON.stringify(parsed.stem)}`);
   }
 
+  // planOverride — the one part of the reply that speaks about *this* pair.
+  let planOv = null;
+  const po = parsed.planOverride;
+  if (po !== undefined && po !== null) {
+    if (typeof po !== "object" || Array.isArray(po)) {
+      bad.push('planOverride 不是一个对象');
+    } else {
+      const next = {outPoint: null, inPoint: null, overlap: null};
+      let ok = true;
+      for (const [key, value] of Object.entries(po)) {
+        if (!(key in next)) { ignored.push("planOverride." + key); continue; }
+        if (value === null) continue;
+        const v = secondsFrom(value);
+        if (v === null) {
+          bad.push(`planOverride.${key}=${JSON.stringify(value)}`);
+          ok = false; continue;
+        }
+        next[key] = v;
+      }
+      const err = ok ? planOverrideError(next) : null;
+      if (err) { bad.push(err); }
+      else if (ok && Object.values(next).some(v => v !== null)) { planOv = next; }
+    }
+  }
+
   const notes = [];
+  if (planOv) {
+    const p = REPORT.plan;
+    const moves = [];
+    if (planOv.outPoint !== null)
+      moves.push(`出点 ${mmss(p.plannerOutPoint ?? p.outPoint)} → <b>${mmss(planOv.outPoint)}</b>`);
+    if (planOv.inPoint !== null)
+      moves.push(`入点 ${mmss(p.plannerInPoint ?? p.inPoint)} → <b>${mmss(planOv.inPoint)}</b>`);
+    if (planOv.overlap !== null)
+      moves.push(`叠加 ${fmt(p.plannerOverlap ?? p.overlapDuration)} → <b>${
+        fmt(planOv.overlap)}</b> 秒`);
+    notes.push("<b>这一对的交接点</b>（只影响当前这一对，不动全局参数）<br>"
+      + moves.join("<br>"));
+  }
   if (rows.length) notes.push("<b>要改的参数</b><br>" + rows.join("<br>"));
   if (style) notes.push(`<b>出曲离场手法</b> 改为 <code>${style}</code>`);
   if (stem) notes.push(`<b>stem 手法</b> 改为 <code>${stem}</code>`);
@@ -952,12 +1288,12 @@ $("#parseAI").onclick = () => {
   if (bad.length) {
     notes.push(`<span class="err">这些取值不合法，已拒绝：${bad.join("、")}</span>`);
   }
-  if (!rows.length && !style && !stem) {
+  if (!rows.length && !style && !stem && !planOv) {
     notes.push('<span class="err">解析出来了，但没有一项是能应用的改动。</span>');
     preview.innerHTML = notes.join("<br><br>");
     return;
   }
-  PENDING_AI = {config: accepted, style: style, stem: stem};
+  PENDING_AI = {config: accepted, style: style, stem: stem, planOverride: planOv};
   preview.innerHTML = notes.join("<br><br>");
   $("#applyAI").style.display = $("#cancelAI").style.display = "";
 };
@@ -968,9 +1304,18 @@ $("#applyAI").onclick = () => {
   if (PENDING_AI.stem) { $("#stemSel").value = PENDING_AI.stem; paintDuck(); }
   $("#applyAI").style.display = $("#cancelAI").style.display = "none";
   const applied = Object.keys(PENDING_AI.config).length;
+  const parts = [];
+  if (PENDING_AI.planOverride) {
+    // Fills the three boxes and lands in PLAN_OV, exactly as if it had been
+    // typed there — `applyConfig` below is what re-plans.
+    setPlanOverride(PENDING_AI.planOverride, false);
+    parts.push("交接点");
+  }
+  if (applied) parts.push(`${applied} 项参数改动`);
+  if (PENDING_AI.style || PENDING_AI.stem) parts.push("手法改动");
   applyConfig(Object.assign({}, CONFIG, PENDING_AI.config));   // re-plans
   BATCH = null;
-  $("#aiPreview").innerHTML = `已应用${applied ? ` ${applied} 项参数改动` : "手法改动"}，决策已重算。`;
+  $("#aiPreview").innerHTML = `已应用${parts.join("、") || "改动"}，决策已重算。`;
   PENDING_AI = null;
 };
 
@@ -1007,18 +1352,28 @@ $("#resetAll").onclick = () => applyConfig(BOOT.standard);
 
 const pairIndex = () => BOOT.pairs.findIndex(
   p => p.outgoing === $("#outSel").value && p.incoming === $("#inSel").value);
+/// A hand-placed seam belongs to one pair; carrying it to the next pair would
+/// point at seconds that mean nothing there, so switching pairs drops it.
+function clearPlanOverrideAndPlan() {
+  $("#ovOut").value = $("#ovIn").value = $("#ovLen").value = "";
+  PLAN_OV = {outPoint: null, inPoint: null, overlap: null};
+  $("#ovErr").textContent = "";
+  paintPlanOverride();
+  plan();
+}
+
 function gotoPair(i) {
   if (!BOOT.pairs.length) return;
   const p = BOOT.pairs[(i + BOOT.pairs.length) % BOOT.pairs.length];
   $("#outSel").value = p.outgoing; $("#inSel").value = p.incoming;
-  plan();
+  clearPlanOverrideAndPlan();
 }
 $("#prevPair").onclick = () => gotoPair((pairIndex() < 0 ? 0 : pairIndex()) - 1);
 $("#nextPair").onclick = () => gotoPair((pairIndex() < 0 ? -1 : pairIndex()) + 1);
 $("#swap").onclick = () => {
   const a = $("#outSel").value;
   $("#outSel").value = $("#inSel").value; $("#inSel").value = a;
-  plan();
+  clearPlanOverrideAndPlan();
 };
 $("#usePaths").onclick = () => {
   for (const [inp, sel] of [["#outPath", "#outSel"], ["#inPath", "#inSel"]]) {
@@ -1029,10 +1384,10 @@ $("#usePaths").onclick = () => {
     if (!opt) { opt = new Option(v.split("/").pop(), v); s.add(opt); }
     s.value = v;
   }
-  plan();
+  clearPlanOverrideAndPlan();
 };
-$("#outSel").onchange = plan;
-$("#inSel").onchange = plan;
+$("#outSel").onchange = clearPlanOverrideAndPlan;
+$("#inSel").onchange = clearPlanOverrideAndPlan;
 $("#styleSel").onchange = plan;
 $("#fadeOv").oninput = schedulePlan;
 $("#stemSel").onchange = () => { paintDuck(); plan(); };

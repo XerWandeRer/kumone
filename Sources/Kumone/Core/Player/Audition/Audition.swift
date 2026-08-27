@@ -31,6 +31,17 @@ public enum Audition {
         return fresh
     }
 
+    /// Offline validation hook (S0.5): recompute the current analyzer's
+    /// per-second vocal-activity curve and its rms grid for `url`, bypassing the
+    /// sidecar cache. Used by the vocal-activity/StemKit correlation harness to
+    /// score the live algorithm against ground truth; not part of playback.
+    public static func vocalActivityForEval(
+        fileAt url: URL
+    ) throws -> (vocal: [Float], rms: [Float], duration: TimeInterval) {
+        let a = try TrackAnalyzer.analyze(fileAt: url)
+        return (a.vocalActivity, a.rmsEnvelope, a.duration)
+    }
+
     /// Whether a usable sidecar already exists (so the CLI can say "analyzing"
     /// only when it really is).
     public static func hasCachedAnalysis(for url: URL) -> Bool {
@@ -90,6 +101,160 @@ public enum Audition {
         }
     }
 
+    // MARK: - Plan-level override
+
+    /// A hand-written (or AI-written) hand-over geometry for *this one pair*,
+    /// layered on top of whatever the planner decided.
+    ///
+    /// The 35 planner knobs are global: they move every pair in the corpus at
+    /// once, which is the wrong instrument when the thing you want is "on this
+    /// pair, leave the outgoing vocal running four bars longer and bring the
+    /// incoming in from its instrumental intro". That is a *plan*, not a
+    /// threshold, so it lives here — outside `TransitionPlanner`, which stays a
+    /// pure function of the two analyses.
+    ///
+    /// Every field is optional; an omitted one keeps the planner's own value.
+    public struct PlanOverride: Sendable, Equatable {
+        /// Seconds into the outgoing track where the hand-over starts.
+        public var outPoint: TimeInterval?
+        /// Seconds into the incoming track that lands on `outPoint`.
+        public var inPoint: TimeInterval?
+        /// How long the two run together.
+        public var overlap: TimeInterval?
+
+        public init(outPoint: TimeInterval? = nil, inPoint: TimeInterval? = nil,
+                    overlap: TimeInterval? = nil) {
+            self.outPoint = outPoint
+            self.inPoint = inPoint
+            self.overlap = overlap
+        }
+
+        /// Longer than this and it stops being a transition and starts being a
+        /// mashup; also the point past which the renderer's pre/post roll makes
+        /// the audition file unwieldy.
+        public static let maxOverlap: TimeInterval = 40
+        /// `TransitionAutomation.Geometry` floors the overlap at 0.1 s; asking
+        /// for less than half a second is always a mistake, not a taste.
+        public static let minOverlap: TimeInterval = 0.5
+
+        public var isEmpty: Bool { outPoint == nil && inPoint == nil && overlap == nil }
+
+        /// Which fields were actually specified, in panel order.
+        public var specifiedFields: [String] {
+            var out: [String] = []
+            if outPoint != nil { out.append("outPoint") }
+            if inPoint != nil { out.append("inPoint") }
+            if overlap != nil { out.append("overlap") }
+            return out
+        }
+
+        /// Seconds from `199.5`, `"199.5"`, `"3:19.5"`, `"03:19"` or
+        /// `"1:03:19.5"`. Returns nil for anything else — including negatives
+        /// and out-of-range minute/second fields, so a typo is a rejection
+        /// rather than a surprising number.
+        public static func seconds(from raw: String) -> TimeInterval? {
+            let text = raw.trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { return nil }
+            if !text.contains(":") {
+                guard let v = Double(text), v.isFinite, v >= 0 else { return nil }
+                return v
+            }
+            let parts = text.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2 || parts.count == 3 else { return nil }
+            var total: TimeInterval = 0
+            for (i, part) in parts.enumerated() {
+                guard let v = Double(part), v.isFinite, v >= 0 else { return nil }
+                // Only the leading field may exceed its wheel: "90:00" is a
+                // legitimate 90 minutes, but "3:75" is a typo.
+                if i > 0 && v >= 60 { return nil }
+                total = total * 60 + v
+            }
+            return total
+        }
+
+        /// Accepts a JSON value that is either a number or one of the strings
+        /// `seconds(from:)` understands.
+        public static func seconds(fromJSON value: Any) -> TimeInterval? {
+            if let n = value as? NSNumber {
+                let v = n.doubleValue
+                return v.isFinite && v >= 0 ? v : nil
+            }
+            if let s = value as? String { return seconds(from: s) }
+            return nil
+        }
+
+        /// Why an override could not be honoured, phrased for the console.
+        public enum Failure: LocalizedError, Equatable {
+            case notANumber(field: String, given: String)
+            case pastEnd(field: String, value: TimeInterval, duration: TimeInterval, track: String)
+            case overlapTooLong(TimeInterval)
+            case overlapTooShort(TimeInterval)
+            case tailTooShort(outPoint: TimeInterval, available: TimeInterval,
+                              wanted: TimeInterval)
+            case intakeTooShort(inPoint: TimeInterval, available: TimeInterval,
+                                wanted: TimeInterval)
+
+            public var errorDescription: String? {
+                func t(_ s: TimeInterval) -> String {
+                    String(format: "%d:%05.2f", Int(s) / 60, s.truncatingRemainder(dividingBy: 60))
+                }
+                switch self {
+                case .notANumber(let field, let given):
+                    return "planOverride.\(field) 看不懂：\(given)。"
+                        + "用秒（如 199.5）或 mm:ss(.xx)（如 3:19.5）。"
+                case .pastEnd(let field, let value, let duration, let track):
+                    return "planOverride.\(field) = \(t(value))，超出了\(track)的时长 \(t(duration))。"
+                case .overlapTooLong(let v):
+                    return String(format: "planOverride.overlap = %.2f 秒，超过 %.0f 秒的上限。",
+                                  v, maxOverlap)
+                case .overlapTooShort(let v):
+                    return String(format: "planOverride.overlap = %.2f 秒，短于 %.2f 秒的下限。",
+                                  v, minOverlap)
+                case .tailTooShort(let outPoint, let available, let wanted):
+                    return String(format: "出点 %@ 之后只剩 %.2f 秒，放不下 %.2f 秒的叠加。",
+                                  t(outPoint), available, wanted)
+                case .intakeTooShort(let inPoint, let available, let wanted):
+                    return String(format: "入点 %@ 之后只剩 %.2f 秒，放不下 %.2f 秒的叠加。",
+                                  t(inPoint), available, wanted)
+                }
+            }
+        }
+
+        /// The geometry this override resolves to against a planner baseline,
+        /// or the first rule it breaks.
+        ///
+        /// `baseOverlap` is floored at `minOverlap` so a `.gapless` baseline
+        /// (no overlap at all) still has something to move.
+        public func resolve(
+            baseOutPoint: TimeInterval, baseInPoint: TimeInterval, baseOverlap: TimeInterval,
+            outgoingDuration: TimeInterval, incomingDuration: TimeInterval
+        ) throws -> (outPoint: TimeInterval, inPoint: TimeInterval, overlap: TimeInterval) {
+            let o = outPoint ?? baseOutPoint
+            let i = inPoint ?? baseInPoint
+            let d = overlap ?? Swift.max(baseOverlap, Self.minOverlap)
+
+            guard o < outgoingDuration else {
+                throw Failure.pastEnd(field: "outPoint", value: o,
+                                      duration: outgoingDuration, track: "出曲")
+            }
+            guard i < incomingDuration else {
+                throw Failure.pastEnd(field: "inPoint", value: i,
+                                      duration: incomingDuration, track: "入曲")
+            }
+            guard d <= Self.maxOverlap else { throw Failure.overlapTooLong(d) }
+            guard d >= Self.minOverlap else { throw Failure.overlapTooShort(d) }
+            let tail = outgoingDuration - o
+            guard tail + 1e-6 >= d else {
+                throw Failure.tailTooShort(outPoint: o, available: tail, wanted: d)
+            }
+            let intake = incomingDuration - i
+            guard intake + 1e-6 >= d else {
+                throw Failure.intakeTooShort(inPoint: i, available: intake, wanted: d)
+            }
+            return (o, i, d)
+        }
+    }
+
     // MARK: - Decision
 
     /// A planned transition plus the numbers that produced it.
@@ -131,6 +296,14 @@ public enum Audition {
         /// Whether `--style` / `--fade` rewrote the planner's own choice.
         public let overridden: Bool
 
+        /// A hand-written hand-over geometry for this pair, if one was given,
+        /// alongside what the planner had chosen before it — so the console
+        /// can show the move rather than just the destination.
+        public let planOverride: PlanOverride?
+        public let plannerOutPoint: TimeInterval?
+        public let plannerInPoint: TimeInterval?
+        public let plannerOverlap: TimeInterval
+
         /// Whether the planner was told a vocal separator is available.
         public let stemsReady: Bool
         /// The stem technique the *planner* chose, before any `--stem`
@@ -170,6 +343,7 @@ public enum Audition {
         style styleOverride: StyleOverride? = nil,
         fade fadeOverride: TimeInterval? = nil,
         stem stemOverride: StemOverride? = nil,
+        plan planOverride: PlanOverride? = nil,
         stems: StemAvailability = .none,
         config configOverrides: [String: Double] = [:],
         useCache: Bool = true
@@ -214,6 +388,22 @@ public enum Audition {
             style.stemTechnique = stemOverride.technique
             planned = PlannedTransition(plan: planned.plan, style: style)
             overridden = true
+        }
+
+        // Where the planner had landed, captured before any plan-level
+        // override rewrites it, so the report can quote the diff.
+        let plannerGeometry = TransitionAutomation.Geometry(plan: planned.plan)
+        let plannerOutPoint = planned.plan.outPoint
+        let plannerInPoint = planInPoint(of: planned.plan)
+        let plannerOverlap = plannerGeometry.overlapDuration
+        var appliedPlanOverride: PlanOverride?
+        if let planOverride, !planOverride.isEmpty {
+            planned = try apply(planOverride, to: planned,
+                                outgoingDuration: out.duration, incomingDuration: inc.duration)
+            // Deliberately not `overridden`: that flag is about the *style*
+            // having been rewritten by hand, and the report has its own step
+            // and chip for a moved seam.
+            appliedPlanOverride = planOverride
         }
 
         let geometry = TransitionAutomation.Geometry(plan: planned.plan)
@@ -263,6 +453,10 @@ public enum Audition {
             overlapDuration: window, overlapBars: bars,
             outgoingRate: outRate, incomingRate: inRate,
             overridden: overridden,
+            planOverride: appliedPlanOverride,
+            plannerOutPoint: plannerOutPoint,
+            plannerInPoint: plannerInPoint,
+            plannerOverlap: plannerOverlap,
             stemsReady: stems == .ready,
             plannedStemTechnique: plannedStem?.label,
             stemBaselineOutPoint: baselineOutPoint,
@@ -408,6 +602,59 @@ public enum Audition {
             return PlannedTransition(
                 plan: .crossfade(duration: fade,
                                  outPoint: max(0, outgoingDuration - fade), inPoint: 0),
+                style: planned.style)
+        }
+    }
+
+    static func planInPoint(of plan: TransitionPlan) -> TimeInterval? {
+        switch plan {
+        case .beatMatched(let p): return p.inPoint
+        case .crossfade(_, _, let point): return point
+        case .gapless: return nil
+        }
+    }
+
+    /// Rewrite a planned transition's geometry with the caller's own out /
+    /// in / overlap, keeping everything else the planner decided.
+    ///
+    /// The plan *kind* survives: a beat-matched hand-over that gets its
+    /// overlap stretched stays beat-matched (bars are re-derived so the beat
+    /// period is preserved), because the kind is what the style and the bass
+    /// swap are written against. A `.gapless` plan has no geometry to move, so
+    /// an override on it produces the crossfade it implicitly asked for.
+    static func apply(_ override: PlanOverride, to planned: PlannedTransition,
+                      outgoingDuration: TimeInterval,
+                      incomingDuration: TimeInterval) throws -> PlannedTransition {
+        let geometry = TransitionAutomation.Geometry(plan: planned.plan)
+        // `.gapless` has no seam of its own. Its implied one is "the overlap
+        // you asked for, landing on the end of the outgoing track" — anchoring
+        // it anywhere else would reject every gapless override that named only
+        // a length.
+        let baseOut = planned.plan.outPoint
+            ?? Swift.max(0, outgoingDuration
+                         - Swift.max(override.overlap ?? geometry.overlapDuration,
+                                     PlanOverride.minOverlap))
+        let baseIn = planInPoint(of: planned.plan) ?? 0
+        let g = try override.resolve(
+            baseOutPoint: baseOut, baseInPoint: baseIn, baseOverlap: geometry.overlapDuration,
+            outgoingDuration: outgoingDuration, incomingDuration: incomingDuration)
+
+        switch planned.plan {
+        case .beatMatched(let p):
+            // Keep the beat period the planner matched to; the bar count is
+            // just how many of those fit in the new window.
+            let beat = p.overlapBars > 0 ? p.overlapDuration / Double(p.overlapBars * 4) : 0
+            let bars = beat > 0.05
+                ? Swift.max(1, Int((g.overlap / (beat * 4)).rounded())) : p.overlapBars
+            return PlannedTransition(
+                plan: .beatMatched(BeatMatchedPlan(
+                    outPoint: g.outPoint, inPoint: g.inPoint, overlapBars: bars,
+                    outgoingRate: p.outgoingRate, incomingRate: p.incomingRate,
+                    bassSwapOffset: g.overlap / 2, overlapDuration: g.overlap)),
+                style: planned.style)
+        case .crossfade, .gapless:
+            return PlannedTransition(
+                plan: .crossfade(duration: g.overlap, outPoint: g.outPoint, inPoint: g.inPoint),
                 style: planned.style)
         }
     }
