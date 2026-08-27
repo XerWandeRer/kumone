@@ -76,6 +76,12 @@ final class HTTPServer {
     /// the loopback console always comes up.
     @discardableResult
     func listen(on addresses: [String], port: UInt16) -> [String] {
+        // A browser scrubbing an <audio> element aborts Range requests
+        // constantly; writing to that closed socket raises SIGPIPE, whose
+        // default action kills the whole process without a crash report.
+        // Ignore it — the write() then fails with EPIPE, which the serve
+        // loop already treats as a closed connection.
+        signal(SIGPIPE, SIG_IGN)
         var bound: [String] = []
         for address in addresses {
             guard let fd = bind(address: address, port: port) else { continue }
@@ -118,6 +124,9 @@ final class HTTPServer {
                 if errno == EINTR { continue }
                 return
             }
+            var yes: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes,
+                       socklen_t(MemoryLayout<Int32>.size))
             Thread.detachNewThread { [weak self] in
                 self?.serve(client)
                 close(client)
