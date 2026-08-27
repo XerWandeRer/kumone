@@ -11,8 +11,33 @@ import Foundation
 //
 // The same STFT pass also feeds two tonal/timbral estimators: a peak-picked
 // chromagram → Krumhansl-Schmuckler template matching for the key, and a
-// three-feature heuristic (vocal-band energy share, band spectral flatness,
-// 2–8 Hz envelope modulation) → per-second vocal activity.
+// four-feature vocal-activity detector.
+//
+// Vocal activity (v5). The three mono-spectral cues that shipped in v4 —
+// vocal-band energy share, band spectral flatness, 2–8 Hz syllable/vibrato
+// modulation — could not tell "a harmonic instrument sitting in the mid band"
+// (sax, distorted guitar, a synth lead) from "someone singing"; validated
+// against StemKit separation on the eval corpus, v4's top-scored windows often
+// held essentially no real vocal energy. v5 adds one cheap, orthogonal cue
+// (docs/automix-stems-predev.md §7.3), pure vDSP:
+//   • Mid/side centre ratio — lead vocals sit at the stereo centre (mid=L+R),
+//     accompaniment and effects spread wider (side=L−R); the vocal band's mid
+//     share is high when a centred voice is present. Needs the stereo signal,
+//     so `analyze(fileAt:)` decodes L/R in parallel with the mono pass (a
+//     second, band-energy-only FFT sweep — see `stereoVoiceEnergies`). The
+//     mono `analyze(samples:)` test entry has no stereo image and skips it.
+//
+// §7.3's other proposal, an HPSS harmonic share (Fitzgerald 2010 median-filter
+// harmonic/percussive separation over the vocal band), was implemented and
+// measured against the same ground truth and did NOT survive: its standalone
+// correlation with per-second vocal/mix energy was +0.015, and a weight search
+// under leave-one-playlist-out CV drove its weight to ~0 in all six folds.
+// Sustained harmonic energy in 200 Hz–4 kHz is as much guitar/synth/strings as
+// voice, so it adds nothing the band and tonality cues do not already carry. It
+// was removed rather than left at weight 0 because it was by far the most
+// expensive part of the analysis (a per-bin double median filter, plus
+// retaining the whole vocal-band spectrogram). Recoverable from git history if
+// a future cue wants it.
 enum TrackAnalyzer {
     static let analysisSampleRate: Double = 22_050
 
@@ -26,12 +51,74 @@ enum TrackAnalyzer {
     /// off the main thread.
     static func analyze(fileAt url: URL) throws -> TrackAnalysis {
         let samples = try decodeMono(url: url, targetRate: analysisSampleRate)
-        return analyze(samples: samples, sampleRate: analysisSampleRate)
+        // Second, stereo decode for the mid/side vocal cue. Best-effort: a
+        // failure (or a truly mono master) simply drops the cue, and the three
+        // mono-spectral features carry the estimate on their own.
+        let midSide = try? stereoVoiceEnergies(url: url, targetRate: analysisSampleRate)
+        return analyze(samples: samples, sampleRate: analysisSampleRate, midSide: midSide)
     }
 
     /// In-memory entry point (used by tests with synthetic signals).
     /// `samples` is mono; any sample rate is accepted and resampled.
     static func analyze(samples: [Float], sampleRate: Double) -> TrackAnalysis {
+        analyze(samples: samples, sampleRate: sampleRate, midSide: nil)
+    }
+
+    /// S0.5 validation hook (offline `vocaleval` only, never the app).
+    ///
+    /// Runs one decode + one STFT pass and returns the per-second cue vectors
+    /// together with both fusions: `v4` replays the three-cue weighting that
+    /// shipped before this change, `v5` is what the analyzer now produces. Both
+    /// therefore rest on byte-identical features, so a correlation difference
+    /// between them is attributable to the fusion weights and the new mid/side
+    /// cue alone — not to decode or windowing drift.
+    static func vocalActivityAB(fileAt url: URL) throws -> VocalActivityAB {
+        let sr = analysisSampleRate
+        let x = try decodeMono(url: url, targetRate: sr)
+        let rmsEnvelope = rmsPerSecond(x, sampleRate: sr)
+        let duration = Double(x.count) / sr
+        guard x.count >= windowSize * 4 else {
+            return VocalActivityAB(
+                v4: [], v5: [], cues: [], rmsEnvelope: rmsEnvelope,
+                duration: duration, hadStereo: false)
+        }
+        let features = stftFeatures(x, sampleRate: sr)
+        let midSide = try? stereoVoiceEnergies(url: url, targetRate: sr)
+        let midShare: [Float]? = midSide.map {
+            midSharePerFrame(mid: $0.mid, side: $0.side, frames: features.bandRatio.count)
+        }
+        let cues = vocalCues(
+            bandRatio: features.bandRatio,
+            flatness: features.flatness,
+            bandEnvelope: features.bandEnvelope,
+            midShare: midShare,
+            fps: sr / Double(hopSize),
+            rmsEnvelope: rmsEnvelope)
+        return VocalActivityAB(
+            v4: fuseVocalCues(cues, legacyV4: true),
+            v5: fuseVocalCues(cues),
+            cues: cues,
+            rmsEnvelope: rmsEnvelope,
+            duration: duration,
+            hadStereo: midShare != nil)
+    }
+
+    struct VocalActivityAB: Sendable {
+        let v4: [Float]
+        let v5: [Float]
+        let cues: [VocalCues]
+        let rmsEnvelope: [Float]
+        let duration: Double
+        /// False for a genuinely mono master — the mid/side cue is inert there.
+        let hadStereo: Bool
+    }
+
+    /// Core analysis. `midSide`, when present, carries per-STFT-frame vocal-band
+    /// magnitude of the mid (L+R) and side (L−R) channels for the stereo-centre
+    /// vocal cue; it is `nil` for the mono test entry and for mono masters.
+    static func analyze(
+        samples: [Float], sampleRate: Double, midSide: (mid: [Float], side: [Float])?
+    ) -> TrackAnalysis {
         let sr = analysisSampleRate
         let x = resample(samples, from: sampleRate, to: sr)
         let duration = Double(x.count) / sr
@@ -80,10 +167,16 @@ enum TrackAnalyzer {
 
         let key = detectKey(
             chromaFrames: features.chroma, frameEnergy: features.chromaEnergy)
+        // Align the (independently decoded) stereo envelopes to the mono frame
+        // count; the two decode paths can differ by a frame at the tail.
+        let midShare: [Float]? = midSide.map { ms in
+            midSharePerFrame(mid: ms.mid, side: ms.side, frames: features.bandRatio.count)
+        }
         let vocals = vocalActivity(
             bandRatio: features.bandRatio,
             flatness: features.flatness,
             bandEnvelope: features.bandEnvelope,
+            midShare: midShare,
             fps: fps,
             rmsEnvelope: rmsEnvelope)
 
@@ -237,6 +330,157 @@ enum TrackAnalyzer {
                 throw AnalyzerError.unsupportedFormat
             }
             if status == .endOfStream { break }
+        }
+        return out
+    }
+
+    /// Decode to `targetRate` two-channel float, deinterleaved as `[L, R]`.
+    /// Genuinely mono sources come back with `L == R` (so `side` is zero and
+    /// the mid/side cue self-disables). Returns `nil` for a one-channel source.
+    private static func decodeStereo(url: URL, targetRate: Double) throws -> [[Float]]? {
+        let file = try AVAudioFile(forReading: url)
+        let srcFormat = file.processingFormat
+        guard srcFormat.channelCount >= 2 else { return nil }
+        guard let dstFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: targetRate,
+            channels: 2, interleaved: false),
+            let converter = AVAudioConverter(from: srcFormat, to: dstFormat)
+        else { throw AnalyzerError.unsupportedFormat }
+
+        let inCapacity: AVAudioFrameCount = 1 << 16
+        let outCapacity: AVAudioFrameCount = 1 << 15
+        guard let inBuf = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: inCapacity),
+              let outBuf = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: outCapacity)
+        else { throw AnalyzerError.unsupportedFormat }
+
+        var left: [Float] = []
+        var right: [Float] = []
+        let reserve = Int(Double(file.length) * targetRate / srcFormat.sampleRate) + 1024
+        left.reserveCapacity(reserve)
+        right.reserveCapacity(reserve)
+        var reachedEnd = false
+
+        while true {
+            outBuf.frameLength = 0
+            var convError: NSError?
+            let status = converter.convert(to: outBuf, error: &convError) { _, outStatus in
+                if reachedEnd {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                do {
+                    inBuf.frameLength = 0
+                    try file.read(into: inBuf, frameCount: inCapacity)
+                } catch {
+                    reachedEnd = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                if inBuf.frameLength == 0 {
+                    reachedEnd = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                outStatus.pointee = .haveData
+                return inBuf
+            }
+            if outBuf.frameLength > 0, let data = outBuf.floatChannelData {
+                let count = Int(outBuf.frameLength)
+                left.append(contentsOf: UnsafeBufferPointer(start: data[0], count: count))
+                right.append(contentsOf: UnsafeBufferPointer(start: data[1], count: count))
+            }
+            if status == .error {
+                if let convError { throw convError }
+                throw AnalyzerError.unsupportedFormat
+            }
+            if status == .endOfStream { break }
+        }
+        return [left, right]
+    }
+
+    /// Per-STFT-frame vocal-band magnitude of the mid (`L+R`) and side (`L−R`)
+    /// channels, on the same window/hop grid as the mono feature pass. Feeds the
+    /// stereo-centre vocal cue. Returns `nil` when the source is mono/degenerate.
+    ///
+    /// This is a second FFT sweep, unavoidable: the mono downmix the rest of the
+    /// analysis runs on has already collapsed the stereo image the cue depends
+    /// on. It is kept as light as possible — a single band sum per frame, no
+    /// mel/chroma/flatness — and mid and side go through the identical routine so
+    /// their ratio is method-fair.
+    static func stereoVoiceEnergies(
+        url: URL, targetRate: Double
+    ) throws -> (mid: [Float], side: [Float])? {
+        guard let lr = try decodeStereo(url: url, targetRate: targetRate) else { return nil }
+        let l = lr[0], r = lr[1]
+        let count = min(l.count, r.count)
+        guard count >= windowSize else { return nil }
+        var mid = [Float](repeating: 0, count: count)
+        var side = [Float](repeating: 0, count: count)
+        vDSP_vadd(l, 1, r, 1, &mid, 1, vDSP_Length(count))
+        // vDSP_vsub(A, B, C) computes C = B − A, so this yields l − r = L − R.
+        vDSP_vsub(r, 1, l, 1, &side, 1, vDSP_Length(count))
+        var half: Float = 0.5   // (L±R)/2
+        vDSP_vsmul(mid, 1, &half, &mid, 1, vDSP_Length(count))
+        vDSP_vsmul(side, 1, &half, &side, 1, vDSP_Length(count))
+        return (voiceBandEnergyPerFrame(mid, sampleRate: targetRate),
+                voiceBandEnergyPerFrame(side, sampleRate: targetRate))
+    }
+
+    /// Stripped STFT: per-frame summed magnitude inside the 200 Hz–4 kHz vocal
+    /// band, nothing else. Same window/hop as `stftFeatures` so frames align.
+    static func voiceBandEnergyPerFrame(_ x: [Float], sampleRate sr: Double) -> [Float] {
+        let n = windowSize
+        let hop = hopSize
+        guard x.count >= n else { return [] }
+        let nFrames = 1 + (x.count - n) / hop
+        let log2n = vDSP_Length(10)
+        guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else { return [] }
+        defer { vDSP_destroy_fftsetup(setup) }
+
+        var window = [Float](repeating: 0, count: n)
+        vDSP_hann_window(&window, vDSP_Length(n), Int32(vDSP_HANN_NORM))
+        let nBins = n / 2 + 1
+        let binHz = sr / Double(n)
+        let voiceLo = max(1, Int(vocalBandLowHz / binHz))
+        let voiceHi = min(nBins - 1, Int(vocalBandHighHz / binHz))
+        let voiceCount = max(0, voiceHi - voiceLo + 1)
+        guard voiceCount > 0 else { return [Float](repeating: 0, count: nFrames) }
+
+        var out = [Float](repeating: 0, count: nFrames)
+        var frame = [Float](repeating: 0, count: n)
+        var realp = [Float](repeating: 0, count: n / 2)
+        var imagp = [Float](repeating: 0, count: n / 2)
+        var mags = [Float](repeating: 0, count: nBins)
+
+        x.withUnsafeBufferPointer { xb in
+            for t in 0..<nFrames {
+                let start = t * hop
+                vDSP_vmul(xb.baseAddress! + start, 1, window, 1, &frame, 1, vDSP_Length(n))
+                realp.withUnsafeMutableBufferPointer { rp in
+                    imagp.withUnsafeMutableBufferPointer { ip in
+                        var split = DSPSplitComplex(
+                            realp: rp.baseAddress!, imagp: ip.baseAddress!)
+                        frame.withUnsafeBufferPointer { fb in
+                            fb.baseAddress!.withMemoryRebound(
+                                to: DSPComplex.self, capacity: n / 2
+                            ) {
+                                vDSP_ctoz($0, 2, &split, 1, vDSP_Length(n / 2))
+                            }
+                        }
+                        vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+                        rp.baseAddress![0] = 0
+                        ip.baseAddress![0] = 0
+                        mags.withUnsafeMutableBufferPointer { mb in
+                            vDSP_zvmags(&split, 1, mb.baseAddress!, 1, vDSP_Length(n / 2))
+                            var count = Int32(nBins)
+                            vvsqrtf(mb.baseAddress!, mb.baseAddress!, &count)
+                            var voice: Float = 0
+                            vDSP_sve(mb.baseAddress! + voiceLo, 1, &voice, vDSP_Length(voiceCount))
+                            out[t] = voice
+                        }
+                    }
+                }
+            }
         }
         return out
     }
@@ -897,29 +1141,77 @@ enum TrackAnalyzer {
 
     // MARK: - Vocal activity detection
 
-    /// Per-second vocal-presence likelihood on the `rmsEnvelope` grid.
+    /// Per-second vocal-presence likelihood on the `rmsEnvelope` grid (v5).
     ///
-    /// Pure DSP heuristic — no model. Three cues are fused:
-    ///  1. share of spectral magnitude in the 200 Hz–4 kHz vocal band,
-    ///  2. spectral flatness inside that band (voiced speech is harmonic, so
-    ///     flatness drops; cymbals/noise stay flat),
-    ///  3. energy of the 2–8 Hz modulation of that band's envelope, i.e. the
-    ///     syllable/vibrato rate.
-    /// The fused score is gated by the track's own loudness and smoothed with
-    /// a 3-second median filter.
+    /// Pure DSP heuristic — no model. Four cues, all measured inside or around
+    /// the 200 Hz–4 kHz vocal band, are fused:
+    ///  1. share of spectral magnitude in the band (`bandRatio`),
+    ///  2. spectral flatness inside it — voiced sound is harmonic so flatness
+    ///     drops; cymbals/noise stay flat (`flatness`),
+    ///  3. 2–8 Hz modulation of the band envelope, the syllable/vibrato rate
+    ///     (`bandEnvelope`),
+    ///  4. stereo-centre share — the band's mid/(mid+side) energy, high for a
+    ///     centred lead vocal (`midShare`, absent for mono input).
+    ///
+    /// Cue 4 is the fix for v4's shortfall: the three mono-spectral cues cannot
+    /// tell "a harmonic instrument sitting in the mid band" (sax, distorted
+    /// guitar, synth lead) from "someone singing", and validated against StemKit
+    /// separation, v4's top-scored windows often held almost no real vocal
+    /// energy. Lead vocals are almost always panned centre while accompaniment
+    /// and effects spread wider, which the mono downmix throws away — measuring
+    /// it recovers the single most informative cue available without a model.
+    ///
+    /// Presence is a necessary gate (the other cues are meaningless in a band
+    /// holding only leakage); the fused score is gated by the track's own
+    /// loudness and 3-second median-smoothed.
     static func vocalActivity(
         bandRatio: [Float], flatness: [Float], bandEnvelope: [Float],
-        fps: Double, rmsEnvelope: [Float]
+        midShare: [Float]?, fps: Double, rmsEnvelope: [Float]
     ) -> [Float] {
+        let cues = vocalCues(
+            bandRatio: bandRatio, flatness: flatness, bandEnvelope: bandEnvelope,
+            midShare: midShare, fps: fps, rmsEnvelope: rmsEnvelope)
+        return fuseVocalCues(cues)
+    }
+
+    /// The per-second cue vector behind `vocalActivity`, kept as a named type so
+    /// the offline validation harness (`vocaleval`, S0.5) can dump the cues and
+    /// re-fuse them under alternative weights without re-running any FFTs — and
+    /// so v4's fusion can be replayed on byte-identical features for the A/B.
+    /// Each `s*` field is already squashed to 0...1.
+    struct VocalCues: Sendable {
+        /// Vocal-band energy share (cue 1).
+        var band: Double = 0
+        /// Band tonality, `1 − flatness` rescaled (cue 2).
+        var tonal: Double = 0
+        /// 2–8 Hz syllable-rate modulation (cue 3).
+        var mod: Double = 0
+        /// Stereo-centre share (cue 4); 0 and unused when `hasMid` is false.
+        var mid: Double = 0
+        /// Necessary-condition multiplier: is there anything in the band at all.
+        var presence: Double = 0
+        /// Track-relative loudness gate.
+        var gate: Double = 0
+        var hasMid = false
+    }
+
+    /// Per-second cue extraction — everything up to, but not including, the
+    /// weighted fusion. Split out of `vocalActivity` so the fusion weights can
+    /// be re-fit offline against ground truth.
+    static func vocalCues(
+        bandRatio: [Float], flatness: [Float], bandEnvelope: [Float],
+        midShare: [Float]?, fps: Double, rmsEnvelope: [Float]
+    ) -> [VocalCues] {
         let seconds = rmsEnvelope.count
         guard seconds > 0, !bandRatio.isEmpty, fps > 1,
               flatness.count == bandRatio.count,
               bandEnvelope.count == bandRatio.count
-        else { return [Float](repeating: 0, count: seconds) }
+        else { return [VocalCues](repeating: VocalCues(), count: seconds) }
 
         let frames = bandRatio.count
+        let hasMid = (midShare?.count ?? 0) == frames
         let maxRMS = max(rmsEnvelope.max() ?? 0, 1e-9)
-        var raw = [Float](repeating: 0, count: seconds)
+        var out = [VocalCues](repeating: VocalCues(), count: seconds)
 
         for s in 0..<seconds {
             let lo = min(frames, Int(Double(s) * fps))
@@ -928,13 +1220,16 @@ enum TrackAnalyzer {
 
             var meanRatio: Float = 0
             var meanFlat: Float = 0
+            var meanMid: Float = 0
             for t in lo..<hi {
                 meanRatio += bandRatio[t]
                 meanFlat += flatness[t]
+                if hasMid { meanMid += midShare![t] }
             }
             let inv = 1 / Float(hi - lo)
             meanRatio *= inv
             meanFlat *= inv
+            meanMid *= inv
 
             // 2 s window centred on this second for the modulation estimate.
             let wLo = max(0, Int((Double(s) - 0.5) * fps))
@@ -942,21 +1237,75 @@ enum TrackAnalyzer {
             let modRatio = modulationRatio(
                 bandEnvelope, range: wLo..<wHi, fps: fps, lowHz: 2, highHz: 8)
 
+            var c = VocalCues()
+            c.hasMid = hasMid
             // Energy in the vocal band is a necessary condition: flatness and
             // modulation measured in a band that holds nothing but leakage are
             // meaningless (a bass line reads as perfectly "harmonic" there).
-            let presence = clamp01(Double(meanRatio - 0.15) / 0.20)
-            let sBand = clamp01(Double(meanRatio - 0.30) / 0.35)
-            let sTonal = clamp01(Double(0.55 - meanFlat) / 0.40)
+            c.presence = clamp01(Double(meanRatio - 0.15) / 0.20)
+            c.band = clamp01(Double(meanRatio - 0.30) / 0.35)
+            c.tonal = clamp01(Double(0.55 - meanFlat) / 0.40)
             // The 4× STFT overlap lowpasses the envelope, so even noise puts
             // ~0.3 of its modulation power under 8 Hz; that is the floor.
-            let sMod = clamp01((modRatio - 0.35) / 0.35)
-            let fused = presence * (0.40 * sBand + 0.35 * sTonal + 0.25 * sMod)
+            c.mod = clamp01((modRatio - 0.35) / 0.35)
+            // A wide/off-centre band (uncorrelated stereo, ~0.5) scores 0; a
+            // band whose energy is centred pulls the estimate up.
+            c.mid = hasMid ? clamp01(Double(meanMid - 0.55) / 0.30) : 0
+            c.gate = clamp01(Double(rmsEnvelope[s] / maxRMS - 0.05) / 0.10)
+            out[s] = c
+        }
+        return out
+    }
 
-            let gate = clamp01(Double(rmsEnvelope[s] / maxRMS - 0.05) / 0.10)
-            raw[s] = Float(clamp01(fused * gate))
+    /// Weighted fusion of the per-second cues, 3-second median smoothed.
+    ///
+    /// `legacyV4` replays the three-cue fusion that shipped in v4 (ignoring the
+    /// mid/side cue, and using v4's weights, even when a stereo image is
+    /// present) — used only by the offline harness, so the before/after
+    /// comparison runs on identical features.
+    static func fuseVocalCues(_ cues: [VocalCues], legacyV4: Bool = false) -> [Float] {
+        var raw = [Float](repeating: 0, count: cues.count)
+        for (s, c) in cues.enumerated() {
+            // Mono-spectral combination; weights sum to 1. This alone governs
+            // mono input, where the stereo-centre cue does not exist.
+            let monoCombo = legacyV4
+                ? v4BandWeight * c.band + v4TonalWeight * c.tonal + v4ModWeight * c.mod
+                : bandWeight * c.band + tonalWeight * c.tonal + modWeight * c.mod
+            // Stereo-centre share, blended in when available.
+            let combined = (!legacyV4 && c.hasMid)
+                ? (1 - midWeight) * monoCombo + midWeight * c.mid
+                : monoCombo
+            raw[s] = Float(clamp01(c.presence * combined * c.gate))
         }
         return medianFilter3(raw)
+    }
+
+    // Fusion weights, fit on the eval corpus against StemKit per-second
+    // vocal/mix ground truth via the `vocaleval` harness (18 tracks across all
+    // six playlists, 3×30 s windows each). The search was run under
+    // leave-one-playlist-out CV; band-dominant weights with a ~0.35 centre blend
+    // were stable across all six folds. The v4 set is retained verbatim so the
+    // harness can reproduce the pre-change curve for the A/B.
+    private static let bandWeight = 0.55
+    private static let tonalWeight = 0.20
+    private static let modWeight = 0.25
+    /// Weight of the stereo-centre cue when a stereo image is available.
+    private static let midWeight = 0.35
+    private static let v4BandWeight = 0.40
+    private static let v4TonalWeight = 0.35
+    private static let v4ModWeight = 0.25
+
+    /// Per-frame centre share `mid/(mid+side)` of vocal-band energy, aligned to
+    /// `frames`. 1 → fully centred (mono-in-stereo), 0 → pure side, 0.5 →
+    /// uncorrelated. Neutral 0.5 where the stereo envelopes run short.
+    static func midSharePerFrame(mid: [Float], side: [Float], frames: Int) -> [Float] {
+        var out = [Float](repeating: 0.5, count: frames)
+        let count = min(frames, min(mid.count, side.count))
+        for t in 0..<count {
+            let denom = mid[t] + side[t]
+            out[t] = denom > 1e-9 ? mid[t] / denom : 0.5
+        }
+        return out
     }
 
     /// Fraction of the (mean-removed) envelope's power that sits between

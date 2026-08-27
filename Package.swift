@@ -140,6 +140,21 @@ let package = Package(
                 .swiftLanguageMode(.v5),
             ]
         ),
+        // S0.5 validation harness: correlate the analyzer's per-second
+        // vocalActivity against StemKit vocal/mix ground truth on the eval
+        // corpus. macOS only (StemKit/MLX). Not shipped in the app.
+        .executableTarget(
+            name: "vocaleval",
+            dependencies: [
+                .target(name: "KumoneCore", condition: .when(platforms: [.macOS])),
+                .target(name: "StemKit", condition: .when(platforms: [.macOS])),
+                .product(name: "MLX", package: "mlx-swift", condition: .when(platforms: [.macOS])),
+            ],
+            path: "Sources/vocaleval",
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
+        ),
         .testTarget(
             name: "KumoneCoreTests",
             dependencies: ["KumoneCore"],

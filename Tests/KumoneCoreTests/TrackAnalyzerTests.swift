@@ -447,4 +447,70 @@ import Foundation
         #expect(head.allSatisfy { $0 > 0.5 }, "head \(Array(head))")
         #expect(tail.allSatisfy { $0 < 0.1 }, "tail \(Array(tail))")
     }
+
+    // MARK: - v5 cue: stereo mid/side centre share
+
+    /// A pure tone at `hz`.
+    private func tone(_ hz: Double, seconds: Double, sampleRate sr: Double,
+                      amplitude: Float = 0.5) -> [Float] {
+        let n = Int(seconds * sr)
+        return (0..<n).map { Float(Double(amplitude) * sin(2 * .pi * hz * Double($0) / sr)) }
+    }
+
+    /// Mid/side energy: a centred vocal-band tone (L = R) reads as fully
+    /// centred; the same tone panned to pure side (L = −R) reads as fully wide.
+    @Test func midShareSeparatesCentredFromSide() {
+        let sr = 22_050.0
+        let l = tone(1_000, seconds: 2, sampleRate: sr)
+
+        // Centred: L = R → mid = L, side = 0.
+        let centredMid = l
+        let centredSide = [Float](repeating: 0, count: l.count)
+        let cMidE = TrackAnalyzer.voiceBandEnergyPerFrame(centredMid, sampleRate: sr)
+        let cSideE = TrackAnalyzer.voiceBandEnergyPerFrame(centredSide, sampleRate: sr)
+        let cShare = TrackAnalyzer.midSharePerFrame(
+            mid: cMidE, side: cSideE, frames: cMidE.count)
+        let cMean = cShare.reduce(0, +) / Float(cShare.count)
+        #expect(cMean > 0.95, "centred mid-share \(cMean)")
+
+        // Pure side: L = −R → mid = 0, side = L.
+        let sideMid = [Float](repeating: 0, count: l.count)
+        let sideSide = l
+        let sMidE = TrackAnalyzer.voiceBandEnergyPerFrame(sideMid, sampleRate: sr)
+        let sSideE = TrackAnalyzer.voiceBandEnergyPerFrame(sideSide, sampleRate: sr)
+        let sShare = TrackAnalyzer.midSharePerFrame(
+            mid: sMidE, side: sSideE, frames: sMidE.count)
+        let sMean = sShare.reduce(0, +) / Float(sShare.count)
+        #expect(sMean < 0.05, "pure-side mid-share \(sMean)")
+    }
+
+    /// The stereo-centre cue lifts a marginal, centred vocal-band second and
+    /// leaves a wide one untouched — the fusion's intended effect.
+    @Test func midShareLiftsCentredVocalSecond() {
+        let fps = TrackAnalyzer.analysisSampleRate / Double(TrackAnalyzer.hopSize)
+        let framesPerSec = Int(fps)
+        let seconds = 6
+        let n = framesPerSec * seconds
+
+        // A middling mono second: some band energy, moderately tonal — enough
+        // to pass the presence gate but not saturate on its own.
+        let bandRatio = [Float](repeating: 0.45, count: n)
+        let flatness = [Float](repeating: 0.45, count: n)
+        let bandEnvelope = [Float](repeating: 1.0, count: n)
+        let rms = [Float](repeating: 1.0, count: seconds)
+
+        func score(mid: [Float]?) -> Float {
+            let v = TrackAnalyzer.vocalActivity(
+                bandRatio: bandRatio, flatness: flatness, bandEnvelope: bandEnvelope,
+                midShare: mid, fps: fps, rmsEnvelope: rms)
+            return v.reduce(0, +) / Float(v.count)
+        }
+
+        let centred = score(mid: [Float](repeating: 0.95, count: n))
+        let wide = score(mid: [Float](repeating: 0.50, count: n))
+        let mono = score(mid: nil)
+
+        #expect(centred > wide + 0.05, "centred \(centred) vs wide \(wide)")
+        #expect(wide <= mono + 0.001, "wide \(wide) should not exceed mono \(mono)")
+    }
 }

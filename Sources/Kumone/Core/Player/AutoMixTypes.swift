@@ -15,7 +15,7 @@ enum Deck: String, Sendable {
 /// persisted as a sidecar next to the cached audio (spec §4).
 struct TrackAnalysis: Codable, Sendable {
     /// Bump when the algorithm changes; stale sidecars are re-analyzed.
-    static let currentVersion = 4
+    static let currentVersion = 5
 
     let version: Int
     let bpm: Double

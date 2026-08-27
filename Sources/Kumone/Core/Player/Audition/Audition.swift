@@ -31,17 +31,6 @@ public enum Audition {
         return fresh
     }
 
-    /// Offline validation hook (S0.5): recompute the current analyzer's
-    /// per-second vocal-activity curve and its rms grid for `url`, bypassing the
-    /// sidecar cache. Used by the vocal-activity/StemKit correlation harness to
-    /// score the live algorithm against ground truth; not part of playback.
-    public static func vocalActivityForEval(
-        fileAt url: URL
-    ) throws -> (vocal: [Float], rms: [Float], duration: TimeInterval) {
-        let a = try TrackAnalyzer.analyze(fileAt: url)
-        return (a.vocalActivity, a.rmsEnvelope, a.duration)
-    }
-
     /// Whether a usable sidecar already exists (so the CLI can say "analyzing"
     /// only when it really is).
     public static func hasCachedAnalysis(for url: URL) -> Bool {
