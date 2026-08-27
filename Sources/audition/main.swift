@@ -52,7 +52,7 @@ func url(_ path: String) -> URL {
 
 let usage = """
 usage:
-  audition plan   <fileA> <fileB> [--json] [--set name=value,...]
+  audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
   audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged] [--fade N]
                                   [--stem acapella|instrumental|duck[:9]]
                                   [--pre N] [--post N] [--set name=value,...]
@@ -64,6 +64,9 @@ usage:
   audition knobs  [--json]
 
   --style   force one technique, to hear it in isolation
+  --stems   on|off (default off) — tell the planner a vocal separator is
+            available, so it may choose vocalDuck / acapellaOver itself. Off is
+            the product default and reproduces the pre-stem decision exactly.
   --stem    layer a stem technique on top of the chosen style (render only):
             acapella      the outgoing vocal floats over the incoming mix
             instrumental  the outgoing vocal is wiped, it leaves instrumental
@@ -129,6 +132,22 @@ func explain(_ d: Audition.Decision) -> String {
     }
     if d.overridden { mechanics += "  [OVERRIDDEN by --style/--fade]" }
     lines.append(mechanics)
+    if d.stemsReady {
+        var stemLine = "  stems on      "
+        if let technique = d.plannedStemTechnique {
+            stemLine += "planner chose \(technique)"
+            if let base = d.stemBaselineOutPoint, let baseOverlap = d.stemBaselineOverlap {
+                stemLine += "  (without stems: out @ \(mmss(base)),"
+                    + " overlap \(f(baseOverlap))s)"
+            }
+        } else {
+            stemLine += "planner chose no stem technique"
+                + "   [needs outgoing vocals > \(f(th("stemVocalActiveRatio")))"
+                + " and either incoming > \(f(th("vocalClashRatio")))"
+                + " (duck) or ≤ \(f(th("stemAcapellaIncomingVocalMax"))) at compatible (acapella)]"
+        }
+        lines.append(stemLine)
+    }
     for miss in d.nearMisses {
         lines.append("  ⚠︎ borderline: \(miss)")
     }
@@ -172,12 +191,19 @@ func decide(_ args: Arguments, a: URL, b: URL) -> Audition.Decision {
         }
         stem = parsed
     }
+    let stems: StemAvailability
+    switch args.flags["stems"] ?? "off" {
+    case "on", "ready", "true": stems = .ready
+    case "off", "none", "false": stems = .none
+    case let raw: fail("unknown --stems '\(raw)'; expected on|off")
+    }
     for file in [a, b] where !Audition.hasCachedAnalysis(for: file) {
         FileHandle.standardError.write(Data("  analyzing \(file.lastPathComponent)…\n".utf8))
     }
     do {
         return try Audition.decide(outgoing: a, incoming: b,
                                    style: style, fade: args.double("fade"), stem: stem,
+                                   stems: stems,
                                    config: configOverrides(args))
     } catch {
         fail("\(a.lastPathComponent) → \(b.lastPathComponent): \(error.localizedDescription)")
@@ -360,6 +386,7 @@ func runBatch(_ args: Arguments) {
                     + " | \(optional(d.tempoRatio, 3)) | \(d.keyDistance.map(String.init) ?? "—")"
                     + " | \(optional(d.outgoingVocalScore))/\(optional(d.incomingVocalScore))"
                     + " | \(d.planKind) | \(d.styleDescription)"
+                    + " | \(d.plannedStemTechnique ?? "—")"
                     + " | \(f(d.overlapDuration))s"
                     + " | \(d.outPoint.map(mmss) ?? "—") | \(rendered) |")
     }
@@ -393,6 +420,10 @@ func runBatch(_ args: Arguments) {
     summary.append(histogram("Tier", tally { $0.tier }))
     summary.append(histogram("Plan", tally { $0.planKind }))
     summary.append(histogram("Style", tally { $0.styleDescription }))
+    if decisions.contains(where: \.stemsReady) {
+        summary.append(histogram("Planner-chosen stem technique",
+                                 tally { $0.plannedStemTechnique ?? "(none)" }))
+    }
     summary.append("**Overlap length** — \(fadeSummary)\n")
     let borderline = decisions.filter { !$0.nearMisses.isEmpty }
     if !borderline.isEmpty {
@@ -420,8 +451,8 @@ func runBatch(_ args: Arguments) {
         "## Per-pair decisions",
         "",
         "| pair | tier | loudness dB | timbre | tempo | key | vocals out/in "
-            + "| plan | style | overlap | out point | render |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+            + "| plan | style | stem | overlap | out point | render |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ] + rows).joined(separator: "\n") + "\n"
 
     let docURL = outDir.appendingPathComponent("decisions.md")

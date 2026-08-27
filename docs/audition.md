@@ -124,17 +124,56 @@ the render still happens as a plain whole-mix one and names the reason.
 `batch` ignores `--stem` on purpose: a corpus sweep is about where the
 planner's thresholds land, and a model pass per pair would cost minutes.
 
+### 7. Let the planner pick a stem technique — `--stems on`
+
+`--stem` is a hand override. `--stems on` is the other thing: it tells the
+planner a separator is available (`StemAvailability.ready`), and lets it choose
+a technique itself under the rules in `TransitionPlanner`'s "Stem layer":
+
+- **vocalDuck** — the outgoing window is vocal-active (`stemVocalActiveRatio`)
+  and so is the incoming opening. Without stems this is the clash the planner
+  punishes by cutting the crossfade to `vocalClashFadeCap` and refusing the
+  8/16-bar beat-matched upgrades; with them the punishment becomes a technique.
+- **acapellaOver** — vocal-active outgoing over an instrumental-leaning opening
+  (`stemAcapellaIncomingVocalMax`), at `tier == .compatible` only.
+- **instrumentalOut** is never chosen automatically (it never won a pair in
+  S1's blind test); `--stem instrumental` still auditions it.
+
+Both rules also re-aim the out point at a sung phrase boundary *before* any
+outro fade, because the plain search pins the hand-over to the fade itself,
+where there is nothing left to separate.
+
+```sh
+swift run audition plan  a.flac b.flac --stems on
+swift run audition batch <corpusDir>   --stems on        # adds a "stem" column
+```
+
+`--stems off` is the default and the product path: with it the planner is
+field-for-field the pre-stem planner and the four `stem` knobs are never read.
+The console has the same switch (default on) and narrates the rule in its
+derivation chain.
+
+**Calibration confidence is low.** On the 16-track corpus the planner's only
+vocal signal, `TrackAnalysis.vocalActivity`, does not predict the separator's
+actual vocal energy: windows scoring 1.26–1.31 came back at `vocal/mix`
+0.000–0.014, while windows scoring 0.97–1.06 came back at 0.29–0.36. The
+mechanism works; the signal it steers on does not discriminate yet. Fix the
+signal (predev §7.3: mid/side centre ratio + HPSS residual) before trusting
+these thresholds.
+
 ---
 
 ## Commands
 
 ```
-audition plan   <fileA> <fileB> [--json] [--set name=value,...]
+audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
 audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged]
                                 [--stem acapella|instrumental|duck[:9]]
+                                [--stems on|off]
                                 [--fade N] [--pre N] [--post N] [--set ...]
 audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
-                            [--style ...] [--fade N] [--pre N] [--post N] [--set ...]
+                            [--style ...] [--stems on|off]
+                            [--fade N] [--pre N] [--post N] [--set ...]
 audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
                 [--state DIR]
 audition knobs  [--json]

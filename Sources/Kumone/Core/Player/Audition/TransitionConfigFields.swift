@@ -147,6 +147,24 @@ extension TransitionPlanner.Config {
         field("echoDelayMax", "shape",
               "回声间隔的上限（秒），太长会拖沓。",
               0.1, 3, 0.01, 2, \.echoDelayMax),
+
+        // --- Stem layer. Only read when人声分离可用；关掉时这四项完全不参与判断。
+        field("stemVocalActiveRatio", "stem",
+              "出曲的交接窗口里人声要有平常的几倍密，才值得动用人声分离。"
+                  + "调小 = 更容易升级到 stem 手法，但也更容易选到其实没什么人声的段落。"
+                  + "参考：语料里每首歌自己的 8 秒窗口，中位数 1.00，第 95 百分位 1.16–1.58。",
+              0.8, 2, 0.01, 2, \.stemVocalActiveRatio),
+        field("stemAcapellaIncomingVocalMax", "stem",
+              "要让出曲的清唱飘在入曲上，入曲开头的人声必须低于自己平常的这个倍数（即“基本是伴奏”）。"
+                  + "调大 = 更多曲子够得着 acapella，但入曲一开口就会变成两个主唱抢戏。",
+              0.2, 1.5, 0.01, 2, \.stemAcapellaIncomingVocalMax),
+        field("stemMinOverlap", "stem",
+              "叠加短于这个秒数就不用 stem 手法：手法本身展不开，也不值得为它跑一次人声分离。",
+              2, 20, 0.5, 1, \.stemMinOverlap),
+        field("stemDuckDepthDB", "stem",
+              "两边都在唱时，出曲的人声被压低多少 dB（S1 盲听选的是 9）。"
+                  + "调大 = 出曲人声让得更彻底，但也更容易听出“被人按住了”。",
+              0, 24, 0.5, 1, \.stemDuckDepthDB),
     ]
 
     /// This config as `name: value`, in field order.

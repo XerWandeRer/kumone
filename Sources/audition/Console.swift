@@ -162,10 +162,14 @@ final class Console: @unchecked Sendable {
             }
             stem = Audition.StemOverride.parse(spec)
         }
+        // The page's "stems 可用" switch. Absent (the baseline batch run, and
+        // any older client) means off, which is the product default.
+        let stems: StemAvailability =
+            (body["stems"] as? Bool ?? false) ? .ready : .none
         return try Audition.decide(
             outgoing: expand(a), incoming: expand(b),
             style: style, fade: fade.flatMap { $0 > 0 ? $0 : nil }, stem: stem,
-            config: config)
+            stems: stems, config: config)
     }
 
     private func expand(_ path: String) -> URL {
@@ -191,7 +195,7 @@ final class Console: @unchecked Sendable {
             guard var row = summarize(pair, body: body) else { continue }
             let base = index < baseline.count ? baseline[index] : [:]
             row["standard"] = base
-            row["changed"] = ["tier", "plan", "style", "overlap"].contains {
+            row["changed"] = ["tier", "plan", "style", "overlap", "stem"].contains {
                 !equalField(row[$0], base[$0])
             }
             rows.append(row)
@@ -227,6 +231,10 @@ final class Console: @unchecked Sendable {
             "loudness": d.loudnessGapDB, "timbre": d.timbreDistance,
             "demotedByKey": d.demotedByKey,
             "nearMisses": d.nearMisses,
+            // Planned, not rendered: the batch sweep stays whole-mix (a stem
+            // pass per pair would cost minutes), so this column says what the
+            // planner *would* ask for.
+            "stem": d.plannedStemTechnique ?? "—",
         ]
         if let t = d.tempoRatio { row["tempo"] = t }
         if let k = d.keyDistance { row["key"] = k }
@@ -269,7 +277,11 @@ final class Console: @unchecked Sendable {
         let out = renderDir.appendingPathComponent(name)
         let pre = (body["pre"] as? NSNumber)?.doubleValue ?? 12
         let post = (body["post"] as? NSNumber)?.doubleValue ?? 12
-        let wantsStem = (body["stem"] as? String).map { !$0.isEmpty && $0 != "none" } ?? false
+        // Either the picker asked for one, or the planner chose one itself —
+        // both mean the job will pay for a separation pass, which is what the
+        // progress line is for.
+        let wantsStem = decision.plannedStemTechnique != nil
+            || ((body["stem"] as? String).map { !$0.isEmpty && $0 != "none" } ?? false)
 
         let id = UUID().uuidString
         let job = RenderJob()

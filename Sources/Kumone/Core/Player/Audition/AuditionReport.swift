@@ -128,6 +128,10 @@ extension Audition {
         public let style: StyleReport
         public let nearMisses: [String]
         public let overridden: Bool
+        /// Whether the planner was offered a vocal separator, and what it did
+        /// with the offer.
+        public let stemsReady: Bool
+        public let plannedStemTechnique: String?
         public let config: [String: Double]
         public let configDiff: [ConfigDiffEntry]
     }
@@ -150,6 +154,8 @@ extension Audition {
             style: styleReport(d, config: c),
             nearMisses: d.nearMisses,
             overridden: d.overridden,
+            stemsReady: d.stemsReady,
+            plannedStemTechnique: d.plannedStemTechnique,
             config: d.config,
             configDiff: c.diffFromStandard.map {
                 ConfigDiffEntry(name: $0.name, standard: $0.standard, current: $0.current)
@@ -501,11 +507,17 @@ extension Audition {
                 outcome: capped
                     ? String(format: "→ 两边人声都太密，叠加从 %.2f 秒砍到 %.2f 秒。",
                              raw, d.overlapDuration)
-                    : String(format: "→ 不会打架，叠加保持 %.2f 秒。", d.overlapDuration),
+                    : (d.plannedStemTechnique != nil
+                       ? String(format: "→ 这一步让位给了下面的人声分离：叠加不砍，保持 %.2f 秒。",
+                                d.overlapDuration)
+                       : String(format: "→ 不会打架，叠加保持 %.2f 秒。", d.overlapDuration)),
                 fired: capped))
         }
 
-        // 6. Style.
+        // 6. Stem layer.
+        steps.append(stemStep(d, config: c))
+
+        // 7. Style.
         steps.append(ChainStep(
             stage: "style", title: "出曲用什么姿势离场",
             rule: styleRule(d.tier),
@@ -521,6 +533,72 @@ extension Audition {
                 fired: true))
         }
         return steps
+    }
+
+    /// The stem-layer step: which of the two upgrade rules fired, on what
+    /// numbers, and where it moved the hand-over to. Always emitted — saying
+    /// *why* a stem technique was not chosen is the more common and the more
+    /// useful case.
+    private static func stemStep(
+        _ d: Decision, config c: TransitionPlanner.Config
+    ) -> ChainStep {
+        let rule = "人声分离可用时，再问两句：出曲的交接窗口里人声够不够密（"
+            + String(format: "≥ %.2f 倍", c.stemVocalActiveRatio)
+            + "）？如果够，而且入曲开头也在唱，就不再砍短叠加，改成把出曲人声压低"
+            + String(format: "（vocal duck，%.0f dB）", c.stemDuckDepthDB)
+            + "；如果够，而入曲开头基本是伴奏（"
+            + String(format: "≤ %.2f 倍", c.stemAcapellaIncomingVocalMax)
+            + "）且这一对很搭，就让出曲的清唱飘在入曲上（acapella over）。"
+            + "两条都不成立就完全不用 stem。instrumental out 从不自动选（S1 盲听里一次没赢过），"
+            + "只保留手动挑选。"
+
+        guard d.stemsReady else {
+            return ChainStep(
+                stage: "stem", title: "要不要动用人声分离",
+                rule: rule,
+                detail: "这次没有告诉规划器人声分离可用（stems = none），"
+                    + "所以下面四个 stem 参数一个都没被读到。",
+                outcome: "→ 不用 stem，结论与不带人声分离时逐字段一致。",
+                fired: false)
+        }
+
+        let ov = d.outgoingVocalScore, iv = d.incomingVocalScore
+        var detail = String(format: "交接窗口的人声密度：出曲 %@ 倍（门槛 %.2f）、入曲 %@ 倍"
+                            + "（打架线 %.2f，伴奏线 %.2f）；叠加 %.2f 秒（stem 至少要 %.2f 秒）。",
+                            ov.map { String(format: "%.2f", $0) } ?? "—",
+                            c.stemVocalActiveRatio,
+                            iv.map { String(format: "%.2f", $0) } ?? "—",
+                            c.vocalClashRatio, c.stemAcapellaIncomingVocalMax,
+                            d.overlapDuration, c.stemMinOverlap)
+        if let base = d.stemBaselineOutPoint, let baseOverlap = d.stemBaselineOverlap {
+            detail += String(format: "　不用 stem 的话，这一对会在 %@ 交接、叠 %.2f 秒。",
+                             mmssText(base), baseOverlap)
+        }
+
+        let outcome: String
+        if let technique = d.plannedStemTechnique {
+            let moved = d.stemBaselineOutPoint.map { abs($0 - (d.outPoint ?? $0)) > 0.05 } ?? false
+            outcome = "→ 升级到 \(technique)"
+                + (moved
+                   ? "，并把交接点从尾奏挪到 \(mmssText(d.outPoint ?? 0)) 这个还在唱的乐句起点上。"
+                   : "，交接点不变。")
+        } else if (ov ?? 0) < c.stemVocalActiveRatio {
+            outcome = "→ 出曲尾部找不到一个人声够密的乐句起点，"
+                + "stem 手法在这里等于空转，所以不用。"
+        } else if d.overlapDuration < c.stemMinOverlap {
+            outcome = String(format: "→ 叠加只有 %.2f 秒，撑不起 stem 手法，不用。",
+                             d.overlapDuration)
+        } else {
+            outcome = "→ 出曲这边够唱，但入曲开头既没热到要压低、也没静到能飘清唱"
+                + "（而且 acapella 只在“很搭”这一档才给），所以不用。"
+        }
+        return ChainStep(stage: "stem", title: "要不要动用人声分离",
+                         rule: rule, detail: detail, outcome: outcome,
+                         fired: d.plannedStemTechnique != nil)
+    }
+
+    private static func mmssText(_ t: TimeInterval) -> String {
+        String(format: "%d:%05.2f", Int(t) / 60, t.truncatingRemainder(dividingBy: 60))
     }
 
     /// The tier, said the way a person would say it. The English term stays

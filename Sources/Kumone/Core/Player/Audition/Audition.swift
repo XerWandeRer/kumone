@@ -47,9 +47,13 @@ public enum Audition {
         case plain, sweep, echo, staged
     }
 
-    /// `--stem` values. The planner never asks for a stem technique yet, so
-    /// this is how the tuning loop hears one: it layers onto whatever style
-    /// the planner (or `--style`) chose, rather than replacing it.
+    /// `--stem` values: a technique picked by hand, layered onto whatever
+    /// style the planner (or `--style`) chose rather than replacing it.
+    ///
+    /// The planner can now choose `vocalDuck` / `acapellaOver` itself when it
+    /// is told `stems: .ready`; this stays the way to hear a technique the
+    /// rules would not have picked — `instrumentalOut` above all, which is
+    /// never chosen automatically.
     public enum StemOverride: Sendable, Equatable {
         case acapella
         case instrumental
@@ -127,6 +131,17 @@ public enum Audition {
         /// Whether `--style` / `--fade` rewrote the planner's own choice.
         public let overridden: Bool
 
+        /// Whether the planner was told a vocal separator is available.
+        public let stemsReady: Bool
+        /// The stem technique the *planner* chose, before any `--stem`
+        /// override — nil when it chose none (or was never offered stems).
+        public let plannedStemTechnique: String?
+        /// What the same pair would have got with `stems: .none`, so the
+        /// console can say how far the stem rules moved the hand-over.
+        /// Nil when stems were not offered.
+        public let stemBaselineOutPoint: TimeInterval?
+        public let stemBaselineOverlap: TimeInterval?
+
         /// "timbre 0.31 vs clash line 0.30" — signals sitting close enough to a
         /// threshold that nudging the constant would flip this pair.
         public let nearMisses: [String]
@@ -155,6 +170,7 @@ public enum Audition {
         style styleOverride: StyleOverride? = nil,
         fade fadeOverride: TimeInterval? = nil,
         stem stemOverride: StemOverride? = nil,
+        stems: StemAvailability = .none,
         config configOverrides: [String: Double] = [:],
         useCache: Bool = true
     ) throws -> Decision {
@@ -169,7 +185,20 @@ public enum Audition {
             && (keyDistance ?? 0) >= config.clashKeyDistance
         let effectiveTier = demoted ? TransitionPlanner.CompatibilityTier.neutral : rawTier
 
-        var planned = TransitionPlanner.plan(outgoing: out, incoming: inc, config: config)
+        var planned = TransitionPlanner.plan(outgoing: out, incoming: inc,
+                                             stems: stems, config: config)
+        let plannedStem = planned.style.stemTechnique
+        // The same decision without stems, purely so the console can quote the
+        // difference. Planning is a pure function over two cached analyses, so
+        // this costs microseconds.
+        var baselineOutPoint: TimeInterval?
+        var baselineOverlap: TimeInterval?
+        if stems == .ready {
+            let base = TransitionPlanner.plan(outgoing: out, incoming: inc,
+                                              stems: .none, config: config)
+            baselineOutPoint = base.plan.outPoint
+            baselineOverlap = TransitionAutomation.Geometry(plan: base.plan).overlapDuration
+        }
         var overridden = false
         if let fadeOverride {
             planned = applyFade(fadeOverride, to: planned, outgoingDuration: out.duration)
@@ -234,6 +263,10 @@ public enum Audition {
             overlapDuration: window, overlapBars: bars,
             outgoingRate: outRate, incomingRate: inRate,
             overridden: overridden,
+            stemsReady: stems == .ready,
+            plannedStemTechnique: plannedStem?.label,
+            stemBaselineOutPoint: baselineOutPoint,
+            stemBaselineOverlap: baselineOverlap,
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
                                    outVocal: outVocal, inVocal: inVocal, config: config),
             rawTier: name(of: rawTier),

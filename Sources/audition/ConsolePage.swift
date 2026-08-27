@@ -194,7 +194,7 @@ audio{width:100%;margin:.4rem 0;height:38px}
   <h2>它是怎么一步步想出来的</h2>
   <div class="card"><ol class="chain" id="chain"></ol></div>
 
-  <h2>参数：31 个可以拧的旋钮 <span class="muted" id="diffCount"></span></h2>
+  <h2>参数：<span id="knobCount">…</span> 个可以拧的旋钮 <span class="muted" id="diffCount"></span></h2>
   <div class="card">
     <div class="row">
       <button id="resetAll">全部恢复出厂设置</button>
@@ -216,7 +216,19 @@ audio{width:100%;margin:.4rem 0;height:38px}
     </div>
     <div class="row" style="margin-top:.5rem">
       <div class="grow">
-        <label class="muted" for="stemSel">stem 手法（只影响试听渲染）</label>
+        <label class="muted">
+          <input type="checkbox" id="stemsReady" checked style="width:auto;margin-right:.35rem">
+          告诉规划器「人声分离可用」（这台机器模型就绪，所以默认开）
+        </label>
+        <p class="muted" style="margin:.15rem 0 0;font-size:.75rem">
+          关掉 = 产品里的默认行为，规划器完全不看下面那组 stem 参数，
+          结论与没有 stem 功能时逐字段一致。打开后它可以自己选 vocal duck / acapella over，
+          并把交接点挪到出曲还在唱的地方。</p>
+      </div>
+    </div>
+    <div class="row" style="margin-top:.5rem">
+      <div class="grow">
+        <label class="muted" for="stemSel">手动指定 stem 手法（盖掉规划器的选择，只影响试听渲染）</label>
         <select id="stemSel"></select>
       </div>
       <div class="grow" id="duckBox" style="display:none">
@@ -238,7 +250,7 @@ audio{width:100%;margin:.4rem 0;height:38px}
 
   <h2>让 AI 帮你调</h2>
   <div class="card">
-    <p class="muted">把这一页现在看到的一切——系统怎么决策、31 个参数各是什么意思和当前取值、
+    <p class="muted">把这一页现在看到的一切——系统怎么决策、每个参数各是什么意思和当前取值、
       这一对歌的五项信号和判断过程、你改动过哪些参数——打包成一段纯文本，
       贴给任意一个 AI 聊天窗口，它回一段 JSON，再贴回来就能应用。</p>
     <div class="row">
@@ -320,6 +332,7 @@ async function boot() {
     .concat((BOOT.stems || []).map(s => `<option value="${s}">${STEM_LABEL[s] || s}</option>`))
     .join("");
   $("#duckDB").value = Math.abs(BOOT.duckDefaultDB ?? 9);
+  $("#knobCount").textContent = BOOT.fields.length;
   paintDuck();
   CONFIG = Object.assign({}, BOOT.standard);
   buildKnobs();
@@ -334,6 +347,7 @@ const GROUPS = {
   beatmatch: "能不能踩到同一个拍子上",
   overlap: "两首歌该叠多久",
   shape: "从哪里交接、出曲怎么离场",
+  stem: "要不要动用人声分离（只在上面的「人声分离可用」打开时才生效）",
 };
 
 function buildKnobs() {
@@ -409,6 +423,7 @@ function requestBody() {
     outgoing: $("#outSel").value, incoming: $("#inSel").value,
     config: CONFIG, style: $("#styleSel").value, fade: fade,
     stem: $("#stemSel").value,
+    stems: $("#stemsReady").checked,
     duckDB: -Math.abs(parseFloat($("#duckDB").value) || 9),
   };
 }
@@ -655,11 +670,12 @@ $("#batchBtn").onclick = async () => {
         : `<td><b>${show}</b> <span class="was">← ${wasShow}</span></td>`;
     };
     $("#batchTable").innerHTML =
-      `<tr><th>出 → 入</th><th>搭不搭</th><th>怎么接</th><th>出曲怎么离场</th><th>叠多久 s</th>
-        <th>音量差 dB</th><th>音色差</th><th>出曲交接点</th></tr>` +
+      `<tr><th>出 → 入</th><th>搭不搭</th><th>怎么接</th><th>出曲怎么离场</th><th>stem 手法</th>
+        <th>叠多久 s</th><th>音量差 dB</th><th>音色差</th><th>出曲交接点</th></tr>` +
       r.pairs.map(p => `<tr class="${p.changed ? "changed" : ""}">
         <td title="${p.outgoing} → ${p.incoming}">${p.outgoing.slice(0, 10)} → ${p.incoming.slice(0, 10)}</td>
-        ${cell(p, "tier")}${cell(p, "plan")}${cell(p, "style")}${cell(p, "overlap", 2)}
+        ${cell(p, "tier")}${cell(p, "plan")}${cell(p, "style")}${cell(p, "stem")}
+        ${cell(p, "overlap", 2)}
         <td>${fmt(p.loudness)}</td><td>${fmt(p.timbre, 3)}</td><td>${mmss(p.outPoint)}</td>
       </tr>`).join("");
   } catch (e) {
@@ -734,6 +750,12 @@ function aiContext() {
     lines.push(`   数据：${c.detail}`);
     lines.push(`   结果：${c.outcome}`);
   });
+  lines.push("");
+  lines.push("## 人声分离");
+  lines.push(r.stemsReady
+    ? `这次告诉规划器人声分离可用，它${r.plannedStemTechnique
+        ? "自己选了 " + r.plannedStemTechnique : "没有选任何 stem 手法"}。`
+    : "这次没有告诉规划器人声分离可用，stem 那一组参数完全没参与判断。");
   lines.push("");
   lines.push("## 当前结论");
   lines.push(`档位 ${r.tier}（${tierText(r.tier)}）${r.demotedByKey ? "，被和声降过一级" : ""}`
@@ -1014,6 +1036,7 @@ $("#inSel").onchange = plan;
 $("#styleSel").onchange = plan;
 $("#fadeOv").oninput = schedulePlan;
 $("#stemSel").onchange = () => { paintDuck(); plan(); };
+$("#stemsReady").onchange = () => { BATCH = null; plan(); };
 $("#duckDB").oninput = () => { paintDuck(); schedulePlan(); };
 
 boot().catch(e => { $("#lead").textContent = "启动失败：" + e.message; });

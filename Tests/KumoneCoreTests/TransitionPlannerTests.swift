@@ -514,6 +514,251 @@ import Foundation
         #expect(plan.overlapBars == 4)
     }
 
+    // MARK: - Stem layer
+
+    /// Slow-building incoming: earns the 18 s fade the stem tests reason about.
+    private func slowBuildEnvelope() -> [Float] {
+        [Float](repeating: 0.1, count: 12) + [Float](repeating: 0.9, count: 188)
+    }
+
+    /// Outgoing whose last third is sung, incoming whose opening is sung —
+    /// the two-lead-vocals case. Without stems this is punished; with them it
+    /// is ducked.
+    private func clashingVocalPair(
+        confidence: Double = 0.3, incomingBPM: Double = 120,
+        outgoingOutroFadeStart: TimeInterval? = nil
+    ) -> (TrackAnalysis, TrackAnalysis) {
+        (makeAnalysis(bpm: 120, confidence: confidence,
+                      outroFadeStart: outgoingOutroFadeStart,
+                      vocalActivity: vocalEnvelope(duration: 200, hot: 130..<200)),
+         makeAnalysis(bpm: incomingBPM, confidence: confidence,
+                      rmsEnvelope: slowBuildEnvelope(), introEnd: 2,
+                      vocalActivity: vocalEnvelope(duration: 200, hot: 0..<40)))
+    }
+
+    /// The hard contract: at `.none` the planner is the pre-stem planner,
+    /// field for field, across every shape the rules can reach.
+    @Test func stemsNoneIsIndistinguishableFromTheOldPlanner() {
+        var cases: [(TrackAnalysis, TrackAnalysis)] = [
+            (makeAnalysis(bpm: 120), makeAnalysis(bpm: 124, introEnd: 2)),
+            (makeAnalysis(bpm: 120), makeAnalysis(bpm: 100, introEnd: 3)),
+            (makeAnalysis(bpm: 120, melProfile: Self.defaultProfile),
+             makeAnalysis(bpm: 120, melProfile: Self.profile(distance: 0.6))),
+            (makeAnalysis(bpm: 120, duration: 200, outroFadeStart: 180),
+             makeAnalysis(bpm: 100, introEnd: 1.5)),
+            (makeAnalysis(bpm: 120, rmsEnvelope: choppyEnvelope(duration: 200)),
+             makeAnalysis(bpm: 100)),
+        ]
+        cases.append(clashingVocalPair())
+        cases.append(clashingVocalPair(confidence: 0.9, incomingBPM: 124))
+
+        for (outgoing, incoming) in cases {
+            let implicit = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming)
+            let explicit = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                                  stems: .none)
+            #expect(implicit.style == explicit.style)
+            #expect(implicit.style.stemTechnique == nil)
+            switch (implicit.plan, explicit.plan) {
+            case (.crossfade(let d1, let o1, let i1), .crossfade(let d2, let o2, let i2)):
+                #expect(d1 == d2 && o1 == o2 && i1 == i2)
+            case (.beatMatched(let a), .beatMatched(let b)):
+                #expect(a.outPoint == b.outPoint && a.inPoint == b.inPoint)
+                #expect(a.overlapBars == b.overlapBars)
+                #expect(a.overlapDuration == b.overlapDuration)
+                #expect(a.outgoingRate == b.outgoingRate && a.incomingRate == b.incomingRate)
+                #expect(a.bassSwapOffset == b.bassSwapOffset)
+            case (.gapless, .gapless):
+                break
+            default:
+                Issue.record("plan kind changed between omitted and explicit .none")
+            }
+        }
+    }
+
+    /// The headline rule: the vocal clash that used to cut a crossfade to
+    /// `vocalClashFadeCap` becomes a technique instead, and the overlap the
+    /// energy shapes earned is kept.
+    @Test func vocalClashUpgradesToADuckAndKeepsTheLongOverlap() {
+        let (outgoing, incoming) = clashingVocalPair()
+        guard case .crossfade(let capped, _, _) = TransitionPlanner
+                .plan(outgoing: outgoing, incoming: incoming).plan else {
+            Issue.record("expected a crossfade")
+            return
+        }
+        #expect(capped <= TransitionPlanner.vocalClashFadeCap)
+
+        let ducked = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                            stems: .ready)
+        guard case .crossfade(let full, let outPoint, _) = ducked.plan else {
+            Issue.record("expected a crossfade")
+            return
+        }
+        #expect(full == 18)                       // the uncapped, energy-derived length
+        #expect(outPoint == 150)                  // a phrase boundary that is being sung
+        #expect(ducked.style.stemTechnique
+                == .vocalDuck(depthDB: -Float(TransitionPlanner.Config.standard.stemDuckDepthDB)))
+        // Composition: the technique layers under the style, it does not replace it.
+        #expect(ducked.style.outroEffect == .fade)
+        #expect(ducked.style.stagedEQ)
+    }
+
+    /// Same rule on the beat-matched path: the 8-bar upgrade the vocal gate
+    /// refused is granted, because the clash is now handled rather than avoided.
+    @Test func duckRestoresTheLongBeatMatchedOverlap() {
+        let outgoing = makeAnalysis(
+            bpm: 120, vocalActivity: vocalEnvelope(duration: 200, hot: 140..<200))
+        let incoming = makeAnalysis(
+            bpm: 124, introEnd: 2, vocalActivity: vocalEnvelope(duration: 200, hot: 0..<40))
+        guard case .beatMatched(let short) = TransitionPlanner
+                .plan(outgoing: outgoing, incoming: incoming).plan else {
+            Issue.record("expected beatMatched")
+            return
+        }
+        #expect(short.overlapBars == 4)
+
+        let ducked = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                            stems: .ready)
+        guard case .beatMatched(let long) = ducked.plan else {
+            Issue.record("expected beatMatched")
+            return
+        }
+        #expect(long.overlapBars == 8)
+        #expect(long.outPoint == 150)
+        #expect(ducked.style.stemTechnique
+                == .vocalDuck(depthDB: -Float(TransitionPlanner.Config.standard.stemDuckDepthDB)))
+        #expect(ducked.style.stagedEQ)            // still the staged hand-over underneath
+    }
+
+    /// A sung outgoing tail over an instrumental-leaning opening, at the one
+    /// tier that licenses a full blend, is what `acapellaOver` is for.
+    @Test func vocalTailOverAnInstrumentalOpeningEarnsAcapella() {
+        let outgoing = makeAnalysis(
+            bpm: 120, confidence: 0.3,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 130..<200))
+        // Incoming sings from 40 s on, so its opening reads well below its own
+        // mean — 0.26 against the 0.90 ceiling.
+        let incoming = makeAnalysis(
+            bpm: 120, confidence: 0.3, rmsEnvelope: slowBuildEnvelope(), introEnd: 2,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 40..<200))
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                             stems: .ready)
+        guard case .crossfade(let fade, let outPoint, _) = planned.plan else {
+            Issue.record("expected a crossfade")
+            return
+        }
+        #expect(planned.style.stemTechnique == .acapellaOver)
+        #expect(outPoint == 150)
+        #expect(fade == 18)
+    }
+
+    /// The corpus's real problem: the plain out-point search pins the hand-over
+    /// to the outro fade, where there is no vocal left to work on. The stem
+    /// search must land before it.
+    @Test func stemSearchLandsBeforeTheOutroFadePin() {
+        let outgoing = makeAnalysis(
+            bpm: 120, confidence: 0.3, outroFadeStart: 160,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 130..<200))
+        let incoming = makeAnalysis(
+            bpm: 120, confidence: 0.3, rmsEnvelope: slowBuildEnvelope(), introEnd: 2,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 40..<200))
+        guard case .crossfade(_, let pinned, _) = TransitionPlanner
+                .plan(outgoing: outgoing, incoming: incoming).plan,
+              case .crossfade(_, let reaimed, _) = TransitionPlanner
+                .plan(outgoing: outgoing, incoming: incoming, stems: .ready).plan
+        else {
+            Issue.record("expected crossfades")
+            return
+        }
+        #expect(pinned == 160)                    // the outro fade
+        #expect(reaimed == 150)                   // the last sung phrase boundary before it
+    }
+
+    /// A vocal-heavy incoming opening is a ducking case, never an acapella one:
+    /// floating one lead over another is the thing the whole gate exists to stop.
+    @Test func aSingingIncomingNeverGetsAcapella() {
+        let (outgoing, incoming) = clashingVocalPair()
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                             stems: .ready)
+        #expect(planned.style.stemTechnique != .acapellaOver)
+    }
+
+    /// Acapella is a compatible-tier technique — its separation residue is the
+    /// one that is genuinely exposed (S1 §4).
+    @Test func acapellaIsRefusedBelowTheCompatibleTier() {
+        let outgoing = makeAnalysis(
+            bpm: 120, confidence: 0.3, melProfile: Self.defaultProfile,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 130..<200))
+        let incoming = makeAnalysis(
+            bpm: 120, confidence: 0.3, rmsEnvelope: slowBuildEnvelope(), introEnd: 2,
+            melProfile: Self.profile(distance: 0.35),        // → neutral tier
+            vocalActivity: vocalEnvelope(duration: 200, hot: 40..<200))
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                             stems: .ready)
+        #expect(planned.style.stemTechnique == nil)
+    }
+
+    /// Nothing to sing over the hand-over, nothing for a stem technique to do.
+    @Test func anInstrumentalTailDeclinesEveryStemTechnique() {
+        // Vocals finish long before any tail-window boundary.
+        let outgoing = makeAnalysis(
+            bpm: 120, confidence: 0.3,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 10..<80))
+        let incoming = makeAnalysis(
+            bpm: 120, confidence: 0.3, rmsEnvelope: slowBuildEnvelope(), introEnd: 2,
+            vocalActivity: vocalEnvelope(duration: 200, hot: 0..<40))
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                             stems: .ready)
+        #expect(planned.style.stemTechnique == nil)
+    }
+
+    /// `stemMinOverlap` is the "is this worth a separation pass" gate: raise it
+    /// past the overlap and the pair falls all the way back to the whole-mix
+    /// decision, vocal cap included.
+    @Test func aShortOverlapIsNotWorthASeparationPass() {
+        let (outgoing, incoming) = clashingVocalPair()
+        var strict = TransitionPlanner.Config.standard
+        strict.stemMinOverlap = 25
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                             stems: .ready, config: strict)
+        guard case .crossfade(let fade, let outPoint, _) = planned.plan else {
+            Issue.record("expected a crossfade")
+            return
+        }
+        #expect(planned.style.stemTechnique == nil)
+        #expect(fade <= strict.vocalClashFadeCap)
+        #expect(outPoint == 150)
+    }
+
+    /// `instrumentalOut` never won a pair in S1's blind test, so the planner
+    /// never asks for it — it stays a hand-picked technique.
+    @Test func instrumentalOutIsNeverChosenAutomatically() {
+        let fixtures: [(TrackAnalysis, TrackAnalysis)] = [
+            clashingVocalPair(),
+            clashingVocalPair(confidence: 0.9, incomingBPM: 124),
+            (makeAnalysis(bpm: 120, confidence: 0.3,
+                          vocalActivity: vocalEnvelope(duration: 200, hot: 130..<200)),
+             makeAnalysis(bpm: 120, confidence: 0.3, rmsEnvelope: slowBuildEnvelope(),
+                          introEnd: 2,
+                          vocalActivity: vocalEnvelope(duration: 200, hot: 40..<200))),
+            (makeAnalysis(bpm: 120), makeAnalysis(bpm: 124, introEnd: 2)),
+        ]
+        for (outgoing, incoming) in fixtures {
+            let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                                 stems: .ready)
+            #expect(planned.style.stemTechnique != .instrumentalOut)
+        }
+    }
+
+    /// A track with no vocal contour at all must not crash or invent a
+    /// technique — absence of evidence is not a vocal.
+    @Test func missingVocalContoursNeverEarnAStemTechnique() {
+        let planned = TransitionPlanner.plan(
+            outgoing: makeAnalysis(bpm: 120, confidence: 0.3),
+            incoming: makeAnalysis(bpm: 120, confidence: 0.3, introEnd: 2),
+            stems: .ready)
+        #expect(planned.style.stemTechnique == nil)
+    }
+
     // MARK: - Rule 3: gapless
 
     @Test func nilOutgoingIsGapless() {
@@ -573,6 +818,16 @@ import Foundation
         #expect(c.clashKeyDistance == 3)
         #expect(c.vocalClashRatio == 1.1)
         #expect(c.vocalClashFadeCap == 4)
+        #expect(c.stemVocalActiveRatio == 1.15)
+        #expect(c.stemAcapellaIncomingVocalMax == 0.90)
+        #expect(c.stemMinOverlap == 5)
+        #expect(c.stemDuckDepthDB == 9)
+        // The two rules must stay disjoint: an incoming opening cannot be both
+        // quiet enough to float over and hot enough to duck against.
+        #expect(c.stemAcapellaIncomingVocalMax < c.vocalClashRatio)
+        // And "vocal-active enough for a stem technique" must be a stricter bar
+        // than "loud enough to clash".
+        #expect(c.stemVocalActiveRatio > c.vocalClashRatio)
     }
 
     /// Omitting `config:` must be indistinguishable from passing `.standard`.

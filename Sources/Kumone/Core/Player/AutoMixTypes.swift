@@ -82,6 +82,21 @@ struct TransitionStyle: Sendable, Equatable {
     static let plain = TransitionStyle(outroEffect: .fade, stagedEQ: false)
 }
 
+/// Whether the caller can hand the renderer a vocal/accompaniment split of the
+/// outgoing track's overlap window.
+///
+/// The planner takes this as an explicit input rather than sniffing for a
+/// model, so it stays a pure function of its arguments — and so the product
+/// path, which passes `.none` everywhere today, provably decides exactly what
+/// it decided before stem techniques existed (`TransitionPlanner.plan`).
+public enum StemAvailability: Sendable, Equatable {
+    /// No separator. Every stem rule is skipped and every stem knob unread.
+    case none
+    /// A separator is available for this hand-over, so the planner may upgrade
+    /// a transition to a `StemTechnique`.
+    case ready
+}
+
 /// Techniques that only exist once the outgoing track can be split into a
 /// vocal stem and its accompaniment (`mixture - vocals`).
 ///

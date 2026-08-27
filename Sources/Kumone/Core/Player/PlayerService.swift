@@ -889,7 +889,11 @@ final class PlayerService: ObservableObject {
                                      outPoint: max(duration - fade, duration * 0.6),
                                      inPoint: 0))
         }
-        return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis)
+        // `stems: .none` — the app ships no separator, so the planner stays on
+        // the whole-mix rules. Stem techniques are auditioned offline only
+        // (`audition --stems on`); wiring a provider in here is S3's job.
+        return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
+                                      stems: .none)
         #endif
     }
 

@@ -109,6 +109,39 @@ enum TransitionPlanner {
         /// Fade length used when the outgoing tail never settles.
         var tailCapacityFallback: TimeInterval = 4
 
+        // --- Stem layer. Read *only* when the caller passes
+        // `StemAvailability.ready`; at `.none` — every product path today —
+        // not one of these numbers is looked at, which is what makes the
+        // stem work provably additive.
+
+        /// How vocal-active the outgoing window has to be, relative to that
+        /// track's own mean, before a stem technique is worth asking for.
+        ///
+        /// Calibrated on the audition corpus: sliding 8 s windows put the
+        /// median at 1.00 and the 95th percentile between 1.16 and 1.58 per
+        /// track (`vocalActivity` is level-normalized, so its dynamic range is
+        /// narrow). 1.15 sits around each track's own 85th percentile — a
+        /// window that is *noticeably* more sung than the song's average — and
+        /// deliberately above `vocalClashRatio`, so anything the stem layer
+        /// calls "vocal-active" is by definition also on the clash side of the
+        /// two-lead-vocals rule.
+        var stemVocalActiveRatio: Double = 1.15
+        /// `acapellaOver` additionally needs the incoming opening to be
+        /// instrumental-leaning: at or below this share of its own mean vocal
+        /// density. Floating one track's vocal over another's is only a
+        /// technique when the other one is not singing; at the corpus's median
+        /// intake of ~1.0 it would just be the two-vocal pile-up the ducking
+        /// rule exists to prevent.
+        var stemAcapellaIncomingVocalMax: Double = 0.90
+        /// No stem technique on an overlap shorter than this: the curves in
+        /// `StemTechniqueLayer` (an accompaniment drop by 28 %, a vocal
+        /// retired by 96 %) need room, and a separation pass is far too
+        /// expensive to spend on a two-second clash-tier hand-over.
+        var stemMinOverlap: TimeInterval = 5
+        /// How far `vocalDuck` holds the outgoing vocal down, in dB of
+        /// attenuation (S1's blind test liked 9).
+        var stemDuckDepthDB: Double = 9
+
         static let standard = Config()
     }
 
@@ -136,8 +169,14 @@ enum TransitionPlanner {
     static let vocalClashRatio = Config.standard.vocalClashRatio
     static let vocalClashFadeCap = Config.standard.vocalClashFadeCap
 
+    /// - Parameter stems: whether a vocal/accompaniment separator is available
+    ///   for this hand-over. At `.none` — the default, and what every product
+    ///   path passes — the result is field-for-field what it was before the
+    ///   stem layer existed; `.ready` lets the two rules in "Stem layer" below
+    ///   re-aim the out point and add a `StemTechnique`.
     static func plan(
         outgoing: TrackAnalysis?, incoming: TrackAnalysis?,
+        stems: StemAvailability = .none,
         config: Config = .standard
     ) -> PlannedTransition {
         guard let outgoing, let incoming,
@@ -149,11 +188,14 @@ enum TransitionPlanner {
         if tier == .compatible, keysClash(outgoing, incoming, config) { tier = .neutral }
         if tier == .compatible,
            let matched = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
-                                         config: config) {
+                                         stems: stems, config: config) {
             // The full DJ hand-over: staged three-band EQ across the overlap.
-            return PlannedTransition(
-                plan: .beatMatched(matched),
-                style: TransitionStyle(outroEffect: .fade, stagedEQ: true))
+            // A stem technique layers *under* that — it rewrites what the
+            // outgoing deck is fed, and the fader / EQ / outro automation then
+            // runs over it unchanged (see `StemTechniqueLayer`).
+            var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+            style.stemTechnique = matched.stem
+            return PlannedTransition(plan: .beatMatched(matched.plan), style: style)
         }
         let cap: TimeInterval
         switch tier {
@@ -161,11 +203,108 @@ enum TransitionPlanner {
         case .neutral: cap = config.neutralOverlapCap
         case .clash: cap = config.clashOverlapCap
         }
-        let plan = crossfadePlan(outgoing: outgoing, incoming: incoming,
-                                 tierCap: cap, config: config)
-        return PlannedTransition(
-            plan: plan,
-            style: crossfadeStyle(tier: tier, outgoing: outgoing, plan: plan, config: config))
+        let crossfade = crossfadePlan(outgoing: outgoing, incoming: incoming,
+                                      tierCap: cap, tier: tier, stems: stems, config: config)
+        // Same composition rule as above: the stem technique never replaces
+        // the outro effect or the staged-EQ decision, it sits beneath them.
+        // So a ducked vocal under a filter sweep is a swept exit whose vocal
+        // is 9 dB down, not a different exit.
+        var style = crossfadeStyle(tier: tier, outgoing: outgoing,
+                                   plan: crossfade.plan, config: config)
+        style.stemTechnique = crossfade.stem
+        return PlannedTransition(plan: crossfade.plan, style: style)
+    }
+
+    // MARK: - Stem layer
+    //
+    // Two rules, checked in this order, and only ever when the caller says a
+    // separator is available. Both start from the same observation: a stem
+    // technique acts on the *outgoing vocal*, so it is worth nothing in a
+    // window that has none — and the corpus says the planner's own out points
+    // are exactly such windows. Fourteen of sixteen tracks have an
+    // `outroFadeStart`, which pins the crossfade out point to the fade itself:
+    // the track is on its way to silence there, and a separation of that
+    // window comes back near-empty (measured vocal-over-mixture energy ≈ 0.005
+    // against ~0.33 mid-song). So both rules re-aim the out point at a
+    // vocal-carrying phrase boundary *before* the outro, and decline to name a
+    // technique when no such boundary exists.
+    //
+    //   1. vocalDuck — the outgoing window is vocal-active and so is the
+    //      incoming opening. Without stems this is the one blend a DJ never
+    //      allows, and the planner punishes it: the crossfade is cut to
+    //      `vocalClashFadeCap`, and the 8/16-bar beat-matched upgrades are
+    //      refused. With stems the punishment becomes a technique — keep the
+    //      long overlap and hold the outgoing vocal `stemDuckDepthDB` down.
+    //      S1's blind test liked this best (3 of 6 pairs).
+    //   2. acapellaOver — the outgoing window is vocal-active and the incoming
+    //      opening is instrumental-leaning, at `tier == .compatible` only.
+    //      S1: this is the structure the technique was built for, and the one
+    //      technique whose separation residue is genuinely exposed, so it stays
+    //      on the tier that already licenses a full blend.
+    //
+    // `instrumentalOut` is deliberately never chosen automatically: it never
+    // won a pair in S1's blind test. It remains reachable by hand (`--stem
+    // instrumental`, or the console's picker) so it can keep being auditioned.
+    //
+    // The two rules cannot both apply: `stemAcapellaIncomingVocalMax` (0.90)
+    // sits below `vocalClashRatio` (1.10), so an incoming opening is either
+    // hot enough to duck against or quiet enough to float over, never both.
+
+    /// What the stem search settled on: where to hand over, and with which
+    /// technique.
+    private struct StemChoice {
+        let outPoint: TimeInterval
+        let technique: StemTechnique
+    }
+
+    /// Pick a vocal-carrying out point out of `candidates` (tail-window phrase
+    /// boundaries that fit `overlap`, best-scored first) and name the technique
+    /// its structure implies; nil when nothing here is worth a separation pass.
+    private static func stemChoice(
+        outgoing: TrackAnalysis, incoming: TrackAnalysis,
+        candidates: [TimeInterval], inPoint: TimeInterval, overlap: TimeInterval,
+        tier: CompatibilityTier, config: Config
+    ) -> StemChoice? {
+        guard overlap >= config.stemMinOverlap else { return nil }
+        // Best-scored boundary that actually carries the outgoing vocal — the
+        // exact opposite of the whole-mix rule below, which prefers a window
+        // where the vocals have already finished.
+        guard let outPoint = candidates.first(where: {
+            (vocalScore(outgoing, from: $0, length: overlap) ?? 0) >= config.stemVocalActiveRatio
+        }) else { return nil }
+
+        // A missing incoming contour means an instrumental (or a vocal too
+        // weak to measure): not something to duck against, and fine to float
+        // over — same reading `vocalsClash` gives it.
+        let incomingScore = vocalScore(incoming, from: inPoint, length: overlap)
+        if let incomingScore, incomingScore > config.vocalClashRatio {
+            return StemChoice(
+                outPoint: outPoint,
+                technique: .vocalDuck(depthDB: Float(-abs(config.stemDuckDepthDB))))
+        }
+        if tier == .compatible,
+           (incomingScore ?? 0) <= config.stemAcapellaIncomingVocalMax {
+            return StemChoice(outPoint: outPoint, technique: .acapellaOver)
+        }
+        return nil
+    }
+
+    /// Phrase boundaries in the outgoing tail that can hold `overlap` and sit
+    /// *before* any outro fade — the stem search's candidate list.
+    ///
+    /// This is the beat-matched out-point window rather than the crossfade's
+    /// `crossfadeOutPointShare` one, on purpose: the crossfade window happily
+    /// includes the outro fade, and handing over inside a fade is precisely
+    /// what leaves a stem technique with nothing to work on.
+    private static func stemCandidates(
+        _ a: TrackAnalysis, overlap: TimeInterval, config: Config
+    ) -> [TimeInterval] {
+        let outLimit = a.outroFadeStart ?? a.duration
+        let windowStart = max(a.duration * config.tailWindowShare,
+                              outLimit - config.tailWindowSeconds)
+        return a.phraseBoundaries.filter {
+            $0 >= windowStart && $0 <= outLimit && $0 + overlap <= a.duration
+        }
     }
 
     /// Which technique sends the outgoing track off, per tier: clashing
@@ -345,8 +484,9 @@ enum TransitionPlanner {
     // MARK: - Rule 1: beat-matched
 
     private static func beatMatchedPlan(
-        outgoing: TrackAnalysis, incoming: TrackAnalysis, config: Config
-    ) -> BeatMatchedPlan? {
+        outgoing: TrackAnalysis, incoming: TrackAnalysis,
+        stems: StemAvailability, config: Config
+    ) -> (plan: BeatMatchedPlan, stem: StemTechnique?)? {
         guard outgoing.bpmConfidence >= config.bpmConfidenceThreshold,
               incoming.bpmConfidence >= config.bpmConfidenceThreshold,
               outgoing.bpm > 0, incoming.bpm > 0
@@ -424,15 +564,46 @@ enum TransitionPlanner {
         }
         guard let outPoint = chosenOutPoint else { return nil }
 
-        let overlap = overlapDuration(bars: bars)
-        return BeatMatchedPlan(
-            outPoint: outPoint,
-            inPoint: inPoint,
-            overlapBars: bars,
-            outgoingRate: Float(outgoingRate),
-            incomingRate: Float(incomingRate),
-            bassSwapOffset: overlap / 2,
-            overlapDuration: overlap)
+        func made(bars: Int, outPoint: TimeInterval) -> BeatMatchedPlan {
+            let overlap = overlapDuration(bars: bars)
+            return BeatMatchedPlan(
+                outPoint: outPoint,
+                inPoint: inPoint,
+                overlapBars: bars,
+                outgoingRate: Float(outgoingRate),
+                incomingRate: Float(incomingRate),
+                bassSwapOffset: overlap / 2,
+                overlapDuration: overlap)
+        }
+        let plain = made(bars: bars, outPoint: outPoint)
+        guard stems == .ready else { return (plain, nil) }
+
+        // Stem variant: the same longest-first bar search, but the vocal gate
+        // that blocked the 8/16-bar upgrades above is replaced by "a stem
+        // technique must apply here". So a pair the whole-mix planner cut back
+        // to four bars for a vocal clash gets its long overlap back — with the
+        // clash ducked rather than avoided. Everything the search still
+        // insists on (the ceiling, both sides' steadiness, room on the
+        // incoming deck) is unchanged: a technique cannot make a lurching
+        // window sit still.
+        for candidate in [16, 8, 4] {
+            let overlap = overlapDuration(bars: candidate)
+            guard overlap <= overlapCeiling, inPoint + overlap <= incoming.duration,
+                  let choice = stemChoice(
+                    outgoing: outgoing, incoming: incoming,
+                    candidates: stemCandidates(outgoing, overlap: overlap, config: config),
+                    inPoint: inPoint, overlap: overlap, tier: .compatible, config: config)
+            else { continue }
+            if candidate > 4 {
+                guard isStable(outgoing.rmsEnvelope, from: choice.outPoint, length: overlap,
+                               cv: config.stableCV),
+                      isStable(incoming.rmsEnvelope, from: inPoint, length: overlap,
+                               cv: config.stableCV)
+                else { continue }
+            }
+            return (made(bars: candidate, outPoint: choice.outPoint), choice.technique)
+        }
+        return (plain, nil)
     }
 
     /// Whether the 1s RMS envelope is steady over [from, from+length).
@@ -491,8 +662,9 @@ enum TransitionPlanner {
 
     private static func crossfadePlan(
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
-        tierCap: TimeInterval, config: Config
-    ) -> TransitionPlan {
+        tierCap: TimeInterval, tier: CompatibilityTier,
+        stems: StemAvailability, config: Config
+    ) -> (plan: TransitionPlan, stem: StemTechnique?) {
         let inPoint = incoming.introEnd
         // Computed, not fixed: the shorter of what the outgoing tail can
         // carry and what the incoming opening can absorb, bounded by the
@@ -521,6 +693,19 @@ enum TransitionPlanner {
                 (vocalScore(outgoing, from: $0, length: fade) ?? 0) <= config.vocalClashRatio
             } ?? candidates.first ?? max(0, outgoing.duration - fade)
         }
+        // Stem layer, before the vocal cap: a technique that can hold the
+        // outgoing vocal down does not need the overlap shortened, and it
+        // needs a *vocal-carrying* out point rather than the outro fade this
+        // search would otherwise settle on.
+        if stems == .ready,
+           let choice = stemChoice(
+            outgoing: outgoing, incoming: incoming,
+            candidates: stemCandidates(outgoing, overlap: fade, config: config),
+            inPoint: inPoint, overlap: fade, tier: tier, config: config) {
+            return (.crossfade(duration: fade, outPoint: choice.outPoint, inPoint: inPoint),
+                    choice.technique)
+        }
+
         // Two lead vocals over each other is the one unforgivable blend —
         // when no vocal-free window exists, keep the overlap brief instead.
         if vocalsClash(outgoing: outgoing, outPoint: outPoint,
@@ -528,6 +713,6 @@ enum TransitionPlanner {
                        config: config) {
             fade = min(fade, config.vocalClashFadeCap)
         }
-        return .crossfade(duration: fade, outPoint: outPoint, inPoint: inPoint)
+        return (.crossfade(duration: fade, outPoint: outPoint, inPoint: inPoint), nil)
     }
 }
