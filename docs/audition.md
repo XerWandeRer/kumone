@@ -85,6 +85,45 @@ swift run audition render a.flac b.flac --style plain --fade 8 -o /tmp/long.wav
 `--style` and `--fade` override the plan after the planner has run, so the mix
 points stay where the planner put them and only the technique / length change.
 
+### 6. Hear a stem technique
+
+`--stem` layers one of the vocal-separation techniques on top of whatever style
+is in play. It splits the *outgoing* track's overlap window into vocal and
+accompaniment (StemKit, Mel-Band RoFormer on MLX/Metal, macOS only) and rewrites
+what the outgoing deck is fed; the fader, EQ hand-over and outro effect then run
+over it unchanged.
+
+```sh
+swift run audition render a.flac b.flac --stem duck          -o /tmp/duck.wav
+swift run audition render a.flac b.flac --stem duck:6        -o /tmp/duck6.wav
+swift run audition render a.flac b.flac --stem instrumental  -o /tmp/inst.wav
+swift run audition render a.flac b.flac --stem acapella      -o /tmp/acap.wav
+```
+
+- `duck[:N]` — the outgoing vocal held N dB down (default 9) for the whole
+  overlap, so two vocals stop fighting. S1's blind test liked this one best.
+- `instrumental` — the outgoing vocal is wiped in the first 12 % of the overlap,
+  so the outgoing track leaves as an instrumental.
+- `acapella` — the outgoing accompaniment drops out by 28 %, and its
+  high-passed vocal floats over the incoming full mix until 96 %.
+
+The recipes are S1's, translated (`Scripts/stems-prototype/separate_and_mix.py`
+→ `StemTechniqueLayer`). Costs on an M4: the first render of a window pays for
+the separation (~0.6× real time, plus a one-off ~1.2 s model load), and the
+separated stem is cached beside the audio as
+`<file>.stems-v1-<startMs>-<lenMs>.caf`, so re-rendering the same window is
+back to whole-mix speed. The 64 MiB checkpoint downloads from Hugging Face on
+first use and is verified against a hardcoded SHA-256.
+
+The report line quotes `vocal/mix` for the separated window. When it is near
+zero the outgoing outro is instrumental, every stem technique is a no-op, and
+the CLI says so — that is a property of the material, not a failure.
+
+If the model is unavailable, the separation fails, or the plan is `gapless`,
+the render still happens as a plain whole-mix one and names the reason.
+`batch` ignores `--stem` on purpose: a corpus sweep is about where the
+planner's thresholds land, and a model pass per pair would cost minutes.
+
 ---
 
 ## Commands
@@ -92,6 +131,7 @@ points stay where the planner put them and only the technique / length change.
 ```
 audition plan   <fileA> <fileB> [--json] [--set name=value,...]
 audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged]
+                                [--stem acapella|instrumental|duck[:9]]
                                 [--fade N] [--pre N] [--post N] [--set ...]
 audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                             [--style ...] [--fade N] [--pre N] [--post N] [--set ...]
@@ -171,14 +211,30 @@ The page (single file, mobile-friendly, follows the system light/dark theme):
   verdict that signal argues for on its own.
 - **决策链** — every rule in order, quoted, with the numbers it saw and what it
   did; the steps that actually changed the outcome are highlighted.
-- **试听** — renders the current decision (~90× real time) and plays it inline;
-  the WAV is served with byte ranges, and a button jumps to 3 s before the
-  hand-over.
+- **the dock** — the render button, the player and "jump to 3 s before the
+  hand-over" live in a bar pinned to the bottom of the window, reachable from
+  anywhere in the page. Rendering is a background job the page polls
+  (`POST /api/render` → `{job}`, then `GET /api/render-status/<job>`), so a
+  stem render's twenty seconds report progress ("分离人声… / 渲染中…") instead
+  of hanging a socket. The WAV is served with byte ranges.
 - **参数** — a slider per `Config` field, grouped, each with a one-line
   explanation; a live diff against `standard`; named presets saved as JSON
-  under `<state>/configs/`.
+  under `<state>/configs/`. Below them, the stem dropdown (with a duck-depth
+  slider) — it shapes the render only, never the batch sweep.
 - **批量** — all 15 adjacent pairs under the current config, with every cell
   that differs from `standard` marked `新值 ← 旧值` and the row highlighted.
+- **让 AI 帮你调** — "复制给 AI" packs the whole page into plain text: a system
+  prompt (the decision model, all 31 knobs with meaning / range / current
+  value, the five signals), the current context (both analyses, the signals
+  against their thresholds, the derivation chain, the diff from `standard`, the
+  corpus distribution if the batch has been run), and the reply format — a
+  fenced JSON block `{"config": {…}, "styleOverride"?, "stem"?, "rationale"}`.
+  Paste the model's answer back and the page pulls the first JSON object out of
+  it (prose around it is fine), validates every name against the field list,
+  clamps every value into its range, shows the resulting diff plus the model's
+  rationale, and only applies it on confirmation. The console is served over
+  plain HTTP on a LAN address, where `navigator.clipboard` does not exist, so
+  copying falls back to `execCommand` and then to a pre-selected textarea.
 
 State (renders and presets) lives in `<corpus>/console/` unless `--state` says
 otherwise. Nothing is written back into the planner: the console explores a

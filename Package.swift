@@ -94,6 +94,12 @@ let package = Package(
             name: "audition",
             dependencies: [
                 .target(name: "KumoneCore", condition: .when(platforms: [.macOS])),
+                // Stem techniques (`render --stem …`, the console's stem
+                // dropdown). KumoneCore stays MLX-free; the separator is
+                // injected into the offline renderer from here. Running the
+                // built binary therefore needs mlx.metallib beside it — see
+                // Scripts/fetch-mlx-metallib.sh.
+                .target(name: "StemKit", condition: .when(platforms: [.macOS])),
             ],
             path: "Sources/audition",
             swiftSettings: [

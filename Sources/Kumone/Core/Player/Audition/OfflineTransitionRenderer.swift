@@ -28,6 +28,10 @@ enum OfflineTransitionRenderer {
         var postRoll: TimeInterval = 12
         /// Automation granularity; 50 Hz is the live engine's ramp tick.
         var tickRate: Double = 50
+        /// How the renderer gets a vocal stem when the style asks for one.
+        /// Nil — the default — means stem techniques degrade to a whole-mix
+        /// render, with the reason reported in `Result.stemFallbackReason`.
+        var vocalStemProvider: VocalStemProvider? = nil
         init() {}
     }
 
@@ -41,6 +45,23 @@ enum OfflineTransitionRenderer {
         let overlapDuration: TimeInterval
         /// Wall-clock seconds spent rendering, and the resulting speed-up.
         let renderSeconds: Double
+        /// The stem technique that actually shaped this render, if any.
+        var stemTechnique: String? = nil
+        /// Wall-clock seconds the stem provider took (separation, or a cache
+        /// read), and how much outgoing audio it was asked for.
+        var stemSeconds: Double? = nil
+        var stemSeparatedSeconds: TimeInterval? = nil
+        /// Vocal energy in the separated window, relative to the mixture.
+        /// Near zero means an instrumental outro — the technique ran and had
+        /// nothing to work on.
+        var stemVocalEnergyRatio: Double? = nil
+        /// The provider served the window from its own cache.
+        var stemCacheHit = false
+        /// Why a requested stem technique was *not* applied. Non-nil means the
+        /// render is a plain whole-mix one and says so out loud, rather than
+        /// silently sounding like something the caller did not ask for.
+        var stemFallbackReason: String? = nil
+
         var realtimeFactor: Double { renderSeconds > 0 ? duration / renderSeconds : .infinity }
     }
 
@@ -127,8 +148,13 @@ enum OfflineTransitionRenderer {
 
         var overlapStart = options.preRoll
         var written: AVAudioFrameCount = 0
+        var stemApplied: StemTechniqueLayer.Applied?
+        var stemFallback: String?
 
         if case .gapless = planned.plan {
+            if planned.style.stemTechnique != nil {
+                stemFallback = StemTechniqueLayer.StemError.noOverlap.errorDescription
+            }
             // Tail-to-head: play out the end of the outgoing track, then start
             // the incoming one on the very next sample.
             let outDuration = try duration(of: outgoingURL)
@@ -168,6 +194,28 @@ enum OfflineTransitionRenderer {
                 incomingURL, from: inPoint,
                 seconds: (overlap + settleDuration + options.postRoll) * rateHeadroom + 1,
                 format: format)
+
+            // --- Stem layer: rewrite the outgoing deck's overlap window
+            // before a single sample is pulled through the graph, so the
+            // automation below plays over stems without knowing it.
+            if let technique = planned.style.stemTechnique {
+                var outgoingRate = 1.0
+                if case .beatMatched(let p) = planned.plan { outgoingRate = Double(p.outgoingRate) }
+                do {
+                    guard let provider = options.vocalStemProvider else {
+                        throw StemTechniqueLayer.StemError.noProvider
+                    }
+                    stemApplied = try StemTechniqueLayer.apply(
+                        technique, to: outBuffer,
+                        source: outgoingURL, windowStart: outStart,
+                        overlapStartFrame: Int((preRoll * sampleRate).rounded()),
+                        plan: planned.plan, style: planned.style, geometry: geometry,
+                        outgoingRate: outgoingRate, provider: provider)
+                } catch {
+                    stemFallback = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                }
+            }
 
             // --- Pre-roll: the outgoing track alone, chain transparent.
             from.schedule(outBuffer)
@@ -263,7 +311,13 @@ enum OfflineTransitionRenderer {
         let duration = Double(written) / sampleRate
         return Result(outputURL: outputURL, duration: duration,
                       overlapStart: overlapStart, overlapDuration: overlap,
-                      renderSeconds: Date().timeIntervalSince(started))
+                      renderSeconds: Date().timeIntervalSince(started),
+                      stemTechnique: stemApplied?.technique.label,
+                      stemSeconds: stemApplied?.seconds,
+                      stemSeparatedSeconds: stemApplied?.separatedSeconds,
+                      stemVocalEnergyRatio: stemApplied?.vocalEnergyRatio,
+                      stemCacheHit: stemApplied?.cacheHit ?? false,
+                      stemFallbackReason: stemFallback)
     }
 
     // MARK: - Offline deck

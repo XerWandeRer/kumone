@@ -54,6 +54,7 @@ let usage = """
 usage:
   audition plan   <fileA> <fileB> [--json] [--set name=value,...]
   audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged] [--fade N]
+                                  [--stem acapella|instrumental|duck[:9]]
                                   [--pre N] [--post N] [--set name=value,...]
   audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                               [--style ...] [--fade N] [--pre N] [--post N]
@@ -63,6 +64,12 @@ usage:
   audition knobs  [--json]
 
   --style   force one technique, to hear it in isolation
+  --stem    layer a stem technique on top of the chosen style (render only):
+            acapella      the outgoing vocal floats over the incoming mix
+            instrumental  the outgoing vocal is wiped, it leaves instrumental
+            duck[:9]      the outgoing vocal held N dB down (default 9)
+            First use downloads a 64 MiB model; the separated window is cached
+            beside the audio as <file>.stems-v1-<start>-<len>.caf.
   --fade    override the overlap length (seconds)
   --pre/--post  context before / after the hand-over (default 12s each)
   --json    print the full decision — signals, thresholds, derivation chain — as JSON
@@ -157,12 +164,20 @@ func decide(_ args: Arguments, a: URL, b: URL) -> Audition.Decision {
         }
         style = parsed
     }
+    var stem: Audition.StemOverride?
+    if let raw = args.flags["stem"], raw != "true" {
+        guard let parsed = Audition.StemOverride.parse(raw) else {
+            fail("unknown --stem '\(raw)'; expected one of "
+                 + Audition.StemOverride.names.joined(separator: "|") + " (duck takes :N dB)")
+        }
+        stem = parsed
+    }
     for file in [a, b] where !Audition.hasCachedAnalysis(for: file) {
         FileHandle.standardError.write(Data("  analyzing \(file.lastPathComponent)…\n".utf8))
     }
     do {
         return try Audition.decide(outgoing: a, incoming: b,
-                                   style: style, fade: args.double("fade"),
+                                   style: style, fade: args.double("fade"), stem: stem,
                                    config: configOverrides(args))
     } catch {
         fail("\(a.lastPathComponent) → \(b.lastPathComponent): \(error.localizedDescription)")
@@ -249,13 +264,28 @@ func runRender(_ args: Arguments) {
                                              withIntermediateDirectories: true)
     let opts = renderOptions(args)
     do {
-        let r = try Audition.render(d, to: out, preRoll: opts.pre, postRoll: opts.post)
+        let r = try Audition.render(d, to: out, preRoll: opts.pre, postRoll: opts.post,
+                                    stemProvider: StemService.shared.provider)
+        var stemLine = ""
+        if let technique = r.stemTechnique {
+            stemLine = "\n    stem \(technique) — separated "
+                + "\(f(r.stemSeparatedSeconds ?? 0, 1))s in \(f(r.stemSeconds ?? 0))s"
+                + (r.stemCacheHit ? " (cached)" : "")
+                + ", vocal/mix \(f(r.stemVocalEnergyRatio ?? 0, 3))"
+            if (r.stemVocalEnergyRatio ?? 0) < 0.02 {
+                stemLine += "\n    ⚠︎ that window is instrumental — the technique had no vocal"
+                    + " to act on, so this will sound like the plain render"
+            }
+        }
+        if let reason = r.stemFallbackReason {
+            stemLine = "\n    stem NOT applied, rendered whole-mix: \(reason)"
+        }
         print("""
 
           wrote \(r.outputURL.path)
             \(f(r.duration))s of audio, hand-over at \(mmss(r.overlapStart)) \
           (overlap \(f(r.overlapDuration))s)
-            rendered in \(f(r.renderSeconds))s — \(f(r.realtimeFactor, 1))× real time
+            rendered in \(f(r.renderSeconds))s — \(f(r.realtimeFactor, 1))× real time\(stemLine)
             afplay \(r.outputURL.path)
           """)
     } catch {
@@ -265,6 +295,13 @@ func runRender(_ args: Arguments) {
 
 func runBatch(_ args: Arguments) {
     guard let dirArg = args.positional.first else { fail(usage) }
+    // A stem render costs a model pass per pair; a corpus sweep is for
+    // comparing planner decisions, not for auditioning one technique.
+    var args = args
+    if args.flags.removeValue(forKey: "stem") != nil {
+        FileHandle.standardError.write(
+            Data("audition: --stem is ignored by batch; use render for stem techniques\n".utf8))
+    }
     let corpus = url(dirArg)
     let outDir = url(args.flags["output"] ?? corpus.appendingPathComponent("renders").path)
     try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
@@ -284,6 +321,9 @@ func runBatch(_ args: Arguments) {
         let files = ((try? FileManager.default.contentsOfDirectory(
             at: corpus, includingPropertiesForKeys: nil)) ?? [])
             .filter { audioExtensions.contains($0.pathExtension.lowercased()) }
+            // `render --stem` leaves vocal-stem sidecars in the corpus; they
+            // are cache, not material.
+            .filter { !StemService.isStemSidecar($0) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard files.count >= 2 else { fail("need at least two audio files in \(corpus.path)") }
         pairs = zip(files, files.dropFirst()).map { ($0, $1) }

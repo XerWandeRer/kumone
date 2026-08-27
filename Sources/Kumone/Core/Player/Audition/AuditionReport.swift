@@ -209,36 +209,47 @@ extension Audition {
         // 1. Loudness
         let loud = d.loudnessGapDB
         out.append(SignalReport(
-            id: "loudness", label: "响度差",
+            id: "loudness", label: "音量差",
             value: loud, display: String(format: "%.2f dB", loud),
             axisMax: Swift.max(c.clashLoudnessDB * 1.6, loud * 1.15, 1),
-            marks: [SignalMark(label: "neutral", value: c.neutralLoudnessDB,
+            marks: [SignalMark(label: "容忍线", value: c.neutralLoudnessDB,
                                field: "neutralLoudnessDB"),
-                    SignalMark(label: "clash", value: c.clashLoudnessDB,
+                    SignalMark(label: "红线", value: c.clashLoudnessDB,
                                field: "clashLoudnessDB")],
             state: state(loud, neutral: c.neutralLoudnessDB, clash: c.clashLoudnessDB),
             verdict: loud > c.clashLoudnessDB
-                ? String(format: "%.2f dB 越过 clash 线 %.2f — 独自判 clash", loud, c.clashLoudnessDB)
+                ? String(format: "出曲结尾和入曲开头的平均音量差 %.2f dB，已经越过 %.2f dB 的红线。"
+                         + "这么大的落差叠在一起，总有一边会被压垮，所以这一对只给最短的礼貌淡出。",
+                         loud, c.clashLoudnessDB)
                 : (loud > c.neutralLoudnessDB
-                   ? String(format: "%.2f dB 越过 neutral 线 %.2f — 拒绝长混音", loud, c.neutralLoudnessDB)
-                   : String(format: "%.2f dB 在 neutral 线 %.2f 之内 — 不反对", loud, c.neutralLoudnessDB))))
+                   ? String(format: "出曲结尾和入曲开头的平均音量差 %.2f dB，超过了 %.2f dB 的容忍线。"
+                            + "还不到灾难的地步，但不适合让两首歌长时间叠在一起，叠加会被缩短。",
+                            loud, c.neutralLoudnessDB)
+                   : String(format: "出曲结尾和入曲开头的平均音量差 %.2f dB，在 %.2f dB 的容忍线以内，"
+                            + "不构成问题。", loud, c.neutralLoudnessDB))))
 
         // 2. Timbre
         let timbre = d.timbreDistance
         out.append(SignalReport(
-            id: "timbre", label: "音色距离",
+            id: "timbre", label: "音色像不像",
             value: timbre, display: String(format: "%.3f", timbre),
             axisMax: Swift.max(c.clashTimbreDistance * 1.6, timbre * 1.15, 0.2),
-            marks: [SignalMark(label: "neutral", value: c.neutralTimbreDistance,
+            marks: [SignalMark(label: "容忍线", value: c.neutralTimbreDistance,
                                field: "neutralTimbreDistance"),
-                    SignalMark(label: "clash", value: c.clashTimbreDistance,
+                    SignalMark(label: "红线", value: c.clashTimbreDistance,
                                field: "clashTimbreDistance")],
             state: state(timbre, neutral: c.neutralTimbreDistance, clash: c.clashTimbreDistance),
             verdict: timbre > c.clashTimbreDistance
-                ? String(format: "%.3f 越过 clash 线 %.3f — 两首歌的频谱形状差得太远", timbre, c.clashTimbreDistance)
+                ? String(format: "两首歌的音色差距 %.3f，越过了 %.3f 的红线。"
+                         + "声音质地差得太远，硬叠在一起会很浑，只能快速交接。",
+                         timbre, c.clashTimbreDistance)
                 : (timbre > c.neutralTimbreDistance
-                   ? String(format: "%.3f 越过 neutral 线 %.3f — 只给短交接", timbre, c.neutralTimbreDistance)
-                   : String(format: "%.3f 在 neutral 线 %.3f 之内 — 不反对", timbre, c.neutralTimbreDistance))))
+                   ? String(format: "两首歌的音色差距 %.3f，超过了 %.3f 的容忍线。"
+                            + "差别听得出来，所以只给一段短交接，不长时间共存。",
+                            timbre, c.neutralTimbreDistance)
+                   : String(format: "两首歌的音色差距 %.3f，在 %.3f 的容忍线以内 —— "
+                            + "听感上属于同一类声音，可以放心长叠。",
+                            timbre, c.neutralTimbreDistance))))
 
         // 3. Tempo
         let tempoAxis = Swift.max(c.clashTempoRatio * 1.6, (d.tempoRatio ?? 0) * 1.15, 0.1)
@@ -247,66 +258,79 @@ extension Audition {
         if let r = d.tempoRatio {
             if r > c.clashTempoRatio {
                 tempoState = "clash"
-                tempoVerdict = String(format: "折叠后差 %.3f 越过 clash 线 %.3f — 判 clash", r, c.clashTempoRatio)
+                tempoVerdict = String(format: "把倍速关系折算之后，两首歌的速度还差 %.1f%%，"
+                                      + "越过了 %.1f%% 的红线 —— 快慢差太多，按“差异很大”处理。",
+                                      r * 100, c.clashTempoRatio * 100)
             } else if r > c.maxBPMDeltaRatio {
                 tempoState = "compatible"
-                tempoVerdict = String(format: "折叠后差 %.3f 超过对拍线 %.3f — 不判 clash，但拿不到 beat-match",
-                                      r, c.maxBPMDeltaRatio)
+                tempoVerdict = String(format: "速度差 %.1f%%，没到 %.1f%% 的红线，"
+                                      + "但超过了对拍所需的 %.1f%% —— 拍子对不上，改用普通的交叉淡入淡出。",
+                                      r * 100, c.clashTempoRatio * 100, c.maxBPMDeltaRatio * 100)
             } else {
                 tempoState = "compatible"
-                tempoVerdict = String(format: "折叠后差 %.3f 在对拍线 %.3f 之内 — 可以对拍", r, c.maxBPMDeltaRatio)
+                tempoVerdict = String(format: "速度差只有 %.1f%%，在对拍所需的 %.1f%% 以内 —— "
+                                      + "两首歌各自微调一点速度就能踩在同一个拍子上。",
+                                      r * 100, c.maxBPMDeltaRatio * 100)
             }
         } else {
             tempoState = "na"
-            tempoVerdict = String(format: "至少一边 BPM 置信度不足 %.2f（出 %.2f / 入 %.2f）— 节奏不参与决策",
-                                  c.bpmConfidenceThreshold,
-                                  d.outgoingBPMConfidence, d.incomingBPMConfidence)
+            tempoVerdict = String(format: "至少有一首歌的节拍没测准（出 %.2f / 入 %.2f，需要 %.2f 以上），"
+                                  + "所以速度这一项这次不参与判断。",
+                                  d.outgoingBPMConfidence, d.incomingBPMConfidence,
+                                  c.bpmConfidenceThreshold)
         }
         out.append(SignalReport(
-            id: "tempo", label: "节奏差（折叠）",
+            id: "tempo", label: "速度差",
             value: d.tempoRatio,
-            display: d.tempoRatio.map { String(format: "%.3f", $0) } ?? "—",
+            display: d.tempoRatio.map { String(format: "%.1f%%", $0 * 100) } ?? "—",
             axisMax: tempoAxis,
-            marks: [SignalMark(label: "beat-match", value: c.maxBPMDeltaRatio,
+            marks: [SignalMark(label: "能对拍", value: c.maxBPMDeltaRatio,
                                field: "maxBPMDeltaRatio"),
-                    SignalMark(label: "clash", value: c.clashTempoRatio,
+                    SignalMark(label: "红线", value: c.clashTempoRatio,
                                field: "clashTempoRatio")],
             state: tempoState, verdict: tempoVerdict))
 
         // 4. Key
         let keyState = (d.keyDistance ?? 0) >= c.clashKeyDistance ? "neutral" : "compatible"
         out.append(SignalReport(
-            id: "key", label: "五度圈距离",
+            id: "key", label: "调性远近",
             value: d.keyDistance.map(Double.init),
-            display: d.keyDistance.map(String.init) ?? "—",
+            display: d.keyDistance.map { "\($0) 步" } ?? "—",
             axisMax: 6,
-            marks: [SignalMark(label: "demote", value: Double(c.clashKeyDistance),
+            marks: [SignalMark(label: "降档线", value: Double(c.clashKeyDistance),
                                field: "clashKeyDistance")],
             state: d.keyDistance == nil ? "na" : keyState,
             verdict: d.keyDistance == nil
-                ? String(format: "至少一边调性置信度不足 %.2f — 和声不参与决策", c.keyConfidenceThreshold)
+                ? String(format: "至少有一首歌听不出稳定的调（需要 %.2f 以上的把握），"
+                         + "所以和声这一项这次不参与判断。", c.keyConfidenceThreshold)
                 : (d.keyDistance! >= c.clashKeyDistance
-                   ? "距离 \(d.keyDistance!) ≥ \(c.clashKeyDistance) — 和声独自把 compatible 降为 neutral"
-                   : "距离 \(d.keyDistance!) < \(c.clashKeyDistance) — 和声不反对")))
+                   ? "两首歌的调在五度圈上隔了 \(d.keyDistance!) 步，达到了 \(c.clashKeyDistance) 步的门槛 —— "
+                     + "和声上不太合得来，档位往下降一级；不过和声从不单独把一对判成“差异很大”。"
+                   : "两首歌的调在五度圈上只隔 \(d.keyDistance!) 步，没到 \(c.clashKeyDistance) 步的门槛 —— "
+                     + "和声上不冲突。")))
 
         // 5. Vocals
         let ov = d.outgoingVocalScore, iv = d.incomingVocalScore
         let bothHot = (ov ?? 0) > c.vocalClashRatio && (iv ?? 0) > c.vocalClashRatio
         out.append(SignalReport(
-            id: "vocals", label: "人声活跃度（出 / 入）",
+            id: "vocals", label: "人声挤不挤（出 / 入）",
             value: ov.flatMap { o in iv.map { Swift.min(o, $0) } },
             display: "\(ov.map { String(format: "%.2f", $0) } ?? "—") / "
                 + "\(iv.map { String(format: "%.2f", $0) } ?? "—")",
             axisMax: Swift.max(c.vocalClashRatio * 1.8, (ov ?? 0) * 1.15, (iv ?? 0) * 1.15),
-            marks: [SignalMark(label: "clash", value: c.vocalClashRatio,
+            marks: [SignalMark(label: "打架线", value: c.vocalClashRatio,
                                field: "vocalClashRatio")],
             state: bothHot ? "clash" : "compatible",
             verdict: (ov == nil || iv == nil)
-                ? "至少一边没有可用的人声轮廓（纯器乐或基线过低）— 人声门槛不生效"
-                : (bothHot
-                   ? String(format: "两边都在 %.2f 线之上 — 撞人声，叠加被砍到 %.2fs 以内",
-                            c.vocalClashRatio, c.vocalClashFadeCap)
-                   : String(format: "至少一边在 %.2f 线之下 — 不会双主唱重叠", c.vocalClashRatio))))
+                ? "至少有一边在这段里没有可用的人声轮廓（纯器乐，或者人声太弱），"
+                  + "所以“别让两个主唱打架”这条规则这次不生效。"
+                : String(format: "这两个数字是交接窗口里的人声密度，相对各自整首歌的平均值："
+                         + "出曲 %.2f 倍、入曲 %.2f 倍。", ov!, iv!)
+                  + (bothHot
+                     ? String(format: "两边都超过了 %.2f 倍的打架线 —— 会听到两个主唱同时在唱，"
+                              + "所以叠加被砍到 %.2f 秒以内。", c.vocalClashRatio, c.vocalClashFadeCap)
+                     : String(format: "至少有一边低于 %.2f 倍的打架线 —— 不会出现两个主唱抢戏。",
+                              c.vocalClashRatio))))
 
         return out
     }
@@ -322,11 +346,14 @@ extension Audition {
         // 0. Duration gate.
         let tooShort = out.duration < c.minTrackDuration || inc.duration < c.minTrackDuration
         steps.append(ChainStep(
-            stage: "gate", title: "长度门槛",
-            rule: "任一首短于 minTrackDuration → 整个 AutoMix 放弃，走 gapless",
-            detail: String(format: "出 %.1fs / 入 %.1fs，门槛 %.0fs",
+            stage: "gate", title: "先看两首歌够不够长",
+            rule: "太短的曲子（间奏、语音、彩蛋）不值得做过渡，直接一首接一首播完。",
+            detail: String(format: "出曲 %.0f 秒、入曲 %.0f 秒，门槛是 %.0f 秒。"
+                           + "（参数 minTrackDuration）",
                            out.duration, inc.duration, c.minTrackDuration),
-            outcome: tooShort ? "→ gapless，后续规则全部跳过" : "两首都够长，继续",
+            outcome: tooShort
+                ? "有一首太短，放弃过渡，改成无缝接续（gapless），下面的规则都不用看了。"
+                : "两首都够长，继续往下判断。",
             fired: tooShort))
         if tooShort { return steps }
 
@@ -334,49 +361,57 @@ extension Audition {
         let s = d.signals
         var reasons: [String] = []
         if s.loudnessGapDB > c.clashLoudnessDB {
-            reasons.append(String(format: "响度差 %.2f > %.2f", s.loudnessGapDB, c.clashLoudnessDB))
+            reasons.append(String(format: "音量差 %.2f dB 越过了 %.2f dB 的红线",
+                                  s.loudnessGapDB, c.clashLoudnessDB))
         }
         if s.timbreDistance > c.clashTimbreDistance {
-            reasons.append(String(format: "音色 %.3f > %.3f", s.timbreDistance, c.clashTimbreDistance))
+            reasons.append(String(format: "音色差距 %.3f 越过了 %.3f 的红线",
+                                  s.timbreDistance, c.clashTimbreDistance))
         }
         if (s.tempoRatio ?? 0) > c.clashTempoRatio {
-            reasons.append(String(format: "节奏 %.3f > %.3f", s.tempoRatio ?? 0, c.clashTempoRatio))
+            reasons.append(String(format: "速度差 %.1f%% 越过了 %.1f%% 的红线",
+                                  (s.tempoRatio ?? 0) * 100, c.clashTempoRatio * 100))
         }
         var neutralReasons: [String] = []
         if s.loudnessGapDB > c.neutralLoudnessDB {
-            neutralReasons.append(String(format: "响度差 %.2f > %.2f",
+            neutralReasons.append(String(format: "音量差 %.2f dB 超过了 %.2f dB 的容忍线",
                                          s.loudnessGapDB, c.neutralLoudnessDB))
         }
         if s.timbreDistance > c.neutralTimbreDistance {
-            neutralReasons.append(String(format: "音色 %.3f > %.3f",
+            neutralReasons.append(String(format: "音色差距 %.3f 超过了 %.3f 的容忍线",
                                          s.timbreDistance, c.neutralTimbreDistance))
         }
         let tierDetail: String
         if !reasons.isEmpty {
-            tierDetail = reasons.joined(separator: "；")
+            tierDetail = reasons.joined(separator: "；") + "。"
         } else if !neutralReasons.isEmpty {
-            tierDetail = neutralReasons.joined(separator: "；")
+            tierDetail = neutralReasons.joined(separator: "；") + "，其余都在线内。"
         } else {
-            tierDetail = String(format: "响度 %.2f、音色 %.3f、节奏 %@ 全部在 neutral 线之内",
+            tierDetail = String(format: "音量差 %.2f dB、音色差距 %.3f、速度差 %@，三项都在容忍线以内。",
                                 s.loudnessGapDB, s.timbreDistance,
-                                s.tempoRatio.map { String(format: "%.3f", $0) } ?? "—")
+                                s.tempoRatio.map { String(format: "%.1f%%", $0 * 100) } ?? "（不参与）")
         }
         steps.append(ChainStep(
-            stage: "tier", title: "三信号定档",
-            rule: "任一信号越 clash 线 → clash；否则响度或音色越 neutral 线 → neutral；都没越 → compatible",
+            stage: "tier", title: "三项信号先定一个档",
+            rule: "只要有一项越过红线，就当成“差异很大”；只要音量或音色越过容忍线，就是“一般般”；"
+                + "都没越过才是“很搭”。",
             detail: tierDetail,
-            outcome: "→ \(d.rawTier)",
+            outcome: "→ 这一步给出：\(tierName(d.rawTier))",
             fired: d.rawTier != "compatible"))
 
         // 2. Key gate.
         if d.rawTier == "compatible" {
             steps.append(ChainStep(
-                stage: "key", title: "调性门槛",
-                rule: "两边调性都可信且五度圈距离 ≥ clashKeyDistance → compatible 降为 neutral（永不独自判 clash）",
-                detail: d.keyDistance.map { "距离 \($0)，门槛 \(c.clashKeyDistance)" }
-                    ?? String(format: "调性置信度不足 %.2f（出 %.2f / 入 %.2f），门槛不生效",
-                              c.keyConfidenceThreshold, out.keyConfidence, inc.keyConfidence),
-                outcome: d.demotedByKey ? "→ neutral（被和声降档）" : "维持 compatible",
+                stage: "key", title: "再问一句和声合不合",
+                rule: "两首歌的调都听得准、而且在五度圈上离得够远时，把“很搭”降一级；"
+                    + "和声从来不单独把一对判成“差异很大”。",
+                detail: d.keyDistance.map { "五度圈距离 \($0) 步，降档门槛是 \(c.clashKeyDistance) 步。" }
+                    ?? String(format: "至少有一首的调没听准（出 %.2f / 入 %.2f，需要 %.2f 以上），"
+                              + "这一关不生效。",
+                              out.keyConfidence, inc.keyConfidence, c.keyConfidenceThreshold),
+                outcome: d.demotedByKey
+                    ? "→ 和声不合，从“很搭”降到“一般般”。"
+                    : "→ 和声没有意见，维持“很搭”。",
                 fired: d.demotedByKey))
         }
 
@@ -388,9 +423,9 @@ extension Audition {
             var detail: String
             var outcome: String
             if !confOK {
-                detail = String(format: "BPM 置信度 出 %.2f / 入 %.2f，门槛 %.2f",
+                detail = String(format: "节拍把握度：出曲 %.2f、入曲 %.2f，需要 %.2f 以上。",
                                 out.bpmConfidence, inc.bpmConfidence, c.bpmConfidenceThreshold)
-                outcome = "置信度不够 → 退回 crossfade"
+                outcome = "→ 拍子本身都没数清，不谈对拍，走普通交叉淡入淡出。"
             } else {
                 let folded = [0.5, 1.0, 2.0].map { inc.bpm * $0 }
                     .min { abs($0 - out.bpm) < abs($1 - out.bpm) }!
@@ -399,32 +434,34 @@ extension Audition {
                 let outRate = target / out.bpm, inRate = target / folded
                 let rateOK = abs(outRate - 1) <= c.maxRateDeviation + 1e-9
                     && abs(inRate - 1) <= c.maxRateDeviation + 1e-9
-                detail = String(format: "%.1f → %.1f BPM（折叠到 %.1f），相对差 %.3f，门槛 %.3f；"
-                                + "变速 %.4f / %.4f，上限 ±%.3f",
-                                out.bpm, inc.bpm, folded, delta, c.maxBPMDeltaRatio,
-                                outRate, inRate, c.maxRateDeviation)
+                detail = String(format: "%.1f → %.1f BPM（按倍速关系折算成 %.1f），还差 %.1f%%，"
+                                + "对拍最多容忍 %.1f%%；要让两边踩到一起，各自变速 %.2f%% / %.2f%%，"
+                                + "单边最多允许 %.1f%%。",
+                                out.bpm, inc.bpm, folded, delta * 100, c.maxBPMDeltaRatio * 100,
+                                (outRate - 1) * 100, (inRate - 1) * 100, c.maxRateDeviation * 100)
                 if delta > c.maxBPMDeltaRatio {
-                    outcome = "BPM 差超过对拍线 → 退回 crossfade"
+                    outcome = "→ 速度差太多，对不上，走普通交叉淡入淡出。"
                 } else if !rateOK {
-                    outcome = "变速超过上限 → 退回 crossfade"
+                    outcome = "→ 要对上就得改速度改太多，听起来会变调走味，放弃对拍。"
                 } else if d.planKind == "beatMatched" {
-                    outcome = "→ beatMatched，\(d.overlapBars ?? 0) 小节"
+                    outcome = "→ 对上了，两首歌踩着同一个拍子叠 \(d.overlapBars ?? 0) 个小节。"
                 } else {
-                    outcome = "门槛都过了，但尾窗内没有能容下叠加的乐句边界 / 入点 → 退回 crossfade"
+                    outcome = "→ 条件都够，但出曲尾巴上找不到一个能装下这段叠加的乐句起点，"
+                        + "只好退回普通交叉淡入淡出。"
                 }
             }
             steps.append(ChainStep(
-                stage: "beatmatch", title: "对拍尝试",
-                rule: "两边节奏可信、折叠后 BPM 差 ≤ maxBPMDeltaRatio、各自变速 ≤ maxRateDeviation，"
-                    + "且尾窗内存在能装下 16/8/4 小节叠加的乐句边界",
+                stage: "beatmatch", title: "试试能不能踩到同一个拍子上",
+                rule: "两边节拍都数得准、速度差在对拍线以内、各自变速幅度不过分，"
+                    + "并且出曲尾部有一个乐句起点能装下整段叠加 —— 四条都满足才做对拍过渡。",
                 detail: detail, outcome: outcome,
                 fired: d.planKind == "beatMatched"))
         } else {
             steps.append(ChainStep(
-                stage: "beatmatch", title: "对拍尝试",
-                rule: "只有 compatible 档才尝试 beat-match",
-                detail: "当前档位 \(d.tier)",
-                outcome: "跳过 → crossfade",
+                stage: "beatmatch", title: "试试能不能踩到同一个拍子上",
+                rule: "只有被判成“很搭”的一对，才值得花力气去对拍。",
+                detail: "这一对是「\(tierName(d.tier))」。",
+                outcome: "→ 跳过对拍，走普通交叉淡入淡出。",
                 fired: false))
         }
 
@@ -437,50 +474,64 @@ extension Audition {
                                     c.maxOverlapShare * Swift.min(out.duration, inc.duration))
             let raw = Swift.max(c.minOverlap, Swift.min(tail, intake, ceiling))
             let binding: String
-            if raw <= c.minOverlap + 1e-9 { binding = "minOverlap 下限" }
-            else if abs(raw - tail) < 1e-9 { binding = "出曲尾部承载力 tailCapacity" }
-            else if abs(raw - intake) < 1e-9 { binding = "入曲开头吸收力 intakeCapacity" }
-            else { binding = "档位上限 / 时长比例 ceiling" }
+            if raw <= c.minOverlap + 1e-9 { binding = "最短叠加的下限兜住了它" }
+            else if abs(raw - tail) < 1e-9 { binding = "出曲的尾巴撑不了更久" }
+            else if abs(raw - intake) < 1e-9 { binding = "入曲的开头藏不住更长的淡出" }
+            else { binding = "档位上限（和曲长比例）封顶了" }
             steps.append(ChainStep(
-                stage: "overlap", title: "叠加长度",
-                rule: "叠加 = max(minOverlap, min(tailCapacity, intakeCapacity, "
-                    + "min(maxOverlap, 档位上限, maxOverlapShare × 较短曲长)))",
-                detail: String(format: "tail %.2fs · intake %.2fs · ceiling %.2fs"
-                               + "（%@ 档上限 %.2fs）→ %.2fs",
-                               tail, intake, ceiling, d.tier, tierCap, raw),
-                outcome: "由 \(binding) 决定 → \(String(format: "%.2fs", raw))",
+                stage: "overlap", title: "两首歌该叠多久",
+                rule: "取三者中最小的一个：出曲尾巴还能撑多久、入曲开头能藏住多长的淡出、"
+                    + "这个档位允许的上限；再兜一个最短值。",
+                detail: String(format: "出曲尾巴 %.2f 秒 · 入曲开头 %.2f 秒 · 档位上限 %.2f 秒"
+                               + "（「%@」这一档封顶 %.2f 秒）。",
+                               tail, intake, ceiling, tierName(d.tier), tierCap),
+                outcome: String(format: "→ %.2f 秒，%@。", raw, binding),
                 fired: true))
 
             // 5. Vocal cap.
             let capped = raw > d.overlapDuration + 1e-6
             steps.append(ChainStep(
-                stage: "vocals", title: "人声门槛",
-                rule: "两边人声活跃度都 > vocalClashRatio → 叠加砍到 vocalClashFadeCap 以内",
-                detail: "出 \(d.outgoingVocalScore.map { String(format: "%.2f", $0) } ?? "—")"
-                    + " / 入 \(d.incomingVocalScore.map { String(format: "%.2f", $0) } ?? "—")"
-                    + String(format: "，门槛 %.2f，砍到 %.2fs", c.vocalClashRatio, c.vocalClashFadeCap),
+                stage: "vocals", title: "别让两个主唱同时开口",
+                rule: "如果交接窗口里两首歌的人声都比各自平时更密，就把叠加砍短，"
+                    + "让两段人声尽量不重合。",
+                detail: "出曲人声密度 \(d.outgoingVocalScore.map { String(format: "%.2f", $0) } ?? "—")"
+                    + " 倍、入曲 \(d.incomingVocalScore.map { String(format: "%.2f", $0) } ?? "—") 倍，"
+                    + String(format: "打架线 %.2f 倍，砍到 %.2f 秒以内。",
+                             c.vocalClashRatio, c.vocalClashFadeCap),
                 outcome: capped
-                    ? String(format: "撞人声 → 叠加从 %.2fs 砍到 %.2fs", raw, d.overlapDuration)
-                    : String(format: "不撞 → 叠加保持 %.2fs", d.overlapDuration),
+                    ? String(format: "→ 两边人声都太密，叠加从 %.2f 秒砍到 %.2f 秒。",
+                             raw, d.overlapDuration)
+                    : String(format: "→ 不会打架，叠加保持 %.2f 秒。", d.overlapDuration),
                 fired: capped))
         }
 
         // 6. Style.
         steps.append(ChainStep(
-            stage: "style", title: "手法",
+            stage: "style", title: "出曲用什么姿势离场",
             rule: styleRule(d.tier),
             detail: styleReport(d, config: c).reason,
             outcome: "→ \(d.styleDescription)",
             fired: true))
         if d.overridden {
             steps.append(ChainStep(
-                stage: "style", title: "人工覆盖",
-                rule: "--style / --fade 直接改写 planner 的选择",
-                detail: "本次结果不是纯 planner 输出",
-                outcome: "→ \(d.styleDescription), \(String(format: "%.2fs", d.overlapDuration))",
+                stage: "style", title: "这一版是手动改过的",
+                rule: "面板上的「手法」「叠加长度」「stem 手法」一旦选了，就直接盖掉上面算出来的结果。",
+                detail: "所以你现在听到的不是纯粹由规则推出来的方案。",
+                outcome: String(format: "→ %@，叠加 %.2f 秒。", d.styleDescription, d.overlapDuration),
                 fired: true))
         }
         return steps
+    }
+
+    /// The tier, said the way a person would say it. The English term stays
+    /// available in `DecisionReport.tier` for anything that needs to match on it.
+    static func tierName(_ tier: String) -> String {
+        switch tier {
+        case "compatible": return "这两首歌很搭"
+        case "neutral": return "一般般，能接但别贪"
+        case "clash": return "差异很大，快进快出"
+        default: return tier
+        }
     }
 
     private static func cap(for tier: String,
@@ -495,11 +546,14 @@ extension Audition {
     private static func styleRule(_ tier: String) -> String {
         switch tier {
         case "clash":
-            return "clash：出曲节奏可信 → 附点八分的 echo-out 尾巴；否则素淡出"
+            return "差异很大的一对：能数清出曲的拍子，就让它在拍点上戛然而止、留一串回声散掉"
+                + "（echo out）；数不清就老老实实淡出。"
         case "neutral":
-            return "neutral：出曲没有自带的 outro fade → filterSweep 掏空退出；已经自己淡出的就不再扫"
+            return "一般般的一对：出曲自己没有淡出结尾，就用一道从低到高的滤波把它掏空着送走"
+                + "（filter sweep）；本来就在自己淡出的，不再多此一举。"
         default:
-            return "compatible：叠加 ≥ stagedEQMinOverlap → fade + 三段 EQ 交接；更短就素淡出"
+            return "很搭的一对：叠加够长，就把高、中、低三段分批交接（staged EQ），"
+                + "低频最后才换手；叠加太短就只做普通淡出。"
         }
     }
 
@@ -535,29 +589,35 @@ extension Audition {
         }
         var reason: String
         if d.planKind == "beatMatched" {
-            reason = "beat-match 一律走 fade + 三段 EQ 交接"
+            reason = "既然两首歌能踩在同一个拍子上，出曲就规规矩矩地淡出，"
+                + "并把高、中、低三段分批交给入曲。"
         } else if d.overridden {
-            reason = "被 --style / --fade 覆盖"
+            reason = "这一版的手法是面板上手动选的，不是规则算出来的。"
         } else {
             switch d.tier {
             case "clash":
                 reason = d.outgoingBPMConfidence >= c.keyConfidenceThreshold
                     && d.outgoingBPM > 0
-                    ? String(format: "clash 且出曲 %.1f BPM 可信 → 附点八分延迟 %.0fms",
-                             d.outgoingBPM,
-                             (style.echoDelayTime ?? 0) * 1000)
-                    : String(format: "clash 但出曲节奏置信度 %.2f 低于 %.2f → 素淡出",
+                    ? String(format: "差异很大，而出曲 %.1f BPM 的拍子数得准，"
+                             + "所以让它在拍点上停住，留一串 %.0f 毫秒的回声散场。",
+                             d.outgoingBPM, (style.echoDelayTime ?? 0) * 1000)
+                    : String(format: "差异很大，但出曲的拍子只有 %.2f 的把握（要 %.2f 以上），"
+                             + "回声接不到点上，改成普通淡出。",
                              d.outgoingBPMConfidence, c.keyConfidenceThreshold)
             case "neutral":
                 reason = d.outgoingAnalysis.outroFadeStart == nil
-                    ? "neutral 且出曲没有自带 outro fade → filterSweep 掏空退出"
-                    : String(format: "neutral，但出曲 %.1fs 起已经自己淡出 → 不再扫，素淡出",
+                    ? "一般般的一对，出曲自己没有淡出结尾，"
+                      + "所以用一道从低到高的滤波把它慢慢掏空着送走。"
+                    : String(format: "一般般的一对，不过出曲从 %.1f 秒起就在自己淡出了，"
+                             + "再扫一道反而多余，普通淡出即可。",
                              d.outgoingAnalysis.outroFadeStart ?? 0)
             default:
                 reason = d.overlapDuration >= c.stagedEQMinOverlap
-                    ? String(format: "compatible 且叠加 %.2fs ≥ %.2fs → fade + 三段 EQ",
+                    ? String(format: "很搭的一对，叠加有 %.2f 秒（够到 %.2f 秒的门槛），"
+                             + "值得把高、中、低三段分批交接，低频最后才换手。",
                              d.overlapDuration, c.stagedEQMinOverlap)
-                    : String(format: "compatible 但叠加 %.2fs < %.2fs → 素淡出",
+                    : String(format: "很搭的一对，但叠加只有 %.2f 秒，不到 %.2f 秒，"
+                             + "分段交接来不及展开，只做普通淡出。",
                              d.overlapDuration, c.stagedEQMinOverlap)
             }
         }

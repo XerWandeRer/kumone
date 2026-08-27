@@ -47,6 +47,45 @@ public enum Audition {
         case plain, sweep, echo, staged
     }
 
+    /// `--stem` values. The planner never asks for a stem technique yet, so
+    /// this is how the tuning loop hears one: it layers onto whatever style
+    /// the planner (or `--style`) chose, rather than replacing it.
+    public enum StemOverride: Sendable, Equatable {
+        case acapella
+        case instrumental
+        case duck(depthDB: Float)
+
+        /// S1's blind-test depth.
+        public static let defaultDuckDepthDB: Float = -9
+        /// The names the CLI and the console offer, without the `duck:N` tail.
+        public static let names = ["acapella", "instrumental", "duck"]
+
+        /// `acapella` / `instrumental` / `duck` / `duck:9` / `duck:-9`.
+        /// The depth is read as an attenuation either way — `duck:9` and
+        /// `duck:-9` both mean 9 dB down, because nobody means +9.
+        public static func parse(_ raw: String) -> StemOverride? {
+            let parts = raw.split(separator: ":", maxSplits: 1)
+            guard let head = parts.first else { return nil }
+            switch head {
+            case "acapella", "acapellaOver": return .acapella
+            case "instrumental", "instrumentalOut": return .instrumental
+            case "duck", "vocalDuck":
+                guard parts.count == 2 else { return .duck(depthDB: defaultDuckDepthDB) }
+                guard let value = Float(parts[1]) else { return nil }
+                return .duck(depthDB: -abs(value))
+            default: return nil
+            }
+        }
+
+        var technique: StemTechnique {
+            switch self {
+            case .acapella: return .acapellaOver
+            case .instrumental: return .instrumentalOut
+            case .duck(let depth): return .vocalDuck(depthDB: depth)
+            }
+        }
+    }
+
     // MARK: - Decision
 
     /// A planned transition plus the numbers that produced it.
@@ -115,6 +154,7 @@ public enum Audition {
         outgoing outgoingURL: URL, incoming incomingURL: URL,
         style styleOverride: StyleOverride? = nil,
         fade fadeOverride: TimeInterval? = nil,
+        stem stemOverride: StemOverride? = nil,
         config configOverrides: [String: Double] = [:],
         useCache: Bool = true
     ) throws -> Decision {
@@ -138,6 +178,12 @@ public enum Audition {
         if let styleOverride {
             planned = PlannedTransition(plan: planned.plan,
                                         style: style(styleOverride, basedOn: planned.style))
+            overridden = true
+        }
+        if let stemOverride {
+            var style = planned.style
+            style.stemTechnique = stemOverride.technique
+            planned = PlannedTransition(plan: planned.plan, style: style)
             overridden = true
         }
 
@@ -206,15 +252,33 @@ public enum Audition {
         public let overlapDuration: TimeInterval
         public let renderSeconds: Double
         public let realtimeFactor: Double
+        /// The stem technique that shaped this render, the wall-clock cost of
+        /// getting the stem, and — when a requested technique could not run —
+        /// why the render fell back to the whole mix.
+        public let stemTechnique: String?
+        public let stemSeconds: Double?
+        public let stemSeparatedSeconds: TimeInterval?
+        /// Vocal energy in the separated window over the mixture's. Near zero
+        /// means the outgoing window is instrumental, so the technique had
+        /// nothing to act on however correctly it ran.
+        public let stemVocalEnergyRatio: Double?
+        public let stemCacheHit: Bool
+        public let stemFallbackReason: String?
     }
 
     /// Render the decision's transition to a 44.1 kHz / 16-bit WAV.
+    ///
+    /// `stemProvider` is only consulted when the decision's style carries a
+    /// stem technique; without one, a stem render degrades to a whole-mix
+    /// render and says so in `RenderSummary.stemFallbackReason`.
     public static func render(_ decision: Decision, to outputURL: URL,
                               preRoll: TimeInterval = 12,
-                              postRoll: TimeInterval = 12) throws -> RenderSummary {
+                              postRoll: TimeInterval = 12,
+                              stemProvider: VocalStemProvider? = nil) throws -> RenderSummary {
         var options = OfflineTransitionRenderer.Options()
         options.preRoll = preRoll
         options.postRoll = postRoll
+        options.vocalStemProvider = stemProvider
         let result = try OfflineTransitionRenderer.render(
             decision.planned,
             outgoing: decision.outgoingURL, incoming: decision.incomingURL,
@@ -223,7 +287,13 @@ public enum Audition {
                              overlapStart: result.overlapStart,
                              overlapDuration: result.overlapDuration,
                              renderSeconds: result.renderSeconds,
-                             realtimeFactor: result.realtimeFactor)
+                             realtimeFactor: result.realtimeFactor,
+                             stemTechnique: result.stemTechnique,
+                             stemSeconds: result.stemSeconds,
+                             stemSeparatedSeconds: result.stemSeparatedSeconds,
+                             stemVocalEnergyRatio: result.stemVocalEnergyRatio,
+                             stemCacheHit: result.stemCacheHit,
+                             stemFallbackReason: result.stemFallbackReason)
     }
 
     // Thresholds are no longer republished here: `Decision.config` carries
@@ -259,6 +329,7 @@ public enum Audition {
             parts.append(String(format: "echoOut(delay %.0fms)", delay * 1000))
         }
         if style.stagedEQ { parts.append("stagedEQ") }
+        if let stem = style.stemTechnique { parts.append(stem.label) }
         return parts.joined(separator: "+")
     }
 

@@ -73,8 +73,46 @@ struct TransitionStyle: Sendable, Equatable {
     /// knows the outgoing tempo. Nil → the engine derives its own (beat
     /// grid on beat-matched plans, otherwise a fixed 250 ms).
     var echoDelayTime: TimeInterval? = nil
+    /// A technique that needs the outgoing track split into vocal and
+    /// accompaniment stems. `nil` — the default, and everything the planner
+    /// emits today — means the hand-over works on the whole mix, exactly as
+    /// it always has. See `StemTechnique`.
+    var stemTechnique: StemTechnique? = nil
 
     static let plain = TransitionStyle(outroEffect: .fade, stagedEQ: false)
+}
+
+/// Techniques that only exist once the outgoing track can be split into a
+/// vocal stem and its accompaniment (`mixture - vocals`).
+///
+/// These are *stem-layer* gestures: they rewrite what the outgoing deck is
+/// fed, and everything downstream — the fader law, the EQ hand-over, the
+/// outro effect — then runs unchanged on top. So `.vocalDuck` under
+/// `.filterSweep` is a swept exit whose vocal sits 9 dB down, not a different
+/// exit. Recipes and blind-test results: `docs/automix-stems-s1-report.md`.
+///
+/// `stagedStemSwap` (drums first, bass second) is deliberately absent: it
+/// needs a 4-stem model, and StemKit ships a vocals/accompaniment one.
+enum StemTechnique: Sendable, Equatable {
+    /// The outgoing accompaniment drops out early and its vocal — high-passed,
+    /// exempt from the outgoing fade — floats over the incoming full mix
+    /// before retiring just before the cut.
+    case acapellaOver
+    /// The outgoing vocal is wiped at the top of the overlap, so the outgoing
+    /// track leaves as an instrumental and the incoming vocal owns the window.
+    case instrumentalOut
+    /// The outgoing vocal is held `depthDB` down for the whole overlap, so two
+    /// vocals stop fighting. S1's blind test liked −9 dB.
+    case vocalDuck(depthDB: Float)
+
+    /// Short name for reports and filenames.
+    var label: String {
+        switch self {
+        case .acapellaOver: return "acapellaOver"
+        case .instrumentalOut: return "instrumentalOut"
+        case .vocalDuck(let depth): return String(format: "vocalDuck(%.1fdB)", depth)
+        }
+    }
 }
 
 /// What the strategy layer hands the engine: mechanics plus chosen styling.

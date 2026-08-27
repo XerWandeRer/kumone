@@ -10,7 +10,7 @@ import KumoneCore
 // drag round-trips faster than it takes to launch a second process. Renders
 // are the only slow path, and they still run ~100× real time.
 
-final class Console {
+final class Console: @unchecked Sendable {
     let corpus: URL
     let stateDir: URL
     var renderDir: URL { stateDir.appendingPathComponent("renders") }
@@ -21,6 +21,23 @@ final class Console {
     /// batch view can highlight what a config change actually moved. Computed
     /// once, on first use.
     private var standardBatch: [[String: Any]]?
+
+    /// In-flight and finished render jobs, keyed by id. Renders used to be
+    /// synchronous — a whole-mix one is ~0.3 s — but a stem render pays for a
+    /// model pass, so the page starts a job and polls it instead of holding a
+    /// socket open for twenty seconds.
+    private var jobs: [String: RenderJob] = [:]
+    /// Serial: two concurrent separations would fight over the GPU and over
+    /// the resident checkpoint for no gain.
+    private let renderQueue = DispatchQueue(label: "audition.console.render")
+
+    /// Mutated only under `lock`.
+    private final class RenderJob: @unchecked Sendable {
+        var stage = "planning"
+        var startedAt = Date()
+        var result: [String: Any]?
+        var error: String?
+    }
 
     init(corpus: URL, stateDir: URL) {
         self.corpus = corpus
@@ -38,6 +55,9 @@ final class Console {
         ((try? FileManager.default.contentsOfDirectory(at: corpus,
                                                        includingPropertiesForKeys: nil)) ?? [])
             .filter { Self.audioExtensions.contains($0.pathExtension.lowercased()) }
+            // Stem sidecars are audio files sitting next to the corpus; they
+            // are not tracks.
+            .filter { !StemService.isStemSidecar($0) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
@@ -68,6 +88,9 @@ final class Console {
         case ("POST", "/api/configs"):
             return saveConfig(request.json)
         default:
+            if request.path.hasPrefix("/api/render-status/") {
+                return renderStatus(String(request.path.dropFirst("/api/render-status/".count)))
+            }
             if request.path.hasPrefix("/api/configs/") {
                 let name = String(request.path.dropFirst("/api/configs/".count))
                 if request.method == "GET" { return loadConfig(name) }
@@ -99,6 +122,8 @@ final class Console {
             "fields": fields,
             "standard": Audition.standardConfig,
             "styles": Audition.StyleOverride.allCases.map(\.rawValue),
+            "stems": Audition.StemOverride.names,
+            "duckDefaultDB": Audition.StemOverride.defaultDuckDepthDB,
             "configs": savedConfigNames(),
         ])
     }
@@ -127,9 +152,19 @@ final class Console {
             style = Audition.StyleOverride(rawValue: raw)
         }
         let fade = (body["fade"] as? NSNumber)?.doubleValue
+        var stem: Audition.StemOverride?
+        if let raw = body["stem"] as? String, !raw.isEmpty, raw != "none" {
+            // The page sends the duck depth as its own slider value, so
+            // "duck" + duckDB rejoin into the CLI's own `duck:N` spelling.
+            var spec = raw
+            if raw == "duck", let depth = (body["duckDB"] as? NSNumber)?.floatValue {
+                spec = "duck:\(depth)"
+            }
+            stem = Audition.StemOverride.parse(spec)
+        }
         return try Audition.decide(
             outgoing: expand(a), incoming: expand(b),
-            style: style, fade: fade.flatMap { $0 > 0 ? $0 : nil },
+            style: style, fade: fade.flatMap { $0 > 0 ? $0 : nil }, stem: stem,
             config: config)
     }
 
@@ -143,6 +178,10 @@ final class Console {
     /// row with what `.standard` would have decided, so the table can mark
     /// the rows a threshold move actually reclassified.
     private func batch(_ body: [String: Any]) -> HTTPResponse {
+        // The corpus sweep stays whole-mix: it is about where the planner's
+        // thresholds land, and a stem pass per pair would cost minutes.
+        var body = body
+        body["stem"] = nil
         let pairs = adjacentPairs
         guard !pairs.isEmpty else { return .error("corpus has fewer than two tracks") }
 
@@ -198,45 +237,118 @@ final class Console {
 
     // MARK: - Render
 
+    /// Start a render and hand back a job id. A whole-mix render finishes in a
+    /// few hundred milliseconds and a cache hit is instant, but the page polls
+    /// the same way for all of them — one code path, and a stem render's
+    /// twenty seconds do not sit on an open socket.
     private func render(_ body: [String: Any]) -> HTTPResponse {
         guard let a = body["outgoing"] as? String, let b = body["incoming"] as? String else {
             return .error("need outgoing and incoming paths")
         }
+        let decision: Audition.Decision
         do {
-            let decision = try decide(outgoing: a, incoming: b, body: body)
-            // Name the file after everything that shapes it, so re-rendering
-            // the same knobs reuses the WAV and the browser's audio element
-            // does not refetch.
-            var hasher = Hasher()
-            hasher.combine(a); hasher.combine(b)
-            hasher.combine(decision.styleDescription)
-            hasher.combine(decision.overlapDuration)
-            hasher.combine(decision.planKind)
-            for (k, v) in decision.config.sorted(by: { $0.key < $1.key }) {
-                hasher.combine(k); hasher.combine(v)
-            }
-            let name = String(format: "console-%016llx.wav", UInt64(bitPattern: Int64(hasher.finalize())))
-            let out = renderDir.appendingPathComponent(name)
-            let pre = (body["pre"] as? NSNumber)?.doubleValue ?? 12
-            let post = (body["post"] as? NSNumber)?.doubleValue ?? 12
-
-            if FileManager.default.fileExists(atPath: out.path),
-               let size = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size])
-                   as? Int, size > 1024 {
-                return .json(["url": "/render/\(name)", "cached": true,
-                              "overlapStart": pre,
-                              "overlapDuration": decision.overlapDuration])
-            }
-            let r = try Audition.render(decision, to: out, preRoll: pre, postRoll: post)
-            return .json(["url": "/render/\(name)", "cached": false,
-                          "duration": r.duration,
-                          "overlapStart": r.overlapStart,
-                          "overlapDuration": r.overlapDuration,
-                          "renderSeconds": r.renderSeconds,
-                          "realtimeFactor": r.realtimeFactor])
+            decision = try decide(outgoing: a, incoming: b, body: body)
         } catch {
-            return .error("render failed: \(error.localizedDescription)", status: 500)
+            return .error(error.localizedDescription, status: 500)
         }
+
+        // Name the file after everything that shapes it, so re-rendering the
+        // same knobs reuses the WAV and the browser's audio element does not
+        // refetch. `styleDescription` carries the stem technique, so a duck
+        // depth change is a different file.
+        var hasher = Hasher()
+        hasher.combine(a); hasher.combine(b)
+        hasher.combine(decision.styleDescription)
+        hasher.combine(decision.overlapDuration)
+        hasher.combine(decision.planKind)
+        for (k, v) in decision.config.sorted(by: { $0.key < $1.key }) {
+            hasher.combine(k); hasher.combine(v)
+        }
+        let name = String(format: "console-%016llx.wav",
+                          UInt64(bitPattern: Int64(hasher.finalize())))
+        let out = renderDir.appendingPathComponent(name)
+        let pre = (body["pre"] as? NSNumber)?.doubleValue ?? 12
+        let post = (body["post"] as? NSNumber)?.doubleValue ?? 12
+        let wantsStem = (body["stem"] as? String).map { !$0.isEmpty && $0 != "none" } ?? false
+
+        let id = UUID().uuidString
+        let job = RenderJob()
+        lock.lock(); jobs[id] = job; lock.unlock()
+
+        if FileManager.default.fileExists(atPath: out.path),
+           let size = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size])
+               as? Int, size > 1024 {
+            finish(job, ["url": "/render/\(name)", "cached": true,
+                         "overlapStart": pre,
+                         "overlapDuration": decision.overlapDuration,
+                         "style": decision.styleDescription])
+            return .json(["job": id, "stage": "done"])
+        }
+
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            self.set(job, stage: wantsStem ? "separating" : "rendering")
+            let provider = StemService.stageReporting(StemService.shared.provider) {
+                [weak self] separating in
+                self?.set(job, stage: separating ? "separating" : "rendering")
+            }
+            do {
+                let r = try Audition.render(decision, to: out, preRoll: pre, postRoll: post,
+                                            stemProvider: provider)
+                var payload: [String: Any] = [
+                    "url": "/render/\(name)", "cached": false,
+                    "duration": r.duration,
+                    "overlapStart": r.overlapStart,
+                    "overlapDuration": r.overlapDuration,
+                    "renderSeconds": r.renderSeconds,
+                    "realtimeFactor": r.realtimeFactor,
+                    "style": decision.styleDescription,
+                    "stemCacheHit": r.stemCacheHit,
+                ]
+                if let t = r.stemTechnique { payload["stemTechnique"] = t }
+                if let s = r.stemSeconds { payload["stemSeconds"] = s }
+                if let s = r.stemSeparatedSeconds { payload["stemSeparatedSeconds"] = s }
+                if let s = r.stemVocalEnergyRatio { payload["stemVocalEnergyRatio"] = s }
+                if let reason = r.stemFallbackReason { payload["stemFallbackReason"] = reason }
+                self.finish(job, payload)
+            } catch {
+                self.fail(job, "render failed: \(error.localizedDescription)")
+            }
+        }
+        return .json(["job": id, "stage": "rendering"])
+    }
+
+    private func renderStatus(_ id: String) -> HTTPResponse {
+        lock.lock()
+        let job = jobs[id]
+        lock.unlock()
+        guard let job else { return .error("no such render job", status: 404) }
+        lock.lock()
+        defer { lock.unlock() }
+        var payload: [String: Any] = ["elapsed": Date().timeIntervalSince(job.startedAt)]
+        if let error = job.error {
+            payload["status"] = "failed"
+            payload["error"] = error
+        } else if let result = job.result {
+            payload["status"] = "done"
+            payload.merge(result) { _, new in new }
+        } else {
+            payload["status"] = "running"
+            payload["stage"] = job.stage
+        }
+        return .json(payload)
+    }
+
+    private func set(_ job: RenderJob, stage: String) {
+        lock.lock(); job.stage = stage; lock.unlock()
+    }
+
+    private func finish(_ job: RenderJob, _ result: [String: Any]) {
+        lock.lock(); job.result = result; lock.unlock()
+    }
+
+    private func fail(_ job: RenderJob, _ message: String) {
+        lock.lock(); job.error = message; lock.unlock()
     }
 
     // MARK: - Saved presets
