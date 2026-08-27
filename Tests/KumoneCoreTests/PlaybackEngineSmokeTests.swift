@@ -1,0 +1,1278 @@
+import Testing
+@testable import KumoneCore
+import AVFoundation
+import AudioToolbox
+import Foundation
+import Darwin
+
+// Local, network-free smoke tests for PlaybackEngine.
+//
+// Fixtures are generated programmatically into a temp directory (nothing
+// binary is committed):
+// - File-deck fixtures: LPCM sine .caf written with AVAudioFile.
+// - Streaming fixture: AAC in an ADTS container (.aac) written with
+//   ExtAudioFile. Rationale: ProgressiveLoader rejects LPCM streams
+//   (setUpConverter requires a compressed format), and AVAudioFile-written
+//   .m4a puts the moov atom at the end of the file, which AudioFileStream
+//   cannot parse progressively. ADTS is a self-framing stream format —
+//   exactly what AudioFileStream is built for — so we go straight to it.
+//
+// The streaming fixture is served by a minimal POSIX-socket HTTP server on
+// 127.0.0.1 (GET 200 with Content-Length; "bytes=N-" Range requests get 206).
+//
+// Every test runs its body under a watchdog: if it exceeds the timeout, the
+// process samples itself with /usr/bin/sample so a deadlock leaves a thread
+// stack in the log, then records a failure and abandons the (possibly stuck)
+// worker thread instead of hanging the whole run.
+//
+// ENGINE BUGS THESE TESTS CAUGHT (both fixed; kept as regression coverage):
+// 1. deliver() stale-accum spin (tests c/c2): binding `guard let accum` to a
+//    LOCAL that went stale when flushAccum() swapped self.accum caused an
+//    infinite busy-loop mid-chunk — only the first 0.5s buffer was ever
+//    delivered, and on the original design (URLSession delegate queue == the
+//    engine queue) the spin pinned the engine queue, so position(of:) blocked
+//    forever: the reported "app not responding". Fixed by re-reading
+//    self.accum every loop iteration.
+// 2. AVAudioConverter poisoning AudioFileStream (test c2, flakily c/d):
+//    whenever AVAudioConverter decoded AAC anywhere in the process, the next
+//    AudioFileStreamParseBytes call failed with 'wht?', so a stream whose
+//    bytes arrived in more than one didReceive callback died mid-parse. The
+//    loader's fail() path then cancelled its own task, and the resulting
+//    NSURLErrorCancelled completion was swallowed silently — no
+//    .streamDownloadCompleted, no .streamFailed, position counting past the
+//    track length. Reproduced standalone (per-packet, batched, deferred, and
+//    cross-thread convert calls all poison the parser; macOS 26). Fixed by
+//    decoding with the C AudioConverter API, between parse calls.
+
+// MARK: - Fixtures
+
+enum Fixtures {
+
+    static let dir: URL = {
+        let d = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PlaybackEngineSmoke-\(ProcessInfo.processInfo.processIdentifier)")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
+
+    /// 6 s 44.1 kHz mono sine .caf — file-deck fixture.
+    static let sixSecondCAF: URL = try! writeSineCAF(seconds: 6, name: "six")
+
+    /// 8 s variant for the gapless "A" deck.
+    static let eightSecondCAF: URL = try! writeSineCAF(seconds: 8, name: "eight")
+
+    /// 21 s AAC/ADTS — long enough for many 0.5 s stream buffers and to cross
+    /// the engine's 40-buffer (≈20 s) high-water backpressure mark.
+    static let streamADTS: URL = try! writeSineADTS(seconds: 21, name: "stream")
+
+    /// 18 s AAC/ADTS — 36 buffers, stays below the 40-buffer high-water mark
+    /// so the download is never suspended. Used by the happy-path streaming
+    /// test; the 21 s fixture above deterministically reproduces a suspend /
+    /// completion race (see streamBackpressureSwallowsCompletion).
+    static let streamShortADTS: URL = try! writeSineADTS(seconds: 18, name: "stream18")
+
+    /// 8 s 44.1 kHz *stereo* sine .caf — matches the graph format exactly, so
+    /// the deck takes the sample-accurate `.file` / scheduleSegment path
+    /// rather than the chunk-converted `.convertedFile` one the mono fixtures
+    /// above go through.
+    static let eightSecondStereoCAF: URL = try! writeSineCAF(seconds: 8, channels: 2, name: "eight-stereo")
+
+    /// 6 s stereo twin of `sixSecondCAF` — the incoming deck of the
+    /// seek-fallback test has to take the `.file` path too, or a `.gapless`
+    /// hand-over cannot be armed on the host clock (armGaplessLocked).
+    static let sixSecondStereoCAF: URL = try! writeSineCAF(seconds: 6, channels: 2, name: "six-stereo")
+
+    /// 8 s 44.1 kHz *mono* sine that goes digitally silent after 4 s. Mono →
+    /// the chunk-converted (buffer-fed) deck path. Used by the seek-residue
+    /// test: seek from the loud half into the silent half and anything the
+    /// monitor still hears is audio from the pre-seek position.
+    static let loudThenSilentCAF: URL =
+        try! writeSineCAF(seconds: 8, silentAfter: 4, name: "loud-silent")
+
+    /// Stereo twin of the above → the sample-accurate `.file` deck path.
+    static let loudThenSilentStereoCAF: URL =
+        try! writeSineCAF(seconds: 8, channels: 2, silentAfter: 4, name: "loud-silent-stereo")
+
+    static func writeSineCAF(seconds: Double, sampleRate: Double = 44_100,
+                             channels: AVAudioChannelCount = 1,
+                             silentAfter: Double? = nil, name: String) throws -> URL {
+        let url = dir.appendingPathComponent("\(name).caf")
+        if FileManager.default.fileExists(atPath: url.path) { return url }
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels)!
+        let file = try AVAudioFile(forWriting: url, settings: format.settings,
+                                   commonFormat: .pcmFormatFloat32, interleaved: false)
+        let chunkFrames: AVAudioFrameCount = 4096
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunkFrames)!
+        var frame = 0
+        let total = Int(seconds * sampleRate)
+        let lastLoudFrame = silentAfter.map { Int($0 * sampleRate) } ?? total
+        while frame < total {
+            let n = min(Int(chunkFrames), total - frame)
+            for channel in 0..<Int(channels) {
+                let data = buffer.floatChannelData![channel]
+                for i in 0..<n {
+                    data[i] = frame + i < lastLoudFrame
+                        ? 0.25 * sinf(2 * .pi * 440 * Float(frame + i) / Float(sampleRate))
+                        : 0
+                }
+            }
+            buffer.frameLength = AVAudioFrameCount(n)
+            try file.write(from: buffer)
+            frame += n
+        }
+        return url
+    }
+
+    /// AAC in ADTS framing via ExtAudioFile (hardware-independent encoder).
+    static func writeSineADTS(seconds: Double, sampleRate: Double = 44_100, name: String) throws -> URL {
+        let url = dir.appendingPathComponent("\(name).aac")
+        if FileManager.default.fileExists(atPath: url.path) { return url }
+
+        var outDesc = AudioStreamBasicDescription()
+        outDesc.mSampleRate = sampleRate
+        outDesc.mFormatID = kAudioFormatMPEG4AAC
+        outDesc.mChannelsPerFrame = 1
+        // Leave the rest zero: the encoder fills them in.
+
+        var extFile: ExtAudioFileRef?
+        var status = ExtAudioFileCreateWithURL(url as CFURL, kAudioFileAAC_ADTSType,
+                                               &outDesc, nil,
+                                               AudioFileFlags.eraseFile.rawValue, &extFile)
+        guard status == noErr, let ext = extFile else {
+            throw NSError(domain: "Fixtures", code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey: "ExtAudioFileCreateWithURL(ADTS) failed (\(status))"])
+        }
+        defer { ExtAudioFileDispose(ext) }
+
+        // Client format: interleaved (packed) float32 mono LPCM.
+        var clientDesc = AudioStreamBasicDescription(
+            mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,
+            mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
+        status = ExtAudioFileSetProperty(ext, kExtAudioFileProperty_ClientDataFormat,
+                                         UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+                                         &clientDesc)
+        guard status == noErr else {
+            throw NSError(domain: "Fixtures", code: Int(status),
+                          userInfo: [NSLocalizedDescriptionKey: "SetProperty(ClientDataFormat) failed (\(status))"])
+        }
+
+        let chunk = 4096
+        var samples = [Float](repeating: 0, count: chunk)
+        var frame = 0
+        let total = Int(seconds * sampleRate)
+        while frame < total {
+            let n = min(chunk, total - frame)
+            for i in 0..<n {
+                samples[i] = 0.25 * sinf(2 * .pi * 440 * Float(frame + i) / Float(sampleRate))
+            }
+            status = samples.withUnsafeMutableBufferPointer { ptr -> OSStatus in
+                var abl = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(mNumberChannels: 1,
+                                          mDataByteSize: UInt32(n * 4),
+                                          mData: UnsafeMutableRawPointer(ptr.baseAddress)))
+                return ExtAudioFileWrite(ext, UInt32(n), &abl)
+            }
+            guard status == noErr else {
+                throw NSError(domain: "Fixtures", code: Int(status),
+                              userInfo: [NSLocalizedDescriptionKey: "ExtAudioFileWrite failed (\(status))"])
+            }
+            frame += n
+        }
+        return url
+    }
+}
+
+// MARK: - Minimal local HTTP server (POSIX sockets)
+
+final class TestHTTPServer: @unchecked Sendable {
+
+    let port: UInt16
+    private let data: Data
+    private let listenFD: Int32
+    private let thread: Thread
+
+    init(serving data: Data) throws {
+        self.data = data
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw POSIXError(.EMFILE) }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0 // random port
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard bindResult == 0, listen(fd, 8) == 0 else {
+            close(fd)
+            throw POSIXError(.EADDRINUSE)
+        }
+        var bound = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(fd, $0, &len) }
+        }
+        listenFD = fd
+        port = UInt16(bigEndian: bound.sin_port)
+
+        let serveData = data
+        let serveFD = fd
+        thread = Thread {
+            while true {
+                let client = accept(serveFD, nil, nil)
+                if client < 0 { break } // listen socket closed → stop
+                TestHTTPServer.handle(client: client, data: serveData)
+            }
+        }
+        thread.name = "TestHTTPServer"
+        thread.start()
+    }
+
+    var url: URL { URL(string: "http://127.0.0.1:\(port)/fixture.aac")! }
+
+    func stop() { close(listenFD) }
+
+    private static func handle(client: Int32, data: Data) {
+        defer { close(client) }
+        var yes: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        // Read until end of headers (tiny requests; one read is usually enough).
+        var request = Data()
+        var buf = [UInt8](repeating: 0, count: 8192)
+        while !request.contains(0x0D) || request.range(of: Data("\r\n\r\n".utf8)) == nil {
+            let n = read(client, &buf, buf.count)
+            guard n > 0 else { return }
+            request.append(contentsOf: buf[0..<n])
+            if request.count > 65_536 { return }
+        }
+        let head = String(decoding: request, as: UTF8.self)
+
+        // Range support: "Range: bytes=N-" and "bytes=N-M".
+        var lo = 0
+        var hi = data.count - 1
+        var partial = false
+        for line in head.split(separator: "\r\n") where line.lowercased().hasPrefix("range:") {
+            let spec = line.dropFirst("range:".count).trimmingCharacters(in: .whitespaces)
+            guard spec.lowercased().hasPrefix("bytes=") else { continue }
+            let parts = spec.dropFirst("bytes=".count).split(separator: "-", omittingEmptySubsequences: false)
+            if parts.count == 2, let start = Int(parts[0]), start < data.count {
+                lo = start
+                if let end = Int(parts[1]), end < data.count { hi = end }
+                partial = true
+            }
+        }
+
+        let body = data.subdata(in: lo..<(hi + 1))
+        var header = partial
+            ? "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes \(lo)-\(hi)/\(data.count)\r\n"
+            : "HTTP/1.1 200 OK\r\n"
+        header += "Content-Type: audio/aac\r\nAccept-Ranges: bytes\r\n"
+        header += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+
+        var out = Data(header.utf8)
+        out.append(body)
+        out.withUnsafeBytes { raw in
+            var sent = 0
+            while sent < raw.count {
+                let n = write(client, raw.baseAddress! + sent, raw.count - sent)
+                if n <= 0 { return }
+                sent += n
+            }
+        }
+    }
+}
+
+// MARK: - Watchdog
+
+/// Runs `body` on its own thread. If it does not finish within `timeout`,
+/// samples this process (thread stacks land in the test log), records a
+/// failure, and returns nil — leaking the stuck thread rather than hanging
+/// the test run.
+private final class ResultBox<T>: @unchecked Sendable { var value: T? }
+
+private func withWatchdog<T>(_ label: String, timeout: TimeInterval,
+                             _ body: @escaping () -> T) -> T? {
+    let box = ResultBox<T>()
+    let done = DispatchSemaphore(value: 0)
+    let thread = Thread {
+        box.value = body()
+        done.signal()
+    }
+    thread.name = "watchdog-body-\(label)"
+    thread.stackSize = 1 << 21
+    thread.start()
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        dumpProcessSample(label: label)
+        Issue.record("Watchdog: '\(label)' did not finish within \(timeout)s — likely deadlock/blocked queue; see sample above")
+        return nil
+    }
+    return box.value
+}
+
+private func dumpProcessSample(label: String) {
+    print("=== WATCHDOG TIMEOUT (\(label)): sampling pid \(getpid()) ===")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+    p.arguments = ["\(getpid())", "2"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do {
+        try p.run()
+        let out = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        print(String(decoding: out, as: UTF8.self))
+    } catch {
+        print("sample failed: \(error)")
+    }
+    print("=== END SAMPLE (\(label)) ===")
+}
+
+// MARK: - Event collection
+
+/// Consumes the engine's single-consumer AsyncStream on a dedicated Task and
+/// makes events poll-able from synchronous test code.
+private final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [PlaybackEngineEvent] = []
+    private var task: Task<Void, Never>?
+
+    init(_ engine: PlaybackEngine) {
+        task = Task {
+            for await event in engine.events {
+                self.append(event)
+            }
+        }
+    }
+
+    private func append(_ event: PlaybackEngineEvent) {
+        lock.lock(); defer { lock.unlock() }
+        events.append(event)
+    }
+
+    deinit { task?.cancel() }
+
+    func snapshot() -> [PlaybackEngineEvent] {
+        lock.lock(); defer { lock.unlock() }
+        return events
+    }
+
+    func contains(_ predicate: (PlaybackEngineEvent) -> Bool) -> Bool {
+        snapshot().contains(where: predicate)
+    }
+
+    /// Polls every 50 ms until an event matches or the timeout passes.
+    @discardableResult
+    func wait(timeout: TimeInterval, for predicate: (PlaybackEngineEvent) -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if contains(predicate) { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return contains(predicate)
+    }
+}
+
+// MARK: - Shared helpers
+
+/// Can AVAudioEngine reach an output device at all? (CI/headless machines may
+/// have none; those environments skip the playback assertions.)
+private let audioOutputAvailable: Bool = {
+    let engine = AVAudioEngine()
+    engine.mainMixerNode.outputVolume = 0
+    engine.prepare()
+    do {
+        try engine.start()
+        engine.stop()
+        return true
+    } catch {
+        print("PlaybackEngineSmoke: no usable audio output (\(error)); playback tests will be skipped")
+        return false
+    }
+}()
+
+/// Poll `engine.position(of:)` until it exceeds `target` or `timeout` passes.
+private func pollPosition(_ engine: PlaybackEngine, deck: Deck, past target: TimeInterval,
+                          timeout: TimeInterval) -> TimeInterval {
+    let deadline = Date().addingTimeInterval(timeout)
+    var last: TimeInterval = 0
+    while Date() < deadline {
+        last = engine.position(of: deck)
+        if last > target { return last }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    return last
+}
+
+// MARK: - Tests
+
+@Suite("PlaybackEngineSmoke", .serialized)
+struct PlaybackEngineSmokeTests {
+
+    // (a) Local file deck: position advances, deckFinished on natural end.
+    @Test func filePlaybackAdvancesAndFinishes() throws {
+        guard audioOutputAvailable else { return } // skipped: no audio device
+        let result = withWatchdog("filePlayback", timeout: 25) { () -> (TimeInterval, Bool) in
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            do {
+                _ = try engine.loadFile(at: Fixtures.sixSecondCAF, on: .a)
+            } catch {
+                return (-1, false)
+            }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 0)
+            let pos = pollPosition(engine, deck: .a, past: 1.0, timeout: 3)
+            let finished = log.wait(timeout: 10) {
+                if case .deckFinished(.a) = $0 { return true }
+                return false
+            }
+            return (pos, finished)
+        }
+        guard let (position, finished) = result else { return } // watchdog already failed the test
+        #expect(position > 1.0, "position should advance past 1s within 3s (got \(position))")
+        #expect(finished, ".deckFinished(.a) should arrive after the 6s file drains")
+    }
+
+    // (b) seek / pause / resume semantics on a file deck.
+    @Test func seekPauseResume() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome { var seekPos = TimeInterval(-1); var pausedA = TimeInterval(-1)
+                         var pausedB = TimeInterval(-1); var resumed = TimeInterval(-1) }
+        let result = withWatchdog("seekPauseResume", timeout: 25) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            _ = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .a)) != nil else { return o }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 0)
+            Thread.sleep(forTimeInterval: 0.5)
+
+            engine.seek(deck: .a, to: 3)
+            // Seek is async on the engine queue; wait for it to land.
+            o.seekPos = pollPosition(engine, deck: .a, past: 2.9, timeout: 1)
+
+            engine.pause()
+            Thread.sleep(forTimeInterval: 0.2) // let the async pause land
+            o.pausedA = engine.position(of: .a)
+            Thread.sleep(forTimeInterval: 0.5)
+            o.pausedB = engine.position(of: .a)
+
+            engine.resume()
+            Thread.sleep(forTimeInterval: 1.0)
+            o.resumed = engine.position(of: .a)
+            return o
+        }
+        guard let o = result else { return }
+        #expect(abs(o.seekPos - 3) <= 0.3, "position after seek(3) should be 3±0.3 (got \(o.seekPos))")
+        #expect(abs(o.pausedB - o.pausedA) < 0.05,
+                "position must freeze while paused (\(o.pausedA) → \(o.pausedB))")
+        #expect(o.resumed > o.pausedB + 0.5,
+                "position must advance after resume (\(o.pausedB) → \(o.resumed))")
+    }
+
+    // (c) Progressive streaming from a local HTTP server: position advances,
+    // download completes, and the .part mirror matches the fixture bytes.
+    @Test func streamingPlaybackAndPartFile() throws {
+        guard audioOutputAvailable else { return }
+        let fixtureData = try Data(contentsOf: Fixtures.streamShortADTS)
+        let server = try TestHTTPServer(serving: fixtureData)
+        defer { server.stop() }
+        let partURL = Fixtures.dir.appendingPathComponent("stream-c.part")
+        try? FileManager.default.removeItem(at: partURL)
+
+        struct Outcome { var pos = TimeInterval(-1); var downloadDone = false
+                         var failed: String?; var partSize = -1 }
+        let serverURL = server.url
+        // 18s fixture: below the high-water mark, the local download is never
+        // suspended, so streamDownloadCompleted arrives within seconds.
+        let result = withWatchdog("streaming", timeout: 30) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            engine.outputVolume = 0
+            engine.startStreaming(from: serverURL, formatHint: "aac", writingTo: partURL, on: .b)
+            engine.play(deck: .b, from: 0)
+            o.pos = pollPosition(engine, deck: .b, past: 1.0, timeout: 3)
+            o.downloadDone = log.wait(timeout: 20) {
+                if case .streamDownloadCompleted(.b) = $0 { return true }
+                return false
+            }
+            for event in log.snapshot() {
+                if case .streamFailed(_, let error) = event { o.failed = "\(error)" }
+            }
+            o.partSize = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? Int ?? -1) ?? -1
+            return o
+        }
+        guard let o = result else { return }
+        #expect(o.failed == nil, "stream failed: \(o.failed ?? "")")
+        #expect(o.pos > 1.0, "stream position should advance past 1s within 3s (got \(o.pos))")
+        #expect(o.downloadDone, ".streamDownloadCompleted(.b) should arrive")
+        #expect(o.partSize == fixtureData.count,
+                ".part size (\(o.partSize)) should equal fixture size (\(fixtureData.count))")
+    }
+
+    // (d) KEY: main-thread responsiveness. While a stream is spinning up and
+    // decoding, position(of:) — a queue.sync hop, exactly what the UI thread
+    // does — must never block for long. This is the "app not responding"
+    // reproduction: if decode work floods the engine queue, single calls here
+    // stall for hundreds of ms.
+    @Test func positionCallLatencyDuringStreaming() throws {
+        guard audioOutputAvailable else { return }
+        let fixtureData = try Data(contentsOf: Fixtures.streamADTS)
+        let server = try TestHTTPServer(serving: fixtureData)
+        defer { server.stop() }
+        let partURL = Fixtures.dir.appendingPathComponent("stream-d.part")
+        try? FileManager.default.removeItem(at: partURL)
+
+        struct Outcome { var maxMs = -1.0; var meanMs = -1.0; var calls = 0; var over100 = 0 }
+        let serverURL = server.url
+        let result = withWatchdog("positionLatency", timeout: 30) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            _ = EventLog(engine)
+            defer { engine.stopAll() }
+            engine.outputVolume = 0
+            engine.startStreaming(from: serverURL, formatHint: "aac", writingTo: partURL, on: .b)
+            engine.play(deck: .b, from: 0)
+
+            // First 3 seconds after stream start: poll from this (non-engine)
+            // thread at 10 Hz, timing each queue.sync round trip.
+            var durations: [Double] = []
+            let end = Date().addingTimeInterval(3.0)
+            while Date() < end {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                _ = engine.position(of: .b)
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                durations.append(ms)
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            o.calls = durations.count
+            o.maxMs = durations.max() ?? -1
+            o.meanMs = durations.reduce(0, +) / Double(max(durations.count, 1))
+            o.over100 = durations.filter { $0 >= 100 }.count
+            return o
+        }
+        guard let o = result else { return }
+        print("positionCallLatency: calls=\(o.calls) max=\(String(format: "%.2f", o.maxMs))ms " +
+              "mean=\(String(format: "%.3f", o.meanMs))ms callsOver100ms=\(o.over100)")
+        #expect(o.maxMs < 100,
+                "max single position(of:) latency must stay under 100ms; measured \(String(format: "%.2f", o.maxMs))ms over \(o.calls) calls (\(o.over100) calls ≥100ms) — a failure here reproduces the 'not responding' hang")
+    }
+
+    // (c2) Same as (c) but with a fixture LONGER than the 40-buffer (≈20s)
+    // high-water mark, so a correct engine must exercise the backpressure
+    // suspend/resume path before the download can complete. This test caught
+    // engine bug #2 (see the suite header): with AVAudioConverter as the
+    // decoder, any stream delivered in more than one didReceive chunk died on
+    // the next parse call, and the failure was swallowed silently. It also
+    // guards the backpressure design itself: suspension pauses parsing (bytes
+    // keep arriving into a backlog and the .part mirror), never the
+    // URLSession task, so the transfer's completion callback can't be lost
+    // no matter how fast the download outruns playback.
+    @Test func streamBackpressureSwallowsCompletion() throws {
+        guard audioOutputAvailable else { return }
+        let fixtureData = try Data(contentsOf: Fixtures.streamADTS) // 21s > high water
+        let server = try TestHTTPServer(serving: fixtureData)
+        defer { server.stop() }
+        let partURL = Fixtures.dir.appendingPathComponent("stream-c2.part")
+        try? FileManager.default.removeItem(at: partURL)
+        let serverURL = server.url
+
+        let result = withWatchdog("backpressure", timeout: 40) { () -> Bool in
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            engine.outputVolume = 0
+            engine.startStreaming(from: serverURL, formatHint: "aac", writingTo: partURL, on: .b)
+            engine.play(deck: .b, from: 0)
+            // With a correct engine the low-water resume (~15s in) releases
+            // the transfer and completion arrives shortly after; 30s is ample.
+            return log.wait(timeout: 30) {
+                if case .streamDownloadCompleted(.b) = $0 { return true }
+                return false
+            }
+        }
+        guard let downloadDone = result else { return }
+        #expect(downloadDone, ".streamDownloadCompleted should arrive even when the download outruns playback past the high-water mark")
+    }
+
+    // (e) Gapless transition A → B: midpoint + completed events, then B's
+    // position advances.
+    @Test func gaplessTransition() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome { var midpoint = false; var completed = false
+                         var bPosEarly = TimeInterval(-1); var bPosLate = TimeInterval(-1) }
+        let result = withWatchdog("gapless", timeout: 30) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return o }
+            engine.outputVolume = 0
+            // Start A near its tail so the hand-over happens within ~3s.
+            engine.play(deck: .a, from: 5)
+            engine.scheduleTransition(.plain(.gapless), from: .a, to: .b)
+
+            o.completed = log.wait(timeout: 10) {
+                if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                return false
+            }
+            o.midpoint = log.contains {
+                if case .transitionMidpoint(from: .a, to: .b) = $0 { return true }
+                return false
+            }
+            o.bPosEarly = engine.position(of: .b)
+            Thread.sleep(forTimeInterval: 1.0)
+            o.bPosLate = engine.position(of: .b)
+            return o
+        }
+        guard let o = result else { return }
+        #expect(o.midpoint, ".transitionMidpoint(a→b) should be emitted")
+        #expect(o.completed, ".transitionCompleted(a→b) should be emitted")
+        #expect(o.bPosLate > o.bPosEarly + 0.5,
+                "deck B position should advance after the hand-over (\(o.bPosEarly) → \(o.bPosLate))")
+    }
+
+    // (f) TransitionStyle execution. Each style runs a real A → B overlap and
+    // must (1) show its effect engaged while the overlap is live and (2) leave
+    // BOTH decks fully neutral once everything has settled — decks are reused,
+    // so a stuck high-pass or a wet delay would poison the next track.
+    @Test func styledTransitionsRunAndResetDecks() throws {
+        guard audioOutputAvailable else { return }
+
+        struct Case {
+            let name: String
+            let planned: PlannedTransition
+            /// Evidence, sampled during the overlap, that the style ran.
+            let evidence: (PlaybackEngine.DeckEffectSnapshot) -> Bool
+        }
+
+        let crossfade = TransitionPlan.crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0)
+        let beatMatched = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.99, incomingRate: 1.02,
+            bassSwapOffset: 1.2, overlapDuration: 2.4))
+
+        let cases = [
+            Case(name: "echoOut",
+                 planned: PlannedTransition(
+                     plan: crossfade,
+                     style: TransitionStyle(outroEffect: .echoOut, stagedEQ: false)),
+                 // The delay is thrown at the stop point (65% into the overlap).
+                 evidence: { $0.delayWetDryMix > 1 }),
+            Case(name: "filterSweep",
+                 planned: PlannedTransition(
+                     plan: crossfade,
+                     style: TransitionStyle(outroEffect: .filterSweep, stagedEQ: false)),
+                 // The high-pass band un-bypasses and sweeps up from 20 Hz.
+                 evidence: { !$0.highPassBypassed && $0.highPassFrequency > 25 }),
+            Case(name: "stagedEQ/beatMatched",
+                 planned: PlannedTransition(
+                     plan: beatMatched,
+                     style: TransitionStyle(outroEffect: .fade, stagedEQ: true)),
+                 // Highs leave the outgoing deck first, before the bass swap.
+                 evidence: { $0.highGain < -1 && $0.midGain < -0.5 }),
+        ]
+
+        for testCase in cases {
+            struct Outcome {
+                var evidenceSeen = false
+                var completed = false
+                var settled = false
+                var deckA = PlaybackEngine.DeckEffectSnapshot(
+                    volume: -1, rate: -1, eqGlobalGain: -1, lowGain: -1, midGain: -1, highGain: -1,
+                    highPassBypassed: false, highPassFrequency: -1,
+                    delayWetDryMix: -1, delayFeedback: -1)
+                var deckB: PlaybackEngine.DeckEffectSnapshot?
+            }
+
+            let result = withWatchdog("style-\(testCase.name)", timeout: 45) { () -> Outcome in
+                var o = Outcome()
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                      (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return o }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: 4.7)
+                engine.scheduleTransition(testCase.planned, from: .a, to: .b)
+
+                // Sample deck A at 20 Hz until the overlap is over, looking for
+                // the style's fingerprint.
+                let deadline = Date().addingTimeInterval(12)
+                while Date() < deadline {
+                    if testCase.evidence(engine.effectSnapshot(of: .a)) { o.evidenceSeen = true }
+                    if log.contains({
+                        if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }) { o.completed = true; break }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+
+                // Wait out the settling phase (rate restore / echo tail decay).
+                let settleDeadline = Date().addingTimeInterval(6)
+                while Date() < settleDeadline {
+                    if !engine.hasPendingTransition { o.settled = true; break }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                o.deckA = engine.effectSnapshot(of: .a)
+                o.deckB = engine.effectSnapshot(of: .b)
+                return o
+            }
+            guard let o = result else { continue }
+            #expect(o.completed, "\(testCase.name): .transitionCompleted(a→b) should be emitted")
+            #expect(o.evidenceSeen, "\(testCase.name): the style's effect should engage during the overlap")
+            #expect(o.settled, "\(testCase.name): the transition should clear itself after settling")
+            // The spent deck is parked: chain transparent AND fader down, so
+            // the ~200 ms still draining out of a just-stopped player node
+            // cannot be heard (see resetDeckLocked).
+            #expect(o.deckA.isParked,
+                    "\(testCase.name): outgoing deck must be parked silent + neutral after the transition (\(o.deckA))")
+            if let deckB = o.deckB {
+                #expect(deckB.isNeutral,
+                        "\(testCase.name): incoming deck must be neutral after the transition (\(deckB))")
+            }
+        }
+    }
+
+    // (g) Regression floor: `.plain` must behave exactly as the engine did
+    // before styles existed — a beat-matched overlap with the single low-shelf
+    // bass swap, no delay, no high-pass, and neutral decks afterwards.
+    @Test func plainStyleIsUnchanged() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome {
+            var completed = false
+            var sawBassSwap = false
+            var sawDelayOrSweep = false
+            var deckA: PlaybackEngine.DeckEffectSnapshot?
+            var deckB: PlaybackEngine.DeckEffectSnapshot?
+        }
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.99, incomingRate: 1.02,
+            bassSwapOffset: 1.2, overlapDuration: 2.4))
+
+        let result = withWatchdog("plainStyle", timeout: 45) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return o }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 4.7)
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+
+            let deadline = Date().addingTimeInterval(12)
+            while Date() < deadline {
+                let a = engine.effectSnapshot(of: .a)
+                if a.lowGain < -1 { o.sawBassSwap = true }
+                // Untouched by `.plain`: mid/high bands, high-pass, delay.
+                if a.delayWetDryMix > 0.001 || !a.highPassBypassed
+                    || abs(a.midGain) > 0.001 || abs(a.highGain) > 0.001 {
+                    o.sawDelayOrSweep = true
+                }
+                if log.contains({
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }) { o.completed = true; break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            let settleDeadline = Date().addingTimeInterval(6)
+            while Date() < settleDeadline {
+                if !engine.hasPendingTransition { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            o.deckA = engine.effectSnapshot(of: .a)
+            o.deckB = engine.effectSnapshot(of: .b)
+            return o
+        }
+        guard let o = result else { return }
+        #expect(o.completed, "plain: .transitionCompleted(a→b) should be emitted")
+        #expect(o.sawBassSwap, "plain: the low-shelf bass swap should still duck the outgoing deck")
+        #expect(!o.sawDelayOrSweep, "plain: no delay, high-pass or extra EQ band may be touched")
+        #expect(o.deckA?.isParked == true, "plain: outgoing deck must end parked silent + neutral (\(String(describing: o.deckA)))")
+        #expect(o.deckB?.isNeutral == true, "plain: incoming deck must end neutral (\(String(describing: o.deckB)))")
+    }
+
+    // (h) Cancelling mid-overlap (seek / skip / disarm) must also leave both
+    // decks neutral — the reset invariant, on the interrupted path.
+    @Test func cancelDuringStyledOverlapResetsDecks() throws {
+        guard audioOutputAvailable else { return }
+        let planned = PlannedTransition(
+            plan: .crossfade(duration: 3.0, outPoint: 5.2, inPoint: 0),
+            style: TransitionStyle(outroEffect: .echoOut, stagedEQ: true))
+
+        let result = withWatchdog("cancelStyled", timeout: 40) { () -> [PlaybackEngine.DeckEffectSnapshot] in
+            let engine = PlaybackEngine()
+            _ = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return [] }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 4.7)
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            // Let the overlap get going (out point ~0.5s in), then cut it.
+            Thread.sleep(forTimeInterval: 1.2)
+            engine.cancelScheduledTransition()
+            Thread.sleep(forTimeInterval: 0.3)
+            return [engine.effectSnapshot(of: .a), engine.effectSnapshot(of: .b)]
+        }
+        guard let snapshots = result, snapshots.count == 2 else { return }
+        // Volume is the one knob a cancel past the midpoint may leave ramped
+        // on the outgoing deck only if it was reset — check the effects.
+        for (deck, snapshot) in zip(["a", "b"], snapshots) {
+            #expect(abs(snapshot.lowGain) < 0.001 && abs(snapshot.midGain) < 0.001
+                    && abs(snapshot.highGain) < 0.001,
+                    "cancel: deck \(deck) EQ must be neutral (\(snapshot))")
+            #expect(snapshot.highPassBypassed, "cancel: deck \(deck) high-pass must be bypassed")
+            #expect(abs(snapshot.delayWetDryMix) < 0.001 && abs(snapshot.delayFeedback) < 0.001,
+                    "cancel: deck \(deck) delay must be dry (\(snapshot))")
+            #expect(abs(snapshot.rate - 1) < 0.001, "cancel: deck \(deck) rate must be 1 (\(snapshot))")
+        }
+    }
+
+    // (i) The outgoing deck must never come back up. Once a transition has
+    // faded the outgoing track out, the deck's contribution to the mixer has
+    // to stay down — the transition's own reset (fader back to 1, EQ back to
+    // flat) must not re-amplify whatever is still in flight through the
+    // chain, and nothing may resume feeding the stopped player.
+    //
+    // Measured on the deck's post-effect output (what actually reaches the
+    // mixer), not on parameters, because the audible symptom lives entirely
+    // in the signal: "the fade reached silence, then the volume jumped back
+    // and the old track played on for a moment".
+    @Test func outgoingDeckStaysSilentAfterTransition() throws {
+        guard audioOutputAvailable else { return }
+
+        struct Sample { var t: TimeInterval; var peak: Float }
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var samples: [Sample] = []
+            let start = Date()
+            func record(_ peak: Float) {
+                lock.lock(); defer { lock.unlock() }
+                samples.append(Sample(t: Date().timeIntervalSince(start), peak: peak))
+            }
+            func snapshot() -> [Sample] {
+                lock.lock(); defer { lock.unlock() }
+                return samples
+            }
+        }
+
+        // Fixture amplitude is 0.25; the overlap runs 5.2 → 7.2 while deck A's
+        // file has audio all the way to 8.0, so a full second of outgoing
+        // material is still schedulable when the transition finishes.
+        let cases: [(String, URL, PlannedTransition)] = [
+            // Deck A mono → the chunk-converted (buffer-fed) source path, the
+            // same shape a progressive stream uses; then once more stereo, on
+            // the sample-accurate scheduleSegment path.
+            ("fade", Fixtures.eightSecondCAF, PlannedTransition(
+                plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                style: TransitionStyle(outroEffect: .fade, stagedEQ: true))),
+            ("filterSweep", Fixtures.eightSecondCAF, PlannedTransition(
+                plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                style: TransitionStyle(outroEffect: .filterSweep, stagedEQ: true))),
+            // `.echoOut` is the interesting one: its tail is *supposed* to
+            // keep ringing past the overlap, so the assertion below allows a
+            // decaying tail — but not a jump back up.
+            ("echoOut", Fixtures.eightSecondCAF, PlannedTransition(
+                plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                style: TransitionStyle(outroEffect: .echoOut, stagedEQ: true))),
+            ("fade/stereo-file", Fixtures.eightSecondStereoCAF, PlannedTransition(
+                plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                style: TransitionStyle(outroEffect: .fade, stagedEQ: true))),
+        ]
+
+        for (name, deckAFixture, planned) in cases {
+            let result = withWatchdog("outgoingSilence-\(name)", timeout: 45) { () -> ([Sample], TimeInterval) in
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.setOutputMonitor(on: .a, nil); engine.stopAll() }
+                guard (try? engine.loadFile(at: deckAFixture, on: .a)) != nil,
+                      (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return ([], -1) }
+                engine.outputVolume = 0
+                let recorder = Recorder()
+                engine.setOutputMonitor(on: .a) { recorder.record($0) }
+                engine.play(deck: .a, from: 4.7)
+                engine.scheduleTransition(planned, from: .a, to: .b)
+
+                // Timestamp the completion against the recorder's clock, at
+                // 5 ms resolution, so "after the transition" is unambiguous.
+                var completedAt: TimeInterval = -1
+                let deadline = Date().addingTimeInterval(20)
+                while Date() < deadline {
+                    if log.contains({
+                        if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }) {
+                        completedAt = Date().timeIntervalSince(recorder.start)
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                // Keep listening well past the reset: the resurrection lasts
+                // as long as the outgoing file had material left.
+                Thread.sleep(forTimeInterval: 1.5)
+                return (recorder.snapshot(), completedAt)
+            }
+            guard let (samples, completedAt) = result, !samples.isEmpty else {
+                Issue.record("\(name): no audio was captured from deck A")
+                continue
+            }
+            guard completedAt > 0 else {
+                Issue.record("\(name): the transition never completed")
+                continue
+            }
+
+            // Sanity: deck A really was sounding at full level early on.
+            let nominal = samples.filter { $0.t < completedAt - 1.8 }.map(\.peak).max() ?? 0
+            #expect(nominal > 0.05, "\(name): deck A should be sounding before the overlap (peak \(nominal))")
+
+            // The level the style had already brought deck A down to, taken
+            // over the last 150 ms before the reset. Everything after the
+            // reset has to stay at or below it: the outgoing deck may keep
+            // decaying (an `.echoOut` tail does), it may never come back up.
+            let before = samples.filter { $0.t > completedAt - 0.15 && $0.t <= completedAt }
+            let ceiling = max((before.map(\.peak).max() ?? 0) * 1.5, nominal * 0.02)
+            // One render buffer of grace: the mixer smooths a gain change over
+            // a few ms, so the very first buffer may still be crossing down.
+            let after = samples.filter { $0.t > completedAt + 0.03 }
+            let worst = after.max { $0.peak < $1.peak }
+            let window = samples.filter { $0.t > completedAt - 2.2 && $0.t < completedAt + 0.6 }
+            let timeline = stride(from: 0, to: window.count, by: max(window.count / 30, 1))
+                .map { String(format: "%+.2f:%.3f", window[$0].t - completedAt, window[$0].peak) }
+                .joined(separator: " ")
+            print("outgoingSilence[\(name)]: nominal=\(nominal) ceiling=\(ceiling) " +
+                  "worstAfter=\(worst?.peak ?? 0) at +\((worst?.t ?? 0) - completedAt)s | \(timeline)")
+            let detail = "\(name): the outgoing deck was down to \(before.map(\.peak).max() ?? 0) " +
+                "when the transition completed, then jumped back up to \(worst?.peak ?? 0) " +
+                "(nominal \(nominal)) at +\((worst?.t ?? 0) - completedAt)s — the faded-out track " +
+                "is audibly resurrected"
+            #expect((worst?.peak ?? 0) <= ceiling, "\(detail)")
+        }
+    }
+
+    // (j) A seek must never *trigger* a hand-over. The out point of an armed
+    // plan sits in the last stretch of the track, so dropping the playhead
+    // there — or past it — used to make the wait tick fire the overlap on its
+    // very next pass: the reported "seek near the end and the next song starts
+    // immediately".
+    //
+    // The rule the engine now enforces (resolvePlanLocked): a transition fires
+    // only when the track *plays into* its out point; a plan whose out point
+    // the playhead has already passed is degraded to something anchored at the
+    // end of the track — a short tail crossfade when there is runway left,
+    // `.gapless` when there is not — so the rest of the song still plays and
+    // the queue still moves.
+    @Test func seekIntoTransitionWindowFallsBackInsteadOfFiring() throws {
+        guard audioOutputAvailable else { return }
+
+        struct Case {
+            let name: String
+            /// Where deck A starts, and where the user then drags to.
+            let playFrom: TimeInterval
+            let seekTo: TimeInterval
+            let plan: TransitionPlan
+            /// How long after the seek nothing may fire.
+            let quiet: TimeInterval
+            /// Re-arm the way PlayerService.seek does (disarm → seek → arm)
+            /// instead of leaving the armed plan for the engine to revalidate.
+            let rearm: Bool
+        }
+
+        // Deck A is the 8 s stereo fixture (sample-accurate `.file` path).
+        let cases = [
+            // Seek past the out point with only 2.5 s of track left: no room
+            // for a fallback overlap → gapless at the end of the file.
+            Case(name: "seek past out point → gapless tail",
+                 playFrom: 3.0, seekTo: 5.5,
+                 plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                 quiet: 1.5, rearm: false),
+            // Same, but re-armed by the caller after the seek (the path
+            // PlayerService takes) — the guard must hold at arm time too.
+            Case(name: "re-armed after seek → gapless tail",
+                 playFrom: 3.0, seekTo: 5.5,
+                 plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                 quiet: 1.5, rearm: true),
+            // Seek past an early out point with 5.5 s left: enough runway, so
+            // the plan is re-anchored to a 2 s crossfade at 6.0 → 8.0.
+            Case(name: "seek past out point → tail crossfade",
+                 playFrom: 0.5, seekTo: 2.5,
+                 plan: .crossfade(duration: 2.0, outPoint: 2.0, inPoint: 0),
+                 quiet: 2.5, rearm: false),
+        ]
+
+        for testCase in cases {
+            struct Outcome {
+                var firedEarly = false
+                var aPosAfterQuiet = TimeInterval(-1)
+                var bPosAfterQuiet = TimeInterval(-1)
+                var completed = false
+            }
+            let result = withWatchdog("seekFallback-\(testCase.name)", timeout: 40) { () -> Outcome in
+                var o = Outcome()
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: Fixtures.eightSecondStereoCAF, on: .a)) != nil,
+                      (try? engine.loadFile(at: Fixtures.sixSecondStereoCAF, on: .b)) != nil else { return o }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: testCase.playFrom)
+                engine.scheduleTransition(.plain(testCase.plan), from: .a, to: .b)
+                _ = pollPosition(engine, deck: .a, past: testCase.playFrom + 0.2, timeout: 3)
+
+                if testCase.rearm { engine.cancelScheduledTransition() }
+                engine.seek(deck: .a, to: testCase.seekTo)
+                if testCase.rearm {
+                    engine.scheduleTransition(.plain(testCase.plan), from: .a, to: .b)
+                }
+
+                Thread.sleep(forTimeInterval: testCase.quiet)
+                o.firedEarly = log.contains {
+                    switch $0 {
+                    case .transitionMidpoint(from: .a, to: .b),
+                         .transitionCompleted(from: .a, to: .b): return true
+                    default: return false
+                    }
+                }
+                o.aPosAfterQuiet = engine.position(of: .a)
+                o.bPosAfterQuiet = engine.position(of: .b)
+                // The fallback still has to hand over at the end of the track.
+                o.completed = log.wait(timeout: 8) {
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }
+                return o
+            }
+            guard let o = result else { continue }
+            let firedDetail = "\(testCase.name): seeking to \(testCase.seekTo) " +
+                "(out point \(testCase.plan.outPoint ?? -1)) must not start the hand-over — " +
+                "the transition belongs to the natural end of the track"
+            #expect(!o.firedEarly, "\(firedDetail)")
+            let expected = testCase.seekTo + testCase.quiet
+            #expect(abs(o.aPosAfterQuiet - expected) < 0.5,
+                    "\(testCase.name): deck A should just keep playing (expected ≈\(expected), got \(o.aPosAfterQuiet))")
+            #expect(o.bPosAfterQuiet < 0.2,
+                    "\(testCase.name): deck B must still be idle (got \(o.bPosAfterQuiet))")
+            #expect(o.completed,
+                    "\(testCase.name): the degraded plan must still hand over at the end of the track")
+        }
+    }
+
+    // (k) A manual seek must not leak the position it seeked away from.
+    // `player.stop()` empties the schedule, not the chain: timePitch/EQ/delay
+    // still hold ~200 ms of already-rendered audio, and they used to push it
+    // out at full level right after the user dropped the playhead somewhere
+    // else. Same failure mode as the post-transition resurrection in (i), and
+    // measured the same way: on the deck's post-effect output, folding in the
+    // fader (which sits at the mixer input, downstream of everything).
+    //
+    // The fixture is loud for 4 s then digitally silent, and the seek goes
+    // from the loud half into the silent half — so ANY level after the seek is
+    // audio from the old position.
+    @Test func seekDoesNotLeakTheOldPosition() throws {
+        guard audioOutputAvailable else { return }
+
+        struct Sample { var t: TimeInterval; var peak: Float }
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var samples: [Sample] = []
+            let start = Date()
+            func record(_ peak: Float) {
+                lock.lock(); defer { lock.unlock() }
+                samples.append(Sample(t: Date().timeIntervalSince(start), peak: peak))
+            }
+            func snapshot() -> [Sample] {
+                lock.lock(); defer { lock.unlock() }
+                return samples
+            }
+        }
+
+        // Mono → chunk-converted (buffer-fed) source, where the residue is
+        // biggest; stereo → the sample-accurate scheduleSegment path.
+        for (name, fixture) in [("converted", Fixtures.loudThenSilentCAF),
+                                ("stereo-file", Fixtures.loudThenSilentStereoCAF)] {
+            let result = withWatchdog("seekResidue-\(name)", timeout: 40) {
+                () -> ([Sample], TimeInterval, TimeInterval, Float) in
+                let engine = PlaybackEngine()
+                _ = EventLog(engine)
+                defer { engine.setOutputMonitor(on: .a, nil); engine.stopAll() }
+                guard (try? engine.loadFile(at: fixture, on: .a)) != nil else { return ([], -1, -1, -1) }
+                engine.outputVolume = 0
+                let recorder = Recorder()
+                engine.setOutputMonitor(on: .a) { recorder.record($0) }
+                engine.play(deck: .a, from: 0)
+                // Sounding at full level well inside the loud half.
+                _ = pollPosition(engine, deck: .a, past: 1.0, timeout: 5)
+
+                let seekAt = Date().timeIntervalSince(recorder.start)
+                engine.seek(deck: .a, to: 5.0)
+                Thread.sleep(forTimeInterval: 1.2)
+                // The fader has to come back on its own, or "no leak" would be
+                // trivially satisfied by a deck that never sounds again.
+                let volume = engine.effectSnapshot(of: .a).volume
+                let position = engine.position(of: .a)
+                return (recorder.snapshot(), seekAt, position, volume)
+            }
+            guard let (samples, seekAt, position, volume) = result, !samples.isEmpty else {
+                Issue.record("\(name): no audio was captured from deck A")
+                continue
+            }
+
+            let nominal = samples.filter { $0.t < seekAt }.map(\.peak).max() ?? 0
+            #expect(nominal > 0.05, "\(name): deck A should be sounding before the seek (peak \(nominal))")
+
+            // One render buffer of grace: the seek is an async hop onto the
+            // engine queue and the mixer smooths a gain change over a few ms.
+            let after = samples.filter { $0.t > seekAt + 0.05 }
+            let worst = after.max { $0.peak < $1.peak }
+            let window = samples.filter { $0.t > seekAt - 0.3 && $0.t < seekAt + 0.8 }
+            let timeline = stride(from: 0, to: window.count, by: max(window.count / 30, 1))
+                .map { String(format: "%+.2f:%.3f", window[$0].t - seekAt, window[$0].peak) }
+                .joined(separator: " ")
+            print("seekResidue[\(name)]: nominal=\(nominal) worstAfter=\(worst?.peak ?? 0) " +
+                  "at +\((worst?.t ?? 0) - seekAt)s | \(timeline)")
+            let leakDetail = "\(name): after seeking from the loud half to the silent half the deck " +
+                "still put out \(worst?.peak ?? 0) (nominal \(nominal)) at " +
+                "+\((worst?.t ?? 0) - seekAt)s — that is the pre-seek position draining out of the chain"
+            #expect((worst?.peak ?? 0) <= nominal * 0.1, "\(leakDetail)")
+            #expect(abs(volume - 1) < 0.001,
+                    "\(name): the fader must be handed back after the flush window (got \(volume))")
+            #expect(position > 5.5, "\(name): playback must continue from the seek target (got \(position))")
+        }
+    }
+
+    // (l) Whatever ends a transition, the deck that is left carrying the track
+    // must be *in service*: chain fully transparent and fader open. A deck is
+    // reused as-is — `play(deck:from:)` does not rebuild it — so a band left
+    // ducked keeps ducking for the whole next song: the reported "everything
+    // sounds muffled / like it is under water" (a -24 dB high shelf is exactly
+    // that). The incoming deck is the risky one, because `beginOverlapLocked`
+    // primes it with the full three-band cut and only the ramps release it.
+    @Test func liveDeckIsNeutralAfterEveryTransitionExit() throws {
+        guard audioOutputAvailable else { return }
+
+        let stagedCrossfade = PlannedTransition(
+            plan: .crossfade(duration: 2.5, outPoint: 5.2, inPoint: 0),
+            style: TransitionStyle(outroEffect: .fade, stagedEQ: true))
+        let echoBeatMatched = PlannedTransition(
+            plan: .beatMatched(BeatMatchedPlan(
+                outPoint: 5.2, inPoint: 0, overlapBars: 2,
+                outgoingRate: 0.99, incomingRate: 1.03,
+                bassSwapOffset: 1.2, overlapDuration: 2.4)),
+            style: TransitionStyle(outroEffect: .echoOut, stagedEQ: true))
+
+        /// What the test does once the overlap is under way, and which deck is
+        /// carrying the track afterwards.
+        enum Interruption { case none, cancelAfterMidpoint, cancelWhileSettling, pauseThenCancel }
+
+        struct Case {
+            let name: String
+            let planned: PlannedTransition
+            let interruption: Interruption
+            /// Load the incoming deck at all? Not loading it is the contract
+            /// violation the engine has to bail out of *cleanly*.
+            let loadIncoming: Bool
+            /// The deck that owns the track once the dust settles.
+            let live: Deck
+        }
+
+        let cases = [
+            Case(name: "normal completion", planned: stagedCrossfade,
+                 interruption: .none, loadIncoming: true, live: .b),
+            Case(name: "cancel after midpoint", planned: stagedCrossfade,
+                 interruption: .cancelAfterMidpoint, loadIncoming: true, live: .b),
+            Case(name: "cancel while settling", planned: echoBeatMatched,
+                 interruption: .cancelWhileSettling, loadIncoming: true, live: .b),
+            Case(name: "pause mid-overlap then cancel", planned: stagedCrossfade,
+                 interruption: .pauseThenCancel, loadIncoming: true, live: .b),
+            // The incoming deck was never loaded: the engine drops the plan —
+            // and must not leave the deck primed with the staged cut, because
+            // the next track will be played on it as-is.
+            Case(name: "incoming deck not loaded", planned: stagedCrossfade,
+                 interruption: .none, loadIncoming: false, live: .b),
+        ]
+
+        for testCase in cases {
+            let result = withWatchdog("liveDeckNeutral-\(testCase.name)", timeout: 45) {
+                () -> PlaybackEngine.DeckEffectSnapshot? in
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil else { return nil }
+                if testCase.loadIncoming {
+                    guard (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return nil }
+                }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: 4.7)
+                engine.scheduleTransition(testCase.planned, from: .a, to: .b)
+
+                func waitForMidpoint() -> Bool {
+                    log.wait(timeout: 12) {
+                        if case .transitionMidpoint(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }
+                }
+                switch testCase.interruption {
+                case .none:
+                    // Let it run to completion and settle out on its own.
+                    _ = log.wait(timeout: 15) {
+                        if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }
+                    let deadline = Date().addingTimeInterval(6)
+                    while Date() < deadline, engine.hasPendingTransition {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                case .cancelAfterMidpoint:
+                    // Past the midpoint the incoming deck IS the current track;
+                    // a skip/seek here must hand it over neutral, not muffled.
+                    _ = waitForMidpoint()
+                    engine.cancelScheduledTransition()
+                case .cancelWhileSettling:
+                    _ = log.wait(timeout: 15) {
+                        if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }
+                    Thread.sleep(forTimeInterval: 0.3) // inside the settle phase
+                    engine.cancelScheduledTransition()
+                case .pauseThenCancel:
+                    _ = waitForMidpoint()
+                    engine.pause()
+                    Thread.sleep(forTimeInterval: 0.4)
+                    engine.cancelScheduledTransition()
+                    engine.resume()
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+                if !testCase.loadIncoming {
+                    // Nothing handed the deck over, so nothing raised its
+                    // fader either — judge the chain only (see below).
+                    return engine.effectSnapshot(of: testCase.live)
+                }
+                return engine.effectSnapshot(of: testCase.live)
+            }
+            guard let snapshot = result ?? nil else { continue }
+            let detail = "\(testCase.name): the deck left carrying the track has a filter still " +
+                "engaged — it will colour the whole next song (\(snapshot))"
+            #expect(snapshot.effectsAreNeutral, "\(detail)")
+            if testCase.loadIncoming {
+                #expect(abs(snapshot.volume - 1) < 0.001,
+                        "\(testCase.name): the live deck's fader must be open (\(snapshot))")
+            }
+        }
+    }
+}
