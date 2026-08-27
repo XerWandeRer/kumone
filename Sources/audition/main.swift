@@ -107,6 +107,11 @@ func explain(_ d: Audition.Decision) -> String {
     lines.append("  loudness gap  \(f(d.loudnessGapDB)) dB"
                  + "   [neutral > \(f(th("neutralLoudnessDB"), 1)),"
                  + " clash > \(f(th("clashLoudnessDB"), 1))]")
+    // The gap above is post-compensation; show what produced it.
+    lines.append("  loudness      \(optional(d.outgoingLoudnessLUFS, 1)) →"
+                 + " \(optional(d.incomingLoudnessLUFS, 1)) LUFS"
+                 + "   trim \(f(d.outgoingTrimDB)) / \(f(d.incomingTrimDB)) dB"
+                 + "  (raw gap \(f(d.rawLoudnessGapDB)) dB)")
     lines.append("  timbre dist   \(f(d.timbreDistance, 3))"
                  + "      [neutral > \(f(th("neutralTimbreDistance"), 2)),"
                  + " clash > \(f(th("clashTimbreDistance"), 2))]")
@@ -306,12 +311,20 @@ func runRender(_ args: Arguments) {
         if let reason = r.stemFallbackReason {
             stemLine = "\n    stem NOT applied, rendered whole-mix: \(reason)"
         }
+        // Blind-test level matching, applied to the finished file only.
+        var normLine = ""
+        if let target = r.normalizationTargetLUFS {
+            normLine = "\n    blind-test normalization "
+                + "\(optional(r.measuredLUFS, 1)) → \(f(target, 1)) LUFS "
+                + "(\(f(r.normalizationGainDB)) dB applied to the file)"
+        }
         print("""
 
           wrote \(r.outputURL.path)
             \(f(r.duration))s of audio, hand-over at \(mmss(r.overlapStart)) \
           (overlap \(f(r.overlapDuration))s)
-            rendered in \(f(r.renderSeconds))s — \(f(r.realtimeFactor, 1))× real time\(stemLine)
+            rendered in \(f(r.renderSeconds))s — \(f(r.realtimeFactor, 1))× real time
+            deck trims \(f(r.outgoingTrimDB)) / \(f(r.incomingTrimDB)) dB (as the player would)\(normLine)\(stemLine)
             afplay \(r.outputURL.path)
           """)
     } catch {
@@ -382,7 +395,9 @@ func runBatch(_ args: Arguments) {
         }
         rows.append("| \(d.outgoingName) → \(d.incomingName) | \(d.tier)"
                     + (d.demotedByKey ? " (key)" : "")
-                    + " | \(f(d.loudnessGapDB)) | \(f(d.timbreDistance, 3))"
+                    + " | \(f(d.loudnessGapDB)) | \(f(d.rawLoudnessGapDB))"
+                    + " | \(f(d.outgoingTrimDB))/\(f(d.incomingTrimDB))"
+                    + " | \(f(d.timbreDistance, 3))"
                     + " | \(optional(d.tempoRatio, 3)) | \(d.keyDistance.map(String.init) ?? "—")"
                     + " | \(optional(d.outgoingVocalScore))/\(optional(d.incomingVocalScore))"
                     + " | \(d.planKind) | \(d.styleDescription)"
@@ -425,6 +440,35 @@ func runBatch(_ args: Arguments) {
                                  tally { $0.plannedStemTechnique ?? "(none)" }))
     }
     summary.append("**Overlap length** — \(fadeSummary)\n")
+
+    // Loudness compensation: what the per-track trims did to the gap the tier
+    // gate reads, and how far the trims had to reach.
+    func spread(_ xs: [Double]) -> String {
+        guard !xs.isEmpty else { return "n/a" }
+        let sorted = xs.sorted()
+        let mean = sorted.reduce(0, +) / Double(sorted.count)
+        return "min \(f(sorted.first!)) · median \(f(sorted[sorted.count / 2])) · "
+            + "mean \(f(mean)) · max \(f(sorted.last!))"
+    }
+    let rawGaps = decisions.map(\.rawLoudnessGapDB)
+    let gaps = decisions.map(\.loudnessGapDB)
+    let trims = decisions.flatMap { [$0.outgoingTrimDB, $0.incomingTrimDB] }
+    summary.append("**Loudness gap (dB)** — before compensation: \(spread(rawGaps))")
+    summary.append("")
+    summary.append("**Loudness gap (dB)** — after compensation (what the tier gate reads): "
+                   + "\(spread(gaps))")
+    summary.append("")
+    summary.append("**Per-track playback trim (dB)** — \(spread(trims))")
+    summary.append("")
+    let neutralLine = Audition.standardConfig["neutralLoudnessDB"] ?? 0
+    let clashLine = Audition.standardConfig["clashLoudnessDB"] ?? 0
+    func over(_ xs: [Double], _ line: Double) -> Int { xs.filter { $0 > line }.count }
+    summary.append("**Pairs the loudness signal alone would demote** — "
+                   + "over the tolerance line (\(f(neutralLine, 1)) dB): "
+                   + "\(over(rawGaps, neutralLine)) → \(over(gaps, neutralLine)); "
+                   + "over the red line (\(f(clashLine, 1)) dB): "
+                   + "\(over(rawGaps, clashLine)) → \(over(gaps, clashLine))")
+    summary.append("")
     let borderline = decisions.filter { !$0.nearMisses.isEmpty }
     if !borderline.isEmpty {
         summary.append("**Borderline pairs** (a threshold nudge would reclassify these)\n")
@@ -450,9 +494,10 @@ func runBatch(_ args: Arguments) {
         summary.joined(separator: "\n"),
         "## Per-pair decisions",
         "",
-        "| pair | tier | loudness dB | timbre | tempo | key | vocals out/in "
+        "| pair | tier | loudness dB | raw loudness dB | trim out/in dB "
+            + "| timbre | tempo | key | vocals out/in "
             + "| plan | style | stem | overlap | out point | render |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ] + rows).joined(separator: "\n") + "\n"
 
     let docURL = outDir.appendingPathComponent("decisions.md")

@@ -96,6 +96,11 @@ enum TransitionPlanner {
         var echoDelayMax: TimeInterval = 1.0
         /// Window (seconds of 1 s RMS) each side contributes to the loudness gap.
         var loudnessWindow: Int = 15
+        /// Whether the two thresholds above are measured **after** the
+        /// per-track playback trim (`LoudnessCompensation`) or on the raw
+        /// masters. Mirrors the product's setting so the planner judges the
+        /// hand-over the listener will actually hear; see `loudnessGapDB`.
+        var loudnessCompensation: Bool = true
         /// Out-point search window for beat-matched plans: candidates must sit
         /// past `max(duration * tailWindowShare, outLimit - tailWindowSeconds)`.
         var tailWindowSeconds: TimeInterval = 60
@@ -402,7 +407,17 @@ enum TransitionPlanner {
     /// `audition` can print them (and how close each sits to its threshold)
     /// rather than re-deriving them and drifting from the real decision.
     struct Signals {
+        /// |dB| level gap at the hand-over **as it will be heard**: the raw
+        /// gap between the two masters, less whatever the per-track playback
+        /// trims already cancel. See `loudnessGapDB`.
         let loudnessGapDB: Double
+        /// The same gap before compensation — what the gate used to measure,
+        /// kept so the console can show the move rather than just the result.
+        let rawLoudnessGapDB: Double
+        /// The playback trim each deck will run at (dB, 0 when compensation is
+        /// off or the loudness is unknown).
+        let outgoingTrimDB: Double
+        let incomingTrimDB: Double
         let timbreDistance: Double
         /// Folded (double/half-time) BPM difference as a ratio of the outgoing
         /// tempo; nil when either tempo is below the confidence gate.
@@ -420,9 +435,16 @@ enum TransitionPlanner {
                 .map { abs(incoming.bpm * $0 - outgoing.bpm) / outgoing.bpm }
                 .min()!
         }
+        let raw = rawLoudnessGapDB(outgoing: outgoing, incoming: incoming, config: config)
+        let outTrim = LoudnessCompensation.trimDB(
+            for: outgoing, enabled: config.loudnessCompensation)
+        let inTrim = LoudnessCompensation.trimDB(
+            for: incoming, enabled: config.loudnessCompensation)
         return Signals(
-            loudnessGapDB: loudnessGapDB(outgoing: outgoing, incoming: incoming,
-                                         config: config),
+            loudnessGapDB: abs(raw + outTrim - inTrim),
+            rawLoudnessGapDB: abs(raw),
+            outgoingTrimDB: outTrim,
+            incomingTrimDB: inTrim,
             timbreDistance: timbreDistance(outgoing.melProfile, incoming.melProfile),
             tempoRatio: tempoRatio)
     }
@@ -448,9 +470,23 @@ enum TransitionPlanner {
         return .compatible
     }
 
-    /// |dB| gap between the outgoing tail's mean RMS and the incoming
-    /// opening's mean RMS (~15 s windows).
-    private static func loudnessGapDB(
+    /// **Signed** gap between the outgoing tail's mean RMS and the incoming
+    /// opening's mean RMS (~15 s windows), in dB, before any compensation.
+    /// Positive = the outgoing tail is the louder side.
+    ///
+    /// This is a *local* level comparison (the seconds that actually meet),
+    /// which is the right thing to gate a hand-over on — while
+    /// `referenceLoudness` is a *whole-track* mastering figure, which is the
+    /// right thing to derive a constant playback trim from. `signals` combines
+    /// them: what the listener hears at the hand-over is this local gap shifted
+    /// by the difference of the two decks' trims, so the gate is left measuring
+    /// only the part the compensation could not absorb (a trim clipped by the
+    /// +3 dB boost cap or by the peak guard, or a track with no loudness
+    /// reading at all). Two songs whose masters differ by 6 dB but whose
+    /// hand-over windows are equally loud have always read 0 dB here and still
+    /// do; two songs whose 6 dB gap the trims cancel now also read ~0, instead
+    /// of being demoted for a difference the player itself removes.
+    private static func rawLoudnessGapDB(
         outgoing: TrackAnalysis, incoming: TrackAnalysis, config: Config
     ) -> Double {
         func mean(_ env: [Float], from: Int, length: Int) -> Double {
@@ -470,7 +506,7 @@ enum TransitionPlanner {
         let tail = mean(outgoing.rmsEnvelope, from: tailEnd - window, length: window)
         let opening = mean(incoming.rmsEnvelope, from: Int(incoming.introEnd), length: window)
         guard tail > 1e-6, opening > 1e-6 else { return 0 }
-        return abs(20 * log10(tail / opening))
+        return 20 * log10(tail / opening)
     }
 
     /// Cosine distance between the (already normalized) mel fingerprints;

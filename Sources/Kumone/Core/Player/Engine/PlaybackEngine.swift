@@ -104,6 +104,18 @@ final class PlaybackEngine: @unchecked Sendable {
         /// level to hand back once the stale audio still inside the effect
         /// chain has been pushed out. See `beginFaderFlushLocked`.
         var pendingFaderRestore: Float?
+        /// Per-track loudness compensation, as a **linear multiplier on every
+        /// fader write** (`setFaderLocked`). 1 = unity, and every path is then
+        /// bit-identical to the player before compensation existed.
+        ///
+        /// It is a property of the material on the deck, set once when the deck
+        /// is loaded and never touched again while that track plays: a trim
+        /// that moved mid-song would be a level jump, which is the very thing
+        /// it exists to remove. It multiplies the transition automation's 0–1
+        /// curves rather than replacing them, so curve semantics are untouched;
+        /// and it lives below the user's volume (`mainMixerNode.outputVolume`),
+        /// which it never reads or writes.
+        var trim: Float = 1
 
         // Progressive-stream bookkeeping.
         var pendingStreamBuffers = 0
@@ -279,7 +291,12 @@ final class PlaybackEngine: @unchecked Sendable {
 
     /// Load a complete local file (cache-hit path); returns its duration.
     /// Does not start playback.
-    func loadFile(at url: URL, on deck: Deck) throws -> TimeInterval {
+    ///
+    /// `trimDB` is this track's loudness compensation (`LoudnessCompensation`),
+    /// taken here rather than through a setter so it is fixed for the whole
+    /// time the track is on the deck: an analysis that lands mid-song cannot
+    /// move it, and the next load is the earliest it can change.
+    func loadFile(at url: URL, on deck: Deck, trimDB: Double = 0) throws -> TimeInterval {
         try queue.sync {
             let file = try AVAudioFile(forReading: url)
             let state = deckStates[deck]!
@@ -289,6 +306,7 @@ final class PlaybackEngine: @unchecked Sendable {
             // the reset has the last word on this deck.
             invalidateTransitionLocked(touching: deck)
             resetDeckLocked(state)
+            state.trim = LoudnessCompensation.gain(fromDB: trimDB)
             let fileFormat = file.processingFormat
             if fileFormat.sampleRate == graphFormat.sampleRate,
                fileFormat.channelCount == graphFormat.channelCount {
@@ -338,11 +356,18 @@ final class PlaybackEngine: @unchecked Sendable {
     /// Progressive streaming: play while downloading, mirroring raw bytes
     /// into `partURL`. `formatHint` is the file extension ("mp3"/"flac"/"m4a")
     /// used as the AudioFileStream type hint.
-    func startStreaming(from remote: URL, formatHint: String?, writingTo partURL: URL, on deck: Deck) {
+    ///
+    /// `trimDB` is 0 in practice: a track being streamed for the first time has
+    /// no analysis yet, so it has no measured loudness to compensate. The
+    /// parameter exists so the stream path cannot silently diverge from the
+    /// file path if that ever changes.
+    func startStreaming(from remote: URL, formatHint: String?, writingTo partURL: URL,
+                        on deck: Deck, trimDB: Double = 0) {
         queue.async {
             let state = self.deckStates[deck]!
             self.invalidateTransitionLocked(touching: deck)
             self.resetDeckLocked(state)
+            state.trim = LoudnessCompensation.gain(fromDB: trimDB)
             let loader = ProgressiveLoader(remoteURL: remote, formatHint: formatHint,
                                            partURL: partURL, output: self.graphFormat,
                                            queue: self.queue)
@@ -548,7 +573,11 @@ final class PlaybackEngine: @unchecked Sendable {
     /// Snapshot of one deck's fader + effect parameters. Test hook: the only
     /// way to assert that a transition left the reused deck neutral.
     struct DeckEffectSnapshot: Sendable, Equatable {
+        /// `player.volume` as written — i.e. the fader level already scaled by
+        /// `trim`, which is what actually reaches the mixer.
         var volume: Float
+        /// The deck's loudness-compensation multiplier; 1 = no compensation.
+        var trim: Float = 1
         var rate: Float
         var eqGlobalGain: Float = 0
         var lowGain: Float
@@ -570,7 +599,9 @@ final class PlaybackEngine: @unchecked Sendable {
 
         /// The pose of a deck that is carrying (or about to carry) a track:
         /// transparent chain, fader open.
-        var isNeutral: Bool { effectsAreNeutral && abs(volume - 1) < 0.001 }
+        /// "Fader fully open" means the deck's own trim, not literally 1 — a
+        /// compensated deck at full fade sits at its trim by construction.
+        var isNeutral: Bool { effectsAreNeutral && abs(volume - trim) < 0.001 }
 
         /// The pose `resetDeckLocked` parks a spent deck in: transparent chain
         /// *and* silent, so nothing still draining out of the chain can be
@@ -583,6 +614,7 @@ final class PlaybackEngine: @unchecked Sendable {
             let state = deckStates[deck]!
             return DeckEffectSnapshot(
                 volume: state.player.volume,
+                trim: state.trim,
                 rate: state.timePitch.rate,
                 eqGlobalGain: state.eq.globalGain,
                 lowGain: state.band(.low).gain,
@@ -702,11 +734,16 @@ final class PlaybackEngine: @unchecked Sendable {
     /// The hard-silence paths (`resetDeckLocked`, `silenceDeckLocked`, the
     /// cancel paths) deliberately bypass this and write 0 directly: a deck
     /// that is being taken out of service must go quiet *now*.
+    ///
+    /// Every requested level is scaled by the deck's loudness-compensation
+    /// `trim` here, and only here — callers keep speaking in 0–1 fader terms
+    /// (`TransitionAutomation` included) and never see the gain.
     private func setFaderLocked(_ state: DeckState, _ value: Float) {
+        let level = value * state.trim
         if state.pendingFaderRestore != nil {
-            state.pendingFaderRestore = value
+            state.pendingFaderRestore = level
         } else {
-            state.player.volume = value
+            state.player.volume = level
         }
     }
 
@@ -821,6 +858,11 @@ final class PlaybackEngine: @unchecked Sendable {
             neutralizeEffectsLocked(state)
         }
         state.source = .none
+        // The trim belongs to the material that just left; a deck out of
+        // service is at unity until its next load says otherwise. (An echo
+        // tail is unaffected: its level is already written into player.volume,
+        // and nothing calls setFaderLocked on a sourceless deck.)
+        state.trim = 1
         state.isPlaying = false
         state.startOffset = 0
         state.lastKnownPosition = 0

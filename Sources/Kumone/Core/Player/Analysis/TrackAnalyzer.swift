@@ -133,7 +133,9 @@ enum TrackAnalyzer {
                 outroFadeStart: nil, introEnd: 0, duration: duration,
                 melProfile: [],
                 keyPitchClass: nil, keyIsMinor: false, keyConfidence: 0,
-                vocalActivity: [])
+                vocalActivity: [],
+                referenceLoudness: LoudnessMeter.integratedLUFS(x, sampleRate: sr),
+                peakDBFS: LoudnessMeter.peakDBFS(x))
         }
 
         let features = stftFeatures(x, sampleRate: sr)
@@ -195,7 +197,12 @@ enum TrackAnalyzer {
             keyPitchClass: key.pitchClass,
             keyIsMinor: key.isMinor,
             keyConfidence: key.confidence,
-            vocalActivity: vocals)
+            vocalActivity: vocals,
+            // Mastered loudness for cross-track gain compensation. Measured on
+            // the same resampled mono signal every other feature uses, so it
+            // costs one extra pass of two biquads and no extra decode.
+            referenceLoudness: LoudnessMeter.integratedLUFS(x, sampleRate: sr),
+            peakDBFS: LoudnessMeter.peakDBFS(x))
     }
 
     /// Whole-track timbre fingerprint for the planner's compatibility gate:

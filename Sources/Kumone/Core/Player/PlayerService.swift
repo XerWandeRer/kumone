@@ -686,7 +686,17 @@ final class PlayerService: ObservableObject {
                 isBuffering = false
             }
             guard generation == resolveGeneration else { return }
-            if let local, let fileDuration = try? engine.loadFile(at: local, on: activeDeck) {
+            // A cached sidecar (this track has been heard before) lets the deck
+            // open at its compensated level right away. On a miss the trim is 0
+            // and stays 0 for this play: `ensureCurrentAnalysis` below will
+            // compute and persist the analysis, but applying it now would be an
+            // audible jump mid-song, so it takes effect from the next load.
+            let cachedAnalysis = analysisWanted
+                ? await AudioCache.shared.loadAnalysis(for: key) : nil
+            guard generation == resolveGeneration else { return }
+            if let local,
+               let fileDuration = try? engine.loadFile(
+                   at: local, on: activeDeck, trimDB: loudnessTrimDB(for: cachedAnalysis)) {
                 hasLocalFile = true
                 engine.play(deck: activeDeck, from: 0)
                 isPlaying = true
@@ -772,7 +782,10 @@ final class PlayerService: ObservableObject {
             do {
                 let local = try await AudioCache.shared.download(from: remote, key: key)
                 guard generation == resolveGeneration else { return }
-                let fileDuration = try engine.loadFile(at: local, on: activeDeck)
+                // Mid-song recovery: keep the level exactly where the listener
+                // has been hearing it (the stream started at unity), so the
+                // fallback is inaudible.
+                let fileDuration = try engine.loadFile(at: local, on: activeDeck, trimDB: 0)
                 hasLocalFile = true
                 isBuffering = false
                 duration = fileDuration
@@ -866,7 +879,8 @@ final class PlayerService: ObservableObject {
     private func armTransitionIfReady() {
         guard !transitionArmed, let next = prefetchedNext else { return }
         let incoming = activeDeck.other
-        guard (try? engine.loadFile(at: next.localURL, on: incoming)) != nil else {
+        guard (try? engine.loadFile(at: next.localURL, on: incoming,
+                                    trimDB: loudnessTrimDB(for: next.analysis))) != nil else {
             prefetchedNext = nil
             return
         }
@@ -893,8 +907,34 @@ final class PlayerService: ObservableObject {
         // the whole-mix rules. Stem techniques are auditioned offline only
         // (`audition --stems on`); wiring a provider in here is S3's job.
         return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
-                                      stems: .none)
+                                      stems: .none, config: plannerConfig)
         #endif
+    }
+
+    /// `Config.standard` with the one knob the user can see: the planner's
+    /// loudness gate must measure the same thing the decks will play, so the
+    /// compensation setting has to reach it.
+    private var plannerConfig: TransitionPlanner.Config {
+        var config = TransitionPlanner.Config.standard
+        config.loudnessCompensation = loudnessCompensationEnabled
+        return config
+    }
+
+    /// Whether cross-track gain compensation is active right now. AutoMix off
+    /// means no analyses are computed at all, so there is nothing to compensate
+    /// with either.
+    private var loudnessCompensationEnabled: Bool {
+        #if os(iOS)
+        return false
+        #else
+        return SettingsManager.shared.automixEnabled
+            && SettingsManager.shared.loudnessCompensationEnabled
+        #endif
+    }
+
+    /// The playback trim to load a track at, given whatever analysis is in hand.
+    private func loudnessTrimDB(for analysis: TrackAnalysis?) -> Double {
+        LoudnessCompensation.trimDB(for: analysis, enabled: loudnessCompensationEnabled)
     }
 
     /// Whether analysis results would ever be consumed: on iOS and with

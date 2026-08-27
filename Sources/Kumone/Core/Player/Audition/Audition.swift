@@ -258,7 +258,16 @@ public enum Audition {
         /// The key gate turned a compatible pair into a neutral one.
         public let demotedByKey: Bool
 
+        /// Level gap at the hand-over after the per-track loudness trims —
+        /// what the gate judges, and what the listener hears.
         public let loudnessGapDB: Double
+        /// The same gap before compensation, and the two trims that closed it.
+        public let rawLoudnessGapDB: Double
+        public let outgoingTrimDB: Double
+        public let incomingTrimDB: Double
+        /// Whole-track mastered loudness (LUFS) of each side, nil when unknown.
+        public let outgoingLoudnessLUFS: Double?
+        public let incomingLoudnessLUFS: Double?
         public let timbreDistance: Double
         public let tempoRatio: Double?
         public let keyDistance: Int?
@@ -429,6 +438,11 @@ public enum Audition {
             tier: name(of: effectiveTier),
             demotedByKey: demoted,
             loudnessGapDB: signals.loudnessGapDB,
+            rawLoudnessGapDB: signals.rawLoudnessGapDB,
+            outgoingTrimDB: signals.outgoingTrimDB,
+            incomingTrimDB: signals.incomingTrimDB,
+            outgoingLoudnessLUFS: out.referenceLoudness,
+            incomingLoudnessLUFS: inc.referenceLoudness,
             timbreDistance: signals.timbreDistance,
             tempoRatio: signals.tempoRatio,
             keyDistance: keyDistance,
@@ -480,6 +494,16 @@ public enum Audition {
         public let stemVocalEnergyRatio: Double?
         public let stemCacheHit: Bool
         public let stemFallbackReason: String?
+        /// The trims the render played the two decks at — the product's own
+        /// compensation, so the render is what the player would do.
+        public let outgoingTrimDB: Double
+        public let incomingTrimDB: Double
+        /// Blind-test level matching: what the finished mix measured and the
+        /// constant gain applied to bring it to `normalizationTargetLUFS`.
+        /// Purely a fairness device for A/B listening; no product counterpart.
+        public let measuredLUFS: Double?
+        public let normalizationGainDB: Double
+        public let normalizationTargetLUFS: Double?
     }
 
     /// Render the decision's transition to a 44.1 kHz / 16-bit WAV.
@@ -495,6 +519,9 @@ public enum Audition {
         options.preRoll = preRoll
         options.postRoll = postRoll
         options.vocalStemProvider = stemProvider
+        // The render plays the decks at exactly the trims the product would.
+        options.outgoingTrimDB = decision.signals.outgoingTrimDB
+        options.incomingTrimDB = decision.signals.incomingTrimDB
         let result = try OfflineTransitionRenderer.render(
             decision.planned,
             outgoing: decision.outgoingURL, incoming: decision.incomingURL,
@@ -509,7 +536,12 @@ public enum Audition {
                              stemSeparatedSeconds: result.stemSeparatedSeconds,
                              stemVocalEnergyRatio: result.stemVocalEnergyRatio,
                              stemCacheHit: result.stemCacheHit,
-                             stemFallbackReason: result.stemFallbackReason)
+                             stemFallbackReason: result.stemFallbackReason,
+                             outgoingTrimDB: result.outgoingTrimDB,
+                             incomingTrimDB: result.incomingTrimDB,
+                             measuredLUFS: result.measuredLUFS,
+                             normalizationGainDB: result.normalizationGainDB,
+                             normalizationTargetLUFS: result.normalizationTargetLUFS)
     }
 
     // Thresholds are no longer republished here: `Decision.config` carries

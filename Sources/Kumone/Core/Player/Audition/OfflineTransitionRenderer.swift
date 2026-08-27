@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import Foundation
 
@@ -32,6 +33,31 @@ enum OfflineTransitionRenderer {
         /// Nil — the default — means stem techniques degrade to a whole-mix
         /// render, with the reason reported in `Result.stemFallbackReason`.
         var vocalStemProvider: VocalStemProvider? = nil
+
+        /// Per-deck loudness compensation, in dB, exactly as the live player
+        /// would apply it (`LoudnessCompensation`). Multiplied into every fader
+        /// write, so what the render sounds like is what the product does.
+        /// 0/0 — the default — is the uncompensated render, bit-identical to
+        /// what this renderer produced before compensation existed.
+        var outgoingTrimDB: Double = 0
+        var incomingTrimDB: Double = 0
+
+        /// Loudness the finished file is normalized to before it is written, or
+        /// nil to write it at its natural level.
+        ///
+        /// This is a **blind-listening fairness device and nothing else**: it
+        /// has no counterpart in the player, is applied to the mix after both
+        /// decks have been summed, and cancels out of any A/B comparison of two
+        /// renders of the same pair. Loudness bias is the strongest confound in
+        /// listening tests — the louder of two takes just sounds better — and
+        /// several of our techniques (`vocalDuck` above all) change level by
+        /// construction, so every result gathered without it is suspect
+        /// (docs/automix-research-notes.md §2.4). Sony's listening test used
+        /// −23 dBFS; −16 LUFS is the same idea on the same scale the rest of
+        /// this feature speaks, and leaves comfortable headroom.
+        var normalizeToLUFS: Double? = -16
+        /// The normalization never lets the file's peak past this.
+        var normalizePeakCeilingDBFS: Double = -1
         init() {}
     }
 
@@ -45,6 +71,15 @@ enum OfflineTransitionRenderer {
         let overlapDuration: TimeInterval
         /// Wall-clock seconds spent rendering, and the resulting speed-up.
         let renderSeconds: Double
+        /// The trims the two decks played at (dB), mirroring the product.
+        var outgoingTrimDB: Double = 0
+        var incomingTrimDB: Double = 0
+        /// Blind-test normalization: what the summed mix measured before it was
+        /// written, and the constant gain applied to land it on the target.
+        /// Nil/0 when normalization was off or the mix could not be measured.
+        var measuredLUFS: Double? = nil
+        var normalizationGainDB: Double = 0
+        var normalizationTargetLUFS: Double? = nil
         /// The stem technique that actually shaped this render, if any.
         var stemTechnique: String? = nil
         /// Wall-clock seconds the stem provider took (separation, or a cache
@@ -111,6 +146,10 @@ enum OfflineTransitionRenderer {
         let engine = AVAudioEngine()
         let decks = (0..<2).map { _ -> OfflineDeck in OfflineDeck(engine: engine, format: format) }
         let from = decks[0], to = decks[1]
+        // Same trim the live decks would carry, in the same place: a multiplier
+        // on the fader, never on the mixer.
+        from.trim = LoudnessCompensation.gain(fromDB: options.outgoingTrimDB)
+        to.trim = LoudnessCompensation.gain(fromDB: options.incomingTrimDB)
         engine.mainMixerNode.outputVolume = 1
         for deck in decks { deck.connect(engine: engine, format: format) }
 
@@ -118,14 +157,17 @@ enum OfflineTransitionRenderer {
         try engine.start()
         defer { engine.stop() }
 
-        let writer = try AVAudioFile(forWriting: outputURL,
-                                     settings: wavSettings(sampleRate: sampleRate),
-                                     commonFormat: .pcmFormatFloat32, interleaved: false)
         let scratch = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat,
                                        frameCapacity: engine.manualRenderingMaximumFrameCount)!
         let tickFrames = AVAudioFrameCount((sampleRate / options.tickRate).rounded())
 
-        /// Pull `frames` frames through the graph and append them to the file.
+        // The mix is accumulated rather than streamed straight to disk: the
+        // blind-test normalization needs the whole file's loudness before a
+        // single sample is written, and a ~40 s stereo render is a few MB.
+        let channelCount = Int(engine.manualRenderingFormat.channelCount)
+        var mix = [[Float]](repeating: [], count: channelCount)
+
+        /// Pull `frames` frames through the graph and append them to the mix.
         func pump(_ frames: AVAudioFrameCount) throws {
             var remaining = frames
             while remaining > 0 {
@@ -133,7 +175,12 @@ enum OfflineTransitionRenderer {
                 let status = try engine.renderOffline(chunk, to: scratch)
                 switch status {
                 case .success:
-                    try writer.write(from: scratch)
+                    if let data = scratch.floatChannelData {
+                        for channel in 0..<channelCount {
+                            mix[channel].append(contentsOf: UnsafeBufferPointer(
+                                start: data[channel], count: Int(scratch.frameLength)))
+                        }
+                    }
                     remaining -= scratch.frameLength
                 case .insufficientDataFromInputNode:
                     // No input node in this graph; treat as end of material.
@@ -162,7 +209,7 @@ enum OfflineTransitionRenderer {
             let outBuffer = try loadSegment(outgoingURL, from: outDuration - tail,
                                             seconds: tail, format: format)
             from.schedule(outBuffer)
-            from.player.volume = 1
+            from.setFader(1)
             from.player.play()
             let tailFrames = outBuffer.frameLength
             try pump(tailFrames)
@@ -173,7 +220,7 @@ enum OfflineTransitionRenderer {
             let inBuffer = try loadSegment(incomingURL, from: 0,
                                            seconds: options.postRoll, format: format)
             to.schedule(inBuffer)
-            to.player.volume = 1
+            to.setFader(1)
             to.player.play()
             try pump(inBuffer.frameLength)
             written += inBuffer.frameLength
@@ -219,7 +266,7 @@ enum OfflineTransitionRenderer {
 
             // --- Pre-roll: the outgoing track alone, chain transparent.
             from.schedule(outBuffer)
-            from.player.volume = 1
+            from.setFader(1)
             from.player.play()
             let preRollFrames = AVAudioFrameCount((preRoll * sampleRate).rounded())
             try pump(preRollFrames)
@@ -239,7 +286,7 @@ enum OfflineTransitionRenderer {
                 to.eq.bands[DeckChain.Band.mid.rawValue].gain = TransitionAutomation.midCutDB
                 to.eq.bands[DeckChain.Band.high.rawValue].gain = TransitionAutomation.highCutDB
             }
-            to.player.volume = 0
+            to.setFader(0)
             to.player.play()
 
             var elapsed: TimeInterval = 0
@@ -265,12 +312,12 @@ enum OfflineTransitionRenderer {
             for band in [DeckChain.Band.low, .mid, .high] { from.eq.bands[band.rawValue].gain = 0 }
             from.eq.bands[DeckChain.Band.highPass.rawValue].bypass = true
             if !tailRinging {
-                from.player.volume = 0
+                from.setFader(0)
                 from.eq.globalGain = 0
                 from.delay.wetDryMix = 0
                 from.delay.feedback = 0
             }
-            to.player.volume = 1
+            to.setFader(1)
             for band in [DeckChain.Band.low, .mid, .high] { to.eq.bands[band.rawValue].gain = 0 }
             to.eq.bands[DeckChain.Band.highPass.rawValue].bypass = true
 
@@ -297,7 +344,7 @@ enum OfflineTransitionRenderer {
                     written += tickFrames
                     settled += tickSeconds
                 }
-                from.player.volume = 0
+                from.setFader(0)
                 DeckChain.neutralize(timePitch: from.timePitch, eq: from.eq, delay: from.delay)
                 to.timePitch.rate = 1
             }
@@ -308,16 +355,99 @@ enum OfflineTransitionRenderer {
             written += postFrames
         }
 
+        // --- Blind-test normalization, then the one and only file write.
+        let normalization = normalize(&mix, options: options)
+        try write(mix, to: outputURL, format: engine.manualRenderingFormat,
+                  sampleRate: sampleRate)
+
         let duration = Double(written) / sampleRate
         return Result(outputURL: outputURL, duration: duration,
                       overlapStart: overlapStart, overlapDuration: overlap,
                       renderSeconds: Date().timeIntervalSince(started),
+                      outgoingTrimDB: options.outgoingTrimDB,
+                      incomingTrimDB: options.incomingTrimDB,
+                      measuredLUFS: normalization.measuredLUFS,
+                      normalizationGainDB: normalization.gainDB,
+                      normalizationTargetLUFS: options.normalizeToLUFS,
                       stemTechnique: stemApplied?.technique.label,
                       stemSeconds: stemApplied?.seconds,
                       stemSeparatedSeconds: stemApplied?.separatedSeconds,
                       stemVocalEnergyRatio: stemApplied?.vocalEnergyRatio,
                       stemCacheHit: stemApplied?.cacheHit ?? false,
                       stemFallbackReason: stemFallback)
+    }
+
+    // MARK: - Output normalization and write-out
+
+    /// Scale the finished mix to `options.normalizeToLUFS`, peak-guarded.
+    ///
+    /// Product-irrelevant by construction: this happens after both decks are
+    /// summed, so it cannot change the *shape* of a transition, only how loud
+    /// the resulting file plays. It exists so two renders put side by side in a
+    /// blind test are compared on their hand-over rather than on their level
+    /// (§2.4 of the research notes; Sony normalized their stimuli to −23 dBFS
+    /// for exactly this reason). The live player does none of this.
+    private static func normalize(
+        _ mix: inout [[Float]], options: Options
+    ) -> (measuredLUFS: Double?, gainDB: Double) {
+        guard let target = options.normalizeToLUFS, !mix.isEmpty, !mix[0].isEmpty else {
+            return (nil, 0)
+        }
+        // Measure on the mono downmix, matching how `referenceLoudness` is
+        // measured (LoudnessMeter counts a mono signal as a centred pair).
+        var mono = mix[0]
+        if mix.count > 1 {
+            for channel in 1..<mix.count {
+                for i in 0..<mono.count { mono[i] += mix[channel][i] }
+            }
+            let scale = Float(mix.count)
+            for i in 0..<mono.count { mono[i] /= scale }
+        }
+        guard let measured = LoudnessMeter.integratedLUFS(mono, sampleRate: DeckChain.format.sampleRate)
+        else { return (nil, 0) }
+
+        var gainDB = target - measured
+        // Sony's clip guard (`utils_data_normalization.py:79-80`), here as a
+        // cap on the gain rather than a rescale after the fact — same result,
+        // one pass.
+        if let peak = LoudnessMeter.peakDBFS(mix.flatMap { $0 }) {
+            gainDB = min(gainDB, options.normalizePeakCeilingDBFS - peak)
+        }
+        let gain = LoudnessCompensation.gain(fromDB: gainDB)
+        guard abs(gain - 1) > 1e-6 else { return (measured, 0) }
+        for channel in 0..<mix.count {
+            var scale = gain
+            vDSP_vsmul(mix[channel], 1, &scale, &mix[channel], 1, vDSP_Length(mix[channel].count))
+        }
+        return (measured, gainDB)
+    }
+
+    /// Write the accumulated mix out as the 16-bit WAV callers expect.
+    private static func write(_ mix: [[Float]], to outputURL: URL,
+                              format: AVAudioFormat, sampleRate: Double) throws {
+        let writer = try AVAudioFile(forWriting: outputURL,
+                                     settings: wavSettings(sampleRate: sampleRate),
+                                     commonFormat: .pcmFormatFloat32, interleaved: false)
+        guard let frames = mix.first?.count, frames > 0 else { return }
+        let chunkSize = 4096
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(chunkSize))
+        else { throw RenderError.manualRenderingFailed }
+        var offset = 0
+        while offset < frames {
+            let count = min(chunkSize, frames - offset)
+            buffer.frameLength = AVAudioFrameCount(count)
+            if let data = buffer.floatChannelData {
+                for channel in 0..<Int(format.channelCount) {
+                    let source = mix[min(channel, mix.count - 1)]
+                    source.withUnsafeBufferPointer {
+                        data[channel].update(from: $0.baseAddress! + offset, count: count)
+                    }
+                }
+            }
+            try writer.write(from: buffer)
+            offset += count
+        }
     }
 
     // MARK: - Offline deck
@@ -350,8 +480,15 @@ enum OfflineTransitionRenderer {
             player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
         }
 
+        /// Loudness-compensation multiplier; see `PlaybackEngine.DeckState.trim`.
+        var trim: Float = 1
+
+        /// The single fader writer, mirroring `PlaybackEngine.setFaderLocked`:
+        /// callers speak in 0–1 and the trim is folded in here.
+        func setFader(_ value: Float) { player.volume = value * trim }
+
         func apply(_ p: TransitionAutomation.DeckParameters) {
-            player.volume = p.fader
+            setFader(p.fader)
             DeckChain.apply(p, timePitch: timePitch, eq: eq, delay: delay)
         }
     }

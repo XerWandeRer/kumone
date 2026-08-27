@@ -405,6 +405,93 @@ import Foundation
                 "…and the outgoing one must be gone (\(post))")
     }
 
+    /// The two levels the renderer touches, and the fact that they are
+    /// independent: the per-deck **trim** is the product's own compensation and
+    /// must change the balance between the two songs, while the output
+    /// **normalization** is a blind-test fairness device applied to the finished
+    /// mix and must not change that balance at all.
+    @Test func renderAppliesDeckTrimsAndNormalizesTheFinishedFile() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audition-loudness-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let a = directory.appendingPathComponent("a.caf")
+        let b = directory.appendingPathComponent("b.caf")
+        try writeTone(440, seconds: 30, to: a)
+        try writeTone(880, seconds: 30, to: b)
+        let planned = PlannedTransition(
+            plan: .crossfade(duration: 4, outPoint: 20, inPoint: 0), style: .plain)
+
+        func render(outTrim: Double, inTrim: Double, normalize: Double?,
+                    name: String) throws -> (OfflineTransitionRenderer.Result, URL) {
+            var options = OfflineTransitionRenderer.Options()
+            options.preRoll = 3
+            options.postRoll = 3
+            options.outgoingTrimDB = outTrim
+            options.incomingTrimDB = inTrim
+            options.normalizeToLUFS = normalize
+            let url = directory.appendingPathComponent("\(name).wav")
+            return (try OfflineTransitionRenderer.render(
+                planned, outgoing: a, incoming: b, to: url, options: options), url)
+        }
+
+        // 1. Un-normalized, no trims: the reference balance.
+        let (plainResult, plainURL) = try render(
+            outTrim: 0, inTrim: 0, normalize: nil, name: "plain")
+        #expect(plainResult.normalizationGainDB == 0)
+        #expect(plainResult.normalizationTargetLUFS == nil)
+        let plainTones = try toneEnergy(in: plainURL)
+
+        // 2. The incoming deck 6 dB down, still un-normalized: only the
+        //    incoming tone moves, and by half.
+        let (trimmed, trimmedURL) = try render(
+            outTrim: 0, inTrim: -6.0206, normalize: nil, name: "trimmed")
+        #expect(trimmed.incomingTrimDB == -6.0206)
+        let trimmedTones = try toneEnergy(in: trimmedURL)
+        let plainPre = plainTones(1.0, 2.0), trimmedPre = trimmedTones(1.0, 2.0)
+        let plainPost = plainTones(8.0, 9.0), trimmedPost = trimmedTones(8.0, 9.0)
+        #expect(abs(trimmedPre.at440 - plainPre.at440) < plainPre.at440 * 0.05,
+                "the untrimmed deck must be untouched (\(trimmedPre) vs \(plainPre))")
+        #expect(abs(trimmedPost.at880 - plainPost.at880 * 0.5) < plainPost.at880 * 0.06,
+                "the trimmed deck must land at half amplitude (\(trimmedPost) vs \(plainPost))")
+
+        // 3. Normalized: the file lands on the target, and — the point of the
+        //    device — the *balance* between the two songs is untouched.
+        let (normalized, normalizedURL) = try render(
+            outTrim: 0, inTrim: -6.0206, normalize: -16, name: "normalized")
+        #expect(normalized.normalizationTargetLUFS == -16)
+        #expect(normalized.measuredLUFS != nil)
+        let measured = try measureLUFS(of: normalizedURL)
+        #expect(abs(measured - -16) < 0.5, "normalized file measured \(measured) LUFS")
+        let normalizedTones = try toneEnergy(in: normalizedURL)
+        let normPre = normalizedTones(1.0, 2.0), normPost = normalizedTones(8.0, 9.0)
+        let trimmedRatio = trimmedPost.at880 / trimmedPre.at440
+        let normalizedRatio = normPost.at880 / normPre.at440
+        #expect(abs(normalizedRatio - trimmedRatio) < trimmedRatio * 0.02,
+                "normalization must scale the whole file, not the mix (\(normalizedRatio) vs \(trimmedRatio))")
+        // And it is a real, non-trivial gain on this material.
+        #expect(abs(normalized.normalizationGainDB) > 0.5)
+    }
+
+    /// BS.1770 loudness of a rendered file, via the same meter the analyzer
+    /// uses (mono downmix, counted as a centred pair).
+    private func measureLUFS(of url: URL) throws -> Double {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                      frameCapacity: AVAudioFrameCount(file.length))!
+        try file.read(into: buffer)
+        let frames = Int(buffer.frameLength)
+        let channels = Int(format.channelCount)
+        var mono = [Float](repeating: 0, count: frames)
+        for channel in 0..<channels {
+            let data = buffer.floatChannelData![channel]
+            for i in 0..<frames { mono[i] += data[i] / Float(channels) }
+        }
+        return LoudnessMeter.integratedLUFS(mono, sampleRate: format.sampleRate)!
+    }
+
     /// `.gapless` is tail-to-head with no overlap: the outgoing track plays out
     /// and the incoming one starts on the very next sample. The render must
     /// show a clean splice — never both tones at once, and never a hole.

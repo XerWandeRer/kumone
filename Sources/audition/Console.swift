@@ -373,7 +373,12 @@ final class Console: @unchecked Sendable {
                     "realtimeFactor": r.realtimeFactor,
                     "style": decision.styleDescription,
                     "stemCacheHit": r.stemCacheHit,
+                    "outgoingTrimDB": r.outgoingTrimDB,
+                    "incomingTrimDB": r.incomingTrimDB,
+                    "normalizationGainDB": r.normalizationGainDB,
                 ]
+                if let m = r.measuredLUFS { payload["measuredLUFS"] = m }
+                if let t = r.normalizationTargetLUFS { payload["normalizationTargetLUFS"] = t }
                 if let t = r.stemTechnique { payload["stemTechnique"] = t }
                 if let s = r.stemSeconds { payload["stemSeconds"] = s }
                 if let s = r.stemSeparatedSeconds { payload["stemSeparatedSeconds"] = s }

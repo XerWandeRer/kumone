@@ -46,6 +46,17 @@ extension TransitionPlanner.Config {
               write: { $0[keyPath: path] = Int($1.rounded()) })
     }
 
+    /// A flag, shown as a 0/1 slider. The console renders every knob from this
+    /// list, so an on/off knob is a two-value one rather than a new widget.
+    private static func boolField(
+        _ name: String, _ group: String, _ blurb: String,
+        _ path: WritableKeyPath<TransitionPlanner.Config, Bool>
+    ) -> Field {
+        Field(name: name, group: group, blurb: blurb, min: 0, max: 1, step: 1, digits: 0,
+              read: { $0[keyPath: path] ? 1 : 0 },
+              write: { $0[keyPath: path] = $1 >= 0.5 })
+    }
+
     static let fields: [Field] = [
         // --- Tier gate: the five signals and the lines they cross.
         field("neutralLoudnessDB", "tier",
@@ -75,6 +86,10 @@ extension TransitionPlanner.Config {
         intField("loudnessWindow", "tier",
                  "比音量时，出曲结尾和入曲开头各取多少秒来算平均值。",
                  3, 45, \.loudnessWindow),
+        boolField("loudnessCompensation", "tier",
+                  "开 = 先按每首歌的母带响度做一次播放增益补偿，再看剩下的音量差；"
+                  + "关 = 直接拿原始音量差去撞上面两条线（补偿功能上线前的老行为）。",
+                  \.loudnessCompensation),
 
         // --- Beat-match gate.
         field("bpmConfidenceThreshold", "beatmatch",

@@ -181,7 +181,7 @@ audio{width:100%;margin:.4rem 0;height:38px}
 
   <h2>这一对的交接点 <span class="muted" id="planOvState">跟着规划器走</span></h2>
   <div class="card">
-    <p class="muted">上面的 35 个旋钮是全局的：一动，整个语料的每一对都跟着变。
+    <p class="muted">上面的 36 个旋钮是全局的：一动，整个语料的每一对都跟着变。
       如果你只是想给<b>这一对</b>换个交接点——比如让出曲的人声多唱完一句，
       或让入曲从更早的纯伴奏前奏进来——在这里直接写死就行。
       留空的那一项沿用规划器算出来的值。也可以直接在下面的时间轴上点一下：
@@ -470,7 +470,7 @@ function requestBody() {
 
 // ------------------------------------------------- plan-level override
 //
-// The 35 knobs are global; this is the one control that speaks about a single
+// The 36 knobs are global; this is the one control that speaks about a single
 // seam. It rides the same request the sliders do, so a hand-placed out point
 // re-plans, re-explains and re-renders exactly like a knob move.
 
@@ -785,12 +785,23 @@ function paintChain() {
 // through the same job + poll path so the page never sits on a dead socket.
 const STAGE_TEXT = {planning: "读取决策…", separating: "分离人声…", rendering: "渲染中…"};
 
+function sgn(v) { return (v >= 0 ? "+" : "") + fmt(v); }
+
 function describeRender(r) {
   const bits = [];
   bits.push(r.cached ? "复用已渲染的这一版"
     : `${fmt(r.duration)}s 音频 · ${fmt(r.realtimeFactor, 1)}× 实时`);
   bits.push(`交接在 ${fmt(r.overlapStart)}s`);
   if (r.style) bits.push(`手法 ${r.style}`);
+  // Playback trims are the product's own compensation; the normalization on
+  // top is only so two renders can be A/B'd without a loudness bias.
+  if (r.outgoingTrimDB || r.incomingTrimDB) {
+    bits.push(`播放增益 出 ${sgn(r.outgoingTrimDB)} / 入 ${sgn(r.incomingTrimDB)} dB`);
+  }
+  if (r.normalizationTargetLUFS !== undefined) {
+    bits.push(`盲听归一 ${fmt(r.measuredLUFS, 1)} → ${fmt(r.normalizationTargetLUFS, 1)} LUFS`
+      + `（${sgn(r.normalizationGainDB)} dB，只影响这个文件的响度，不影响过渡本身）`);
+  }
   if (r.stemTechnique) {
     bits.push(`stem ${r.stemTechnique} · 分离 ${fmt(r.stemSeparatedSeconds, 1)}s 用时`
       + ` ${fmt(r.stemSeconds)}s${r.stemCacheHit ? "（缓存命中）" : ""}`);
@@ -877,7 +888,7 @@ $("#batchBtn").onclick = async () => {
 // ------------------------------------------------------------------- AI 回路
 //
 // The console knows everything an outside model would need — what each of the
-// 31 knobs means and where it sits, what the five signals said, how the
+// 36 knobs means and where it sits, what the five signals said, how the
 // decision was derived — but only as pixels. These two buttons turn that into
 // text a chat window can read, and read a reply back in. No network call
 // leaves this page: the user carries the text across by hand, which is also

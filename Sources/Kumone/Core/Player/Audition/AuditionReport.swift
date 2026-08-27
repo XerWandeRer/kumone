@@ -46,6 +46,8 @@ extension Audition {
         public let keyConfidence: Double
         public let introEnd: TimeInterval
         public let outroFadeStart: TimeInterval?
+        /// Whole-track mastered loudness (BS.1770 gated integrated, LUFS).
+        public let referenceLoudness: Double?
         /// 1 s RMS, scaled so the track's own peak is 1.
         public let rms: [Double]
         /// 1 s vocal-presence likelihood, 0–1 as analyzed.
@@ -196,6 +198,7 @@ extension Audition {
             keyConfidence: a.keyConfidence,
             introEnd: a.introEnd,
             outroFadeStart: a.outroFadeStart,
+            referenceLoudness: a.referenceLoudness,
             rms: a.rmsEnvelope.map { Double($0) / scale },
             vocal: a.vocalActivity.map { Double($0) },
             // Whole-track grids get big; one downbeat every other bar is
@@ -221,8 +224,43 @@ extension Audition {
 
         var out: [SignalReport] = []
 
-        // 1. Loudness
+        // 1. Loudness — measured *after* the per-track playback trims, so the
+        // gate only ever punishes the part the compensation could not absorb.
         let loud = d.loudnessGapDB
+        func lufs(_ v: Double?) -> String {
+            v.map { String(format: "%.1f LUFS", $0) } ?? "未测出"
+        }
+        var compensation: String
+        if !c.loudnessCompensation {
+            compensation = "（响度补偿已关闭，这里是两首歌的原始音量差。"
+                + "出曲 \(lufs(d.outgoingLoudnessLUFS))、入曲 \(lufs(d.incomingLoudnessLUFS))。）"
+        } else if abs(d.outgoingTrimDB) < 0.05 && abs(d.incomingTrimDB) < 0.05 {
+            compensation = String(
+                format: "（母带响度 出曲 %@ / 入曲 %@，两边都不需要调整，播放增益均为 0.00 dB。）",
+                lufs(d.outgoingLoudnessLUFS), lufs(d.incomingLoudnessLUFS))
+        } else {
+            compensation = String(
+                format: "（母带响度 出曲 %@ / 入曲 %@，播放时分别加 %+.2f dB 和 %+.2f dB 的增益；"
+                    + "补偿前的原始音量差是 %.2f dB，上面这个数是补偿之后剩下的部分。）",
+                lufs(d.outgoingLoudnessLUFS), lufs(d.incomingLoudnessLUFS),
+                d.outgoingTrimDB, d.incomingTrimDB, d.rawLoudnessGapDB)
+        }
+        let loudnessVerdict: String
+        if loud > c.clashLoudnessDB {
+            loudnessVerdict = String(
+                format: "出曲结尾和入曲开头的平均音量差 %.2f dB，已经越过 %.2f dB 的红线。"
+                    + "这么大的落差叠在一起，总有一边会被压垮，所以这一对只给最短的礼貌淡出。",
+                loud, c.clashLoudnessDB)
+        } else if loud > c.neutralLoudnessDB {
+            loudnessVerdict = String(
+                format: "出曲结尾和入曲开头的平均音量差 %.2f dB，超过了 %.2f dB 的容忍线。"
+                    + "还不到灾难的地步，但不适合让两首歌长时间叠在一起，叠加会被缩短。",
+                loud, c.neutralLoudnessDB)
+        } else {
+            loudnessVerdict = String(
+                format: "出曲结尾和入曲开头的平均音量差 %.2f dB，在 %.2f dB 的容忍线以内，不构成问题。",
+                loud, c.neutralLoudnessDB)
+        }
         out.append(SignalReport(
             id: "loudness", label: "音量差",
             value: loud, display: String(format: "%.2f dB", loud),
@@ -232,16 +270,7 @@ extension Audition {
                     SignalMark(label: "红线", value: c.clashLoudnessDB,
                                field: "clashLoudnessDB")],
             state: state(loud, neutral: c.neutralLoudnessDB, clash: c.clashLoudnessDB),
-            verdict: loud > c.clashLoudnessDB
-                ? String(format: "出曲结尾和入曲开头的平均音量差 %.2f dB，已经越过 %.2f dB 的红线。"
-                         + "这么大的落差叠在一起，总有一边会被压垮，所以这一对只给最短的礼貌淡出。",
-                         loud, c.clashLoudnessDB)
-                : (loud > c.neutralLoudnessDB
-                   ? String(format: "出曲结尾和入曲开头的平均音量差 %.2f dB，超过了 %.2f dB 的容忍线。"
-                            + "还不到灾难的地步，但不适合让两首歌长时间叠在一起，叠加会被缩短。",
-                            loud, c.neutralLoudnessDB)
-                   : String(format: "出曲结尾和入曲开头的平均音量差 %.2f dB，在 %.2f dB 的容忍线以内，"
-                            + "不构成问题。", loud, c.neutralLoudnessDB))))
+            verdict: loudnessVerdict + compensation))
 
         // 2. Timbre
         let timbre = d.timbreDistance

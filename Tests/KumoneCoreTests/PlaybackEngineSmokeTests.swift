@@ -808,6 +808,108 @@ struct PlaybackEngineSmokeTests {
         #expect(o.deckB?.isNeutral == true, "plain: incoming deck must end neutral (\(String(describing: o.deckB)))")
     }
 
+    // (g2) Loudness compensation. The trim is a multiplier folded into the one
+    // fader writer, so two things have to hold: at 0 dB the engine is
+    // bit-identical to what it was before the trim existed, and at a real trim
+    // every fader path (play, the overlap ramp, the parked pose) is scaled by
+    // exactly that factor with nothing else moving.
+    @Test func loudnessTrimScalesTheFaderAndZeroDBChangesNothing() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome {
+            var untrimmed: PlaybackEngine.DeckEffectSnapshot?
+            var trimmed: PlaybackEngine.DeckEffectSnapshot?
+            var trimmedAfterStop: PlaybackEngine.DeckEffectSnapshot?
+        }
+        let result = withWatchdog("loudnessTrim", timeout: 40) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            _ = EventLog(engine)
+            defer { engine.stopAll() }
+            engine.outputVolume = 0
+            // Default (no trim argument): unity, exactly the old behaviour.
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil
+            else { return o }
+            engine.play(deck: .a, from: 0)
+            Thread.sleep(forTimeInterval: 0.4)
+            o.untrimmed = engine.effectSnapshot(of: .a)
+
+            // −6.0206 dB = exactly half amplitude.
+            guard (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b,
+                                        trimDB: -6.0206)) != nil else { return o }
+            engine.play(deck: .b, from: 0)
+            Thread.sleep(forTimeInterval: 0.4)
+            o.trimmed = engine.effectSnapshot(of: .b)
+
+            engine.stop(deck: .b)
+            Thread.sleep(forTimeInterval: 0.2)
+            o.trimmedAfterStop = engine.effectSnapshot(of: .b)
+            return o
+        }
+        guard let o = result, let untrimmed = o.untrimmed, let trimmed = o.trimmed,
+              let stopped = o.trimmedAfterStop else { return }
+
+        #expect(untrimmed.trim == 1, "a plain load must leave the deck at unity")
+        #expect(abs(untrimmed.volume - 1) < 0.001,
+                "0 dB trim: the fader must sit at 1 exactly as before (\(untrimmed.volume))")
+        #expect(untrimmed.isNeutral, "0 dB trim: the deck's pose must be unchanged")
+
+        #expect(abs(trimmed.trim - 0.5) < 0.001, "trim multiplier (\(trimmed.trim))")
+        #expect(abs(trimmed.volume - 0.5) < 0.001,
+                "a fully open fader on a −6 dB deck sits at 0.5 (\(trimmed.volume))")
+        // Nothing *but* the fader moves: the trim is not an EQ or a rate change.
+        #expect(trimmed.effectsAreNeutral)
+        #expect(trimmed.isNeutral, "'fader open' means the deck's trim, not literally 1")
+
+        // A deck taken out of service goes back to unity, so the next track
+        // cannot inherit the previous one's gain.
+        #expect(stopped.trim == 1)
+        #expect(stopped.isParked)
+    }
+
+    /// A styled overlap under a trim: the automation's 0–1 curves are scaled,
+    /// never replaced, so the incoming deck still lands exactly on its trim and
+    /// the outgoing deck still ends parked silent.
+    @Test func aTrimmedDeckStillEndsTheTransitionNeutral() throws {
+        guard audioOutputAvailable else { return }
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.99, incomingRate: 1.02,
+            bassSwapOffset: 1.2, overlapDuration: 2.4))
+        let result = withWatchdog("trimmedTransition", timeout: 45) {
+            () -> [PlaybackEngine.DeckEffectSnapshot] in
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a,
+                                        trimDB: -3)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b,
+                                        trimDB: 2)) != nil else { return [] }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 4.7)
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+            let deadline = Date().addingTimeInterval(14)
+            while Date() < deadline {
+                if log.contains({
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }) { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            let settle = Date().addingTimeInterval(6)
+            while Date() < settle, engine.hasPendingTransition {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            return [engine.effectSnapshot(of: .a), engine.effectSnapshot(of: .b)]
+        }
+        guard let snapshots = result, snapshots.count == 2 else { return }
+        #expect(snapshots[0].isParked,
+                "trimmed outgoing deck must end parked silent (\(snapshots[0]))")
+        #expect(snapshots[1].isNeutral,
+                "trimmed incoming deck must end at its own trim (\(snapshots[1]))")
+        #expect(abs(snapshots[1].volume - snapshots[1].trim) < 0.001)
+        #expect(abs(snapshots[1].trim - 1.2589) < 0.001, "+2 dB = ×1.2589")
+    }
+
     // (h) Cancelling mid-overlap (seek / skip / disarm) must also leave both
     // decks neutral — the reset invariant, on the interrupted path.
     @Test func cancelDuringStyledOverlapResetsDecks() throws {

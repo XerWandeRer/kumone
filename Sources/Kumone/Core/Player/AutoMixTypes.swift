@@ -15,7 +15,7 @@ enum Deck: String, Sendable {
 /// persisted as a sidecar next to the cached audio (spec §4).
 struct TrackAnalysis: Codable, Sendable {
     /// Bump when the algorithm changes; stale sidecars are re-analyzed.
-    static let currentVersion = 5
+    static let currentVersion = 6
 
     let version: Int
     let bpm: Double
@@ -50,6 +50,16 @@ struct TrackAnalysis: Codable, Sendable {
     /// Vocal-presence likelihood 0–1 at 1s granularity (same grid as
     /// `rmsEnvelope`). Empty when not computed.
     let vocalActivity: [Float]
+    /// Whole-track mastered loudness: BS.1770-4 K-weighted **gated integrated
+    /// loudness in LUFS** (v6). This is the per-track "how loud is this master"
+    /// number the cross-track gain compensation trims against; see
+    /// `LoudnessMeter` for why LUFS and not an RMS proxy. Nil when the track is
+    /// too short or effectively silent — the compensation then leaves the deck
+    /// at unity rather than guessing.
+    var referenceLoudness: Double? = nil
+    /// Sample peak of the 22.05 kHz mono analysis signal, in dBFS. Only used to
+    /// keep a compensation *boost* from clipping; nil for a silent track.
+    var peakDBFS: Double? = nil
 }
 
 /// Expressive styling for a transition — the technique vocabulary the

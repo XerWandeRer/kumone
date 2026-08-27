@@ -211,6 +211,11 @@ import Testing
         options.preRoll = 4
         options.postRoll = 4
         options.vocalStemProvider = provider
+        // These tests compare absolute band energy *between* two renders, so the
+        // blind-test output normalization has to be off: it deliberately scales
+        // each file to the same loudness, which is precisely the level
+        // difference a duck is supposed to produce.
+        options.normalizeToLUFS = nil
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("stem-render-\(UUID().uuidString).wav")
         return try OfflineTransitionRenderer.render(

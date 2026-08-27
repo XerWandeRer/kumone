@@ -26,6 +26,11 @@ struct SettingsView: View {
                 Text("歌曲之间自动衔接：节拍相近时对拍混音，否则平滑淡入淡出；关闭后仍保持无缝播放")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("统一歌曲响度", isOn: $settings.loudnessCompensationEnabled)
+                    .disabled(!settings.automixEnabled)
+                Text("按每首歌的母带响度调整播放增益，下一首不会突然变响；需要开启 AutoMix")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 #endif
             }
 

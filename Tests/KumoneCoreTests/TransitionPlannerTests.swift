@@ -53,7 +53,9 @@ import Foundation
         keyPitchClass: Int? = nil,
         keyIsMinor: Bool = false,
         keyConfidence: Double = 0,
-        vocalActivity: [Float] = []
+        vocalActivity: [Float] = [],
+        referenceLoudness: Double? = nil,
+        peakDBFS: Double? = -6
     ) -> TrackAnalysis {
         let barLength = 4 * 60 / bpm
         let db = downbeats ?? stride(from: 0.4, to: duration, by: barLength).map { $0 }
@@ -72,7 +74,9 @@ import Foundation
             melProfile: melProfile ?? Self.defaultProfile,
             keyPitchClass: keyPitchClass, keyIsMinor: keyIsMinor,
             keyConfidence: keyConfidence,
-            vocalActivity: vocalActivity)
+            vocalActivity: vocalActivity,
+            referenceLoudness: referenceLoudness,
+            peakDBFS: peakDBFS)
     }
 
     /// Mechanics-only view of the planner result; style assertions use
@@ -315,6 +319,68 @@ import Foundation
             return
         }
         #expect(duration > TransitionPlanner.clashOverlapCap)
+    }
+
+    // MARK: - Loudness compensation and the tier gate
+
+    /// The gate must judge what will be *played*, not what is on disk. Two
+    /// masters 8 dB apart are a clash on the raw numbers; once each deck runs
+    /// at its own trim the gap is gone, so the pair must not be punished.
+    @Test func compensationRemovesAMasteringLoudnessClash() {
+        // −6 LUFS vs −14 LUFS, and the RMS windows carry the same 8 dB gap.
+        let loudEnv = [Float](repeating: 0.5, count: 200)
+        let quietEnv = [Float](repeating: 0.5 * 0.398, count: 200)  // −8 dB
+        let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: loudEnv, referenceLoudness: -6)
+        let incoming = makeAnalysis(bpm: 120, rmsEnvelope: quietEnv, referenceLoudness: -14)
+
+        var off = TransitionPlanner.Config.standard
+        off.loudnessCompensation = false
+        let raw = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming, config: off)
+        #expect(abs(raw.loudnessGapDB - 8) < 0.2)
+        #expect(raw.loudnessGapDB > TransitionPlanner.clashLoudnessDB)
+        #expect(TransitionPlanner.tier(of: raw, config: off) == .clash)
+
+        let compensated = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming)
+        // −6 LUFS gets −8 dB, −14 LUFS gets 0: exactly the 8 dB gap.
+        #expect(abs(compensated.outgoingTrimDB - -8) < 1e-6)
+        #expect(abs(compensated.incomingTrimDB) < 1e-6)
+        #expect(abs(compensated.rawLoudnessGapDB - 8) < 0.2)
+        #expect(compensated.loudnessGapDB < 0.2)
+        #expect(TransitionPlanner.tier(of: compensated) == .compatible)
+    }
+
+    /// What the trim cannot reach, the gate still sees. A master so quiet that
+    /// the +3 dB boost ceiling bites leaves a residual, and that residual —
+    /// not the full raw gap — is what the thresholds are measured against.
+    @Test func theGateStillSeesWhatTheTrimCannotAbsorb() {
+        let loudEnv = [Float](repeating: 0.5, count: 200)
+        let quietEnv = [Float](repeating: 0.5 * 0.0794, count: 200)  // −22 dB
+        let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: loudEnv, referenceLoudness: -8)
+        // −33 LUFS wants +19 dB and may have +3 (the peak leaves room).
+        let incoming = makeAnalysis(bpm: 120, rmsEnvelope: quietEnv,
+                                    referenceLoudness: -33, peakDBFS: -30)
+
+        let s = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming)
+        #expect(abs(s.outgoingTrimDB - -6) < 1e-6)
+        #expect(abs(s.incomingTrimDB - 3) < 1e-6)
+        #expect(abs(s.rawLoudnessGapDB - 22) < 0.3)
+        // 22 raw − 6 (cut) − 3 (boost) = 13 dB the compensation could not close.
+        #expect(abs(s.loudnessGapDB - 13) < 0.3)
+        #expect(TransitionPlanner.tier(of: s) == .clash)
+    }
+
+    /// Tracks with no loudness reading (never analyzed at v6) behave exactly
+    /// as they did before compensation existed.
+    @Test func withoutAMeasurementTheGateIsUnchanged() {
+        let loudEnv = [Float](repeating: 0.5, count: 200)
+        let quietEnv = [Float](repeating: 0.5 * 0.398, count: 200)
+        let s = TransitionPlanner.signals(
+            outgoing: makeAnalysis(bpm: 120, rmsEnvelope: loudEnv),
+            incoming: makeAnalysis(bpm: 120, rmsEnvelope: quietEnv))
+        #expect(s.outgoingTrimDB == 0)
+        #expect(s.incomingTrimDB == 0)
+        #expect(abs(s.loudnessGapDB - s.rawLoudnessGapDB) < 1e-9)
+        #expect(abs(s.loudnessGapDB - 8) < 0.2)
     }
 
     @Test func timbreClashForcesShortFade() {
