@@ -327,6 +327,30 @@ enum TransitionPlanner {
         /// outgoing deck is gone. Only read when a separator is available.
         var stemExchangeHandoverMin: Double = 0.30
         var stemExchangeHandoverMax: Double = 0.85
+        /// Two-clock hand-over: choose the vocal's hand-over instant L *relative
+        /// to* the floor swap S (`Geometry.swapOffset`) rather than relative to
+        /// the middle of the overlap. Off = the single-clock compile this
+        /// replaced, field-for-field — the knob exists so the A/B is a knob flip
+        /// and so the old shape stays pinned by a test.
+        ///
+        /// The two clocks are the whole idea: the instrumental floor changes
+        /// decks at S because that is where the low end and the staged EQ say
+        /// it does, and the *voice* changes decks at L because that is where a
+        /// sung line ends. A DJ move is those two instants being deliberately
+        /// different; a mix is them being the same instant twice.
+        var twoClockExchange: Bool = true
+        /// How far past the floor swap the outgoing singer may carry, in
+        /// seconds. A line-end inside `(S, S + this]` makes the hand-over a
+        /// `vocalCarryover`; nothing inside it makes it a `vocalYield`.
+        ///
+        /// 8 s is about two bars at 60 BPM and four at 120 — long enough to
+        /// finish almost any single line, short enough that the carry does not
+        /// outlive the outgoing deck's fader. It is capped by
+        /// `stemExchangeHandoverMax` anyway, and that cap is the binding one on
+        /// a typical 16 s overlap (see `VocalExchange.compensationCeilingDB`:
+        /// past ~64 % of the post-swap stretch the compensation saturates and
+        /// the carried voice starts riding the fader down regardless).
+        var vocalCarryWindowSeconds: TimeInterval = 8
 
         // --- Structure layer (predev §2.3). Read *only* when the analysis on
         // the relevant side carries `sections` — a v7 sidecar the segmenter was

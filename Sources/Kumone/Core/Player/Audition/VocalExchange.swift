@@ -38,6 +38,45 @@ extension Audition {
         public let fallbackReason: String?
         /// The compiled curves; nil exactly when `fallbackReason` is set.
         public let envelope: StemEnvelope?
+        /// Seconds into the overlap where the *floor* changes decks — the other
+        /// clock. Reported alongside `handover` because the whole gesture is
+        /// the relationship between the two, and a report that gives only L
+        /// cannot say which gesture it is looking at.
+        public var swapOffset: TimeInterval = 0
+        /// Which of the two named gestures this compiled to, or nil when the
+        /// two-clock rule never ran (knob off, or no lyric line-end to place
+        /// against a swap — the contour and duck paths are unchanged).
+        public var gesture: Gesture?
+        /// The stretch over which the *incoming* vocal is held at
+        /// `incomingVocalMutedDB` while the outgoing singer carries the line
+        /// over the incoming deck's bed — `(S, L]`, and set only for
+        /// `.carryover`. Nil for every other outcome.
+        public var incomingDuckWindow: ClosedRange<TimeInterval>?
+        /// The weakest level the carried outgoing vocal actually reaches, in dB
+        /// relative to its pre-swap level. 0 means the compensation held the
+        /// voice flat all the way to L; negative means it saturated at
+        /// `compensationCeilingDB` and the last of the line rode the outgoing
+        /// fader down by this much. Honest reporting of the one place the
+        /// technique cannot fully deliver on its promise.
+        public var carryShortfallDB: Float = 0
+    }
+
+    /// The two named ways a vocal hand-over can sit against the floor swap.
+    public enum Gesture: String, Sendable, Equatable, Codable {
+        /// 人声唱完才走: L > S. The outgoing voice rides past the floor swap on
+        /// the incoming deck's bed and retires when its line ends.
+        case carryover = "vocalCarryover"
+        /// 人声先行: L ≤ S. The outgoing voice retires first and the floor swap
+        /// then lands on a bar nobody is singing over.
+        case yield = "vocalYield"
+
+        /// How the console says it.
+        public var chineseLabel: String {
+            switch self {
+            case .carryover: return "人声唱完才走"
+            case .yield: return "人声先行"
+            }
+        }
     }
 
     enum VocalExchange {
@@ -125,7 +164,8 @@ extension Audition {
                 (.vocalDuck(depthDB: Float(-abs(config.stemDuckDepthDB))),
                  ExchangeCompilation(handover: 0, handoverAbsolute: outPoint,
                                      source: "duck", lyricLine: nil, clampedFrom: nil,
-                                     fallbackReason: reason, envelope: nil))
+                                     fallbackReason: reason, envelope: nil,
+                                     swapOffset: geometry.swapOffset))
             }
 
             guard overlap > 1 else {
@@ -142,9 +182,32 @@ extension Audition {
             var source: String
             var line: String?
             var clampedFrom: TimeInterval?
+            var gesture: Gesture?
 
-            if let pick = lyricHandover(outgoingURL: outgoingURL, outgoing: outgoing,
-                                        outPoint: outPoint, overlap: overlap) {
+            // The floor clock. Everything below asks where L sits relative to
+            // this, and nothing below moves it: the swap is the plan's, decided
+            // by the low end and the staged EQ, and the vocal is the thing that
+            // gets to disagree with it.
+            let swap = geometry.swapOffset
+
+            let ends = twoClockExchangeAvailable(config)
+                ? lyricLineEnds(outgoingURL: outgoingURL, outgoing: outgoing,
+                                outPoint: outPoint, overlap: overlap)
+                : []
+
+            if let pick = twoClockPick(ends, swap: swap, low: low, high: high,
+                                       carryWindow: config.vocalCarryWindowSeconds) {
+                handover = pick.seconds
+                source = "lyric"
+                line = pick.line
+                gesture = pick.gesture
+            } else if let pick = lyricHandover(outgoingURL: outgoingURL, outgoing: outgoing,
+                                               outPoint: outPoint, overlap: overlap) {
+                // Either the knob is off, or the two-clock rule found nothing on
+                // *either* side of the swap inside the window. Today's pick —
+                // the line-end nearest the middle — and then the gesture is
+                // read off wherever it happened to land, which is exactly the
+                // accidental behaviour this change makes deliberate elsewhere.
                 handover = pick.seconds
                 source = "lyric"
                 line = pick.line
@@ -161,15 +224,98 @@ extension Audition {
             if abs(clamped - handover) > 1e-6 { clampedFrom = handover }
             handover = clamped
 
+            // A gesture the two-clock rule did not name (fallback pick, or the
+            // contour) still gets labelled once L is final — but only when the
+            // rule was allowed to run at all, so the knob-off compile and the
+            // contour/duck degradations report exactly what they always did.
+            if gesture == nil, twoClockExchangeAvailable(config), source == "lyric" {
+                gesture = handover > swap + 1e-6 ? .carryover : .yield
+            }
+
+            // Only a carryover splits the clocks; a yield *is* the single-clock
+            // shape, because a hand-over that finishes before the swap has
+            // nothing to carry across it.
+            let carryFrom = gesture == .carryover ? swap : nil
             let envelope = template(overlap: overlap, handover: handover,
                                     plan: planned.plan, style: planned.style,
-                                    geometry: geometry)
+                                    geometry: geometry, carryFrom: carryFrom)
             return (.custom(envelope),
                     ExchangeCompilation(handover: handover,
                                         handoverAbsolute: outPoint + handover,
                                         source: source, lyricLine: line,
                                         clampedFrom: clampedFrom,
-                                        fallbackReason: nil, envelope: envelope))
+                                        fallbackReason: nil, envelope: envelope,
+                                        swapOffset: swap, gesture: gesture,
+                                        incomingDuckWindow: carryFrom.map { $0...handover },
+                                        carryShortfallDB: carryFrom.map {
+                                            carryShortfallDB(from: $0, to: handover,
+                                                             plan: planned.plan,
+                                                             style: planned.style,
+                                                             geometry: geometry)
+                                        } ?? 0))
+        }
+
+        /// The rule only has anything to say when there is a swap to be on
+        /// either side of. A degenerate geometry (swap at 0, or at the very end)
+        /// leaves both windows empty anyway, so this is a readability guard
+        /// rather than a behavioural one.
+        static func twoClockExchangeAvailable(_ config: TransitionPlanner.Config) -> Bool {
+            config.twoClockExchange
+        }
+
+        // MARK: - Two clocks
+
+        /// Pick L against S, and name the gesture.
+        ///
+        /// Carryover wins outright when it is available, because it is the
+        /// gesture with something to say: the voice outliving the floor under
+        /// it is the DJ move, and yielding is what you do when the phrasing
+        /// will not let you. Among several line-ends past the swap the
+        /// **earliest** wins — carrying longer than the phrase requires only
+        /// spends more of the compensation headroom (`compensationCeilingDB`)
+        /// for no extra gesture.
+        ///
+        /// Yield takes the **latest** line-end at or before S for the mirror
+        /// reason: the voice should hold the floor for as long as it still owns
+        /// it, and only then hand a vocal-free bar to the swap.
+        static func twoClockPick(_ ends: [(end: TimeInterval, text: String)],
+                                 swap: TimeInterval, low: TimeInterval, high: TimeInterval,
+                                 carryWindow: TimeInterval)
+            -> (seconds: TimeInterval, line: String, gesture: Gesture)? {
+            // The carry window is bounded on both sides by things that are not
+            // it: below by the share floor (a swap earlier than 0.30 of the
+            // overlap would otherwise let L sit before the window opens) and
+            // above by the share ceiling, which on a typical geometry is the
+            // binding one long before `carryWindow` is.
+            let carryLow = Swift.max(swap, low)
+            let carryHigh = Swift.min(swap + Swift.max(0, carryWindow), high)
+            let carried = ends.filter { $0.end > carryLow + 1e-6 && $0.end <= carryHigh + 1e-6 }
+            if let first = carried.min(by: { $0.end < $1.end }) {
+                return (first.end, first.text, .carryover)
+            }
+            let yielded = ends.filter { $0.end >= low - 1e-6 && $0.end <= swap + 1e-6 }
+            if let last = yielded.max(by: { $0.end < $1.end }) {
+                return (last.end, last.text, .yield)
+            }
+            return nil
+        }
+
+        /// How much level the carried voice loses at L, once the compensation
+        /// has hit its ceiling.
+        ///
+        /// The compensated lane holds `vocal × (1/fader)`, capped — so while
+        /// `-20log10(fader) ≤ compensationCeilingDB` the voice is flat, and past
+        /// that it falls with the deck. This is that fall, in dB, and it is the
+        /// honest limit of "the singer finishes the line at full voice".
+        static func carryShortfallDB(from swap: TimeInterval, to handover: TimeInterval,
+                                     plan: TransitionPlan, style: TransitionStyle,
+                                     geometry: TransitionAutomation.Geometry) -> Float {
+            let fader = TransitionAutomation.frame(plan: plan, style: style,
+                                                   elapsed: handover, geometry: geometry)
+                .outgoing.fader
+            guard fader > 0 else { return -compensationCeilingDB }
+            let wanted = Float(-20 * log10(Double(fader)))
+            return Swift.min(0, compensationCeilingDB - wanted)
         }
 
         // MARK: - Where the phrase ends
@@ -183,7 +329,26 @@ extension Audition {
         static func lyricHandover(outgoingURL: URL, outgoing: TrackAnalysis,
                                   outPoint: TimeInterval, overlap: TimeInterval)
             -> (seconds: TimeInterval, line: String)? {
-            guard let lines = Lyrics.load(for: outgoingURL), !lines.isEmpty else { return nil }
+            let inside = lyricLineEnds(outgoingURL: outgoingURL, outgoing: outgoing,
+                                       outPoint: outPoint, overlap: overlap)
+            let middle = overlap / 2
+            guard let best = inside.min(by: {
+                abs($0.end - middle) < abs($1.end - middle)
+            }) else { return nil }
+            return (best.end, best.text)
+        }
+
+        /// Every outgoing lyric line-end inside this overlap, in
+        /// overlap-relative seconds.
+        ///
+        /// Only ends that actually fall inside the overlap are candidates:
+        /// clamping a line-end from a minute away would produce a number that
+        /// is not a phrase boundary at all, which is worse than saying "no
+        /// lyrics here" and letting the contour decide.
+        static func lyricLineEnds(outgoingURL: URL, outgoing: TrackAnalysis,
+                                  outPoint: TimeInterval, overlap: TimeInterval)
+            -> [(end: TimeInterval, text: String)] {
+            guard let lines = Lyrics.load(for: outgoingURL), !lines.isEmpty else { return [] }
             var ends: [(end: TimeInterval, text: String)] = []
             for (index, line) in lines.enumerated() {
                 if index + 1 < lines.count {
@@ -192,16 +357,9 @@ extension Audition {
                     ends.append((decay, line.text))
                 }
             }
-            let middle = outPoint + overlap / 2
-            // Only ends that actually fall inside this overlap are candidates:
-            // clamping a line-end from a minute away would produce a number
-            // that is not a phrase boundary at all, which is worse than saying
-            // "no lyrics here" and letting the contour decide.
-            let inside = ends.filter { $0.end >= outPoint && $0.end <= outPoint + overlap }
-            guard let best = inside.min(by: {
-                abs($0.end - middle) < abs($1.end - middle)
-            }) else { return nil }
-            return (best.end - outPoint, best.text)
+            return ends
+                .filter { $0.end >= outPoint && $0.end <= outPoint + overlap }
+                .map { (end: $0.end - outPoint, text: $0.text) }
         }
 
         /// Where the vocal contour has dropped to 60 % of its level at `time` —
@@ -254,9 +412,27 @@ extension Audition {
         /// exact fade law are all known — and capped at
         /// `compensationCeilingDB`, past which "hold the level" would just be
         /// amplifying a nearly-gone deck.
+        /// The extra compensation samples spent on the carried stretch `(S, L]`.
+        ///
+        /// The pre-swap fader is nearly flat (unity down to the courtesy dip),
+        /// so six points cover it; the post-swap fader is a compressed
+        /// equal-power collapse, and six points across `[0, L]` would straddle
+        /// it with two. Six of their own keep the compensated hold within the
+        /// same ~0.2 dB of the continuous curve on both sides of the swap.
+        /// 6 + 6 + retire + tail is 14 breakpoints, inside
+        /// `StemEnvelope.maxBreakpoints`.
+        static let carrySamples = 6
+
+        /// Non-nil `carryFrom` is the floor swap S, and switches the template
+        /// to the two-clock shape: the two *bed* lanes hand the floor over on
+        /// S, while the two *vocal* lanes hand the voice over on L > S. Nil is
+        /// the single-clock shape, field-for-field what this template always
+        /// produced — which is what `twoClockExchange = false` and every yield
+        /// compile still get.
         static func template(overlap: TimeInterval, handover h: TimeInterval,
                              plan: TransitionPlan, style: TransitionStyle,
-                             geometry: TransitionAutomation.Geometry) -> StemEnvelope {
+                             geometry: TransitionAutomation.Geometry,
+                             carryFrom: TimeInterval? = nil) -> StemEnvelope {
             func faders(_ t: TimeInterval) -> (out: Float, incoming: Float) {
                 let f = TransitionAutomation.frame(plan: plan, style: style,
                                                    elapsed: Swift.min(Swift.max(t, 0), overlap),
@@ -270,12 +446,41 @@ extension Audition {
             }
             typealias Point = StemEnvelope.Breakpoint
 
+            // The two-clock shape only makes sense when the swap has room on
+            // both sides of it inside this hand-over; anything degenerate falls
+            // back to the single-clock curves below.
+            let carry = carryFrom.flatMap { $0 > 0.05 && $0 < h - 0.05 ? $0 : nil }
+
             // --- Outgoing vocal: hold the *audible* level to the hand-over,
             //     then retire inside `outgoingRetireSeconds`.
+            //
+            //     This lane is how the carried voice survives the floor swap.
+            //     It is a stem gain *multiplied onto* the outgoing deck fader,
+            //     and it already carries `1/fader` — so past S, where the
+            //     dominant-deck law collapses that fader, the lane rises to
+            //     cancel the collapse and the voice stays where it was. No
+            //     restructuring of which layer carries the vocal was needed:
+            //     the compensation that existed to keep the singer off the
+            //     pre-swap fade is the same mechanism, asked to reach further.
+            //     It reaches exactly `compensationCeilingDB` far — past that
+            //     the voice does ride the fader down, and `carryShortfallDB`
+            //     reports by how much rather than letting the ceiling silently
+            //     bend the gesture.
             var outgoingVocal: [Point] = []
-            for k in 0..<holdSamples {
-                let t = h * Double(k) / Double(holdSamples - 1)
-                outgoingVocal.append(Point(t: t, gainDB: compensation(faders(t).out)))
+            if let carry {
+                for k in 0..<holdSamples {
+                    let t = carry * Double(k) / Double(holdSamples - 1)
+                    outgoingVocal.append(Point(t: t, gainDB: compensation(faders(t).out)))
+                }
+                for k in 1...carrySamples {
+                    let t = carry + (h - carry) * Double(k) / Double(carrySamples)
+                    outgoingVocal.append(Point(t: t, gainDB: compensation(faders(t).out)))
+                }
+            } else {
+                for k in 0..<holdSamples {
+                    let t = h * Double(k) / Double(holdSamples - 1)
+                    outgoingVocal.append(Point(t: t, gainDB: compensation(faders(t).out)))
+                }
             }
             let retired = Swift.min(overlap, h + outgoingRetireSeconds)
             outgoingVocal.append(Point(t: retired, gainDB: StemEnvelope.minGainDB))
@@ -285,11 +490,25 @@ extension Audition {
 
             // --- Outgoing bed: steps back early so the incoming one can
             //     arrive, then follows the vocal out once it has gone.
+            //
+            //     On a carryover this lane keeps the *floor* clock: it is
+            //     already at `bedAtHandoverDB` by S, because S is where the low
+            //     end and the staged EQ change decks and a bed still holding on
+            //     past its own swap is what makes the move read as a mix. From
+            //     S to L it simply stays there and lets the deck fader take it
+            //     the rest of the way out — the instrumental "follows the
+            //     dominant-deck exit as it already does", uncompensated, which
+            //     is precisely what decouples it from the vocal lane above.
+            let bedSwap = carry ?? h
             var outgoingBed: [Point] = [
                 Point(t: 0, gainDB: 0),
-                Point(t: h * bedEarlyShare, gainDB: bedEarlyDB),
-                Point(t: h, gainDB: bedAtHandoverDB),
+                Point(t: bedSwap * bedEarlyShare, gainDB: bedEarlyDB),
+                Point(t: bedSwap, gainDB: bedAtHandoverDB),
             ]
+            // Held flat across the carry: the stem gain has already said its
+            // piece at S, and what takes the bed out from there is the deck
+            // fader, not another stem move on top of it.
+            if carry != nil { outgoingBed.append(Point(t: h, gainDB: bedAtHandoverDB)) }
             if retired > h + 0.05 { outgoingBed.append(Point(t: retired, gainDB: bedRetiredDB)) }
             if retired < overlap - 0.05 {
                 outgoingBed.append(Point(t: overlap, gainDB: bedAfterHandoverDB))
@@ -297,8 +516,12 @@ extension Audition {
 
             // --- Incoming bed: in first, and pushed up while it is the only
             //     bed holding the middle of the hand-over together.
+            //     On a carryover the lift is timed to arrive *by S*, not by L:
+            //     from S onward this bed is the floor, and it is holding a
+            //     singer who does not belong to it. It then stays lifted right
+            //     across the carry and only releases once that singer has gone.
             var incomingBed: [Point] = [Point(t: 0, gainDB: 0)]
-            let lift = h * incomingBedLiftShare
+            let lift = (carry ?? h) * incomingBedLiftShare
             if lift > 0.05 {
                 incomingBed.append(Point(t: lift, gainDB: incomingBedLiftDB))
                 incomingBed.append(Point(t: h, gainDB: incomingBedLiftDB))
@@ -308,9 +531,21 @@ extension Audition {
             if released < overlap - 0.05 { incomingBed.append(Point(t: overlap, gainDB: 0)) }
 
             // --- Incoming vocal: silent, then takes over.
+            //
+            //     On a carryover this lane is also the *duck*: across `(S, L]`
+            //     the incoming deck owns the floor and would otherwise be free
+            //     to sing over the outgoing singer still finishing a line on
+            //     top of it. Holding it at `incomingVocalMutedDB` through that
+            //     stretch is what keeps the carry a hand-over rather than a
+            //     duet. It costs nothing extra to separate: this lane is
+            //     already non-pass-through in every exchange, so the incoming
+            //     window was being separated before the carry existed.
             var incomingVocal: [Point] = [Point(t: 0, gainDB: incomingVocalMutedDB)]
+            if let carry { incomingVocal.append(Point(t: carry, gainDB: incomingVocalMutedDB)) }
             let hold = h - incomingHoldSeconds
-            if hold > 0.05 { incomingVocal.append(Point(t: hold, gainDB: incomingVocalMutedDB)) }
+            if hold > (carry ?? 0) + 0.05 {
+                incomingVocal.append(Point(t: hold, gainDB: incomingVocalMutedDB))
+            }
             incomingVocal.append(Point(t: h, gainDB: incomingVocalAtHandoverDB))
             let risen = Swift.min(overlap, h + incomingRiseSeconds)
             incomingVocal.append(Point(t: risen,

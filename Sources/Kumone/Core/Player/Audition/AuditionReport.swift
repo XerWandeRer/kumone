@@ -220,6 +220,18 @@ extension Audition {
         public let lyricLine: String?
         public let clampedFrom: TimeInterval?
         public let fallbackReason: String?
+        /// The floor clock: where the low end changes decks. `handover` is the
+        /// vocal clock, and the gesture is which side of this it landed on.
+        public let swapOffset: TimeInterval
+        /// `"vocalCarryover"` / `"vocalYield"`, or nil when the two-clock rule
+        /// did not run (knob off, or a contour/duck outcome).
+        public let gesture: String?
+        /// `[S, L]` — the stretch the incoming vocal is held down for while the
+        /// outgoing singer carries a line over its bed. Carryover only.
+        public let incomingDuckWindow: [TimeInterval]?
+        /// dB the carried voice loses at L once fader compensation saturates;
+        /// 0 when it held the line flat the whole way.
+        public let carryShortfallDB: Double
     }
 
     // MARK: - Building the report
@@ -252,7 +264,13 @@ extension Audition {
                                handoverAbsolute: $0.handoverAbsolute,
                                source: $0.source, lyricLine: $0.lyricLine,
                                clampedFrom: $0.clampedFrom,
-                               fallbackReason: $0.fallbackReason)
+                               fallbackReason: $0.fallbackReason,
+                               swapOffset: $0.swapOffset,
+                               gesture: $0.gesture?.rawValue,
+                               incomingDuckWindow: $0.incomingDuckWindow.map {
+                                   [$0.lowerBound, $0.upperBound]
+                               },
+                               carryShortfallDB: Double($0.carryShortfallDB))
             },
             stemEnvelope: d.stemEnvelope.map { envelope in
                 EnvelopeReport(
@@ -959,6 +977,32 @@ extension Audition {
                     : "，出曲这段没有可用的歌词行末，改用人声活跃度的低谷。"
                 if let from = x.clampedFrom {
                     outcome += String(format: "（原本算到 %.2f 秒，被夹回窗口内。）", from)
+                }
+                // The two clocks, and which side of the floor swap the voice
+                // ended up on — the one sentence that tells a listener whether
+                // they are about to hear a DJ move or a mix.
+                if let gesture = x.gesture {
+                    outcome += String(format: "　伴奏的低频交接点在第 %.2f 秒；",
+                                      x.swapOffset)
+                    switch gesture {
+                    case .carryover:
+                        outcome += String(
+                            format: "人声比它晚 %.2f 秒才走（\(gesture.rawValue)，"
+                                + "\(gesture.chineseLabel)）：出曲这句是骑在入曲的伴奏上唱完的，"
+                                + "这段时间里入曲的人声被压住不出声。",
+                            x.handover - x.swapOffset)
+                        if x.carryShortfallDB < -0.05 {
+                            outcome += String(
+                                format: "（骑到最后补偿到顶，出曲人声比开头低了 %.1f dB。）",
+                                -x.carryShortfallDB)
+                        }
+                    case .yield:
+                        outcome += String(
+                            format: "人声比它早 %.2f 秒就退了（\(gesture.rawValue)，"
+                                + "\(gesture.chineseLabel)）：低频交接砸在一个没人唱的小节上，"
+                                + "入曲的人声不受影响。",
+                            x.swapOffset - x.handover)
+                    }
                 }
             }
         }
