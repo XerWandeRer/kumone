@@ -362,6 +362,18 @@ final class PlaybackEngine: @unchecked Sendable {
     /// un-bend and stranded the outgoing deck permanently. Rather than add the
     /// call there and wait for the next one, the invariant is enforced where it
     /// cannot be forgotten: losing the plan *is* handing the rate back.
+    ///
+    /// **A hand-over bends two different decks at two different times, and the
+    /// invariant owes both.** Before the seam the pre-seam glide bends
+    /// `tr.from`, taken back by `endTempoRampLocked`. After it, the `.settling`
+    /// rate release bends `tr.to` — the deck that *is* the music by then —
+    /// taken back by `endRateRestoreLocked`. Only the first was covered here for
+    /// a while, because `endTempoRampLocked` addresses `tr.from` and only while
+    /// `rampActive`, which `beginOverlapLocked` clears at the seam; the second
+    /// strand was held by a single hand-written pair of calls in
+    /// `cancelTransitionLocked`'s `.settling` case. Deleting that pair to see
+    /// what happened left the live deck at ×1.05 with its pad 6.5 dB down for
+    /// the rest of the track — one un-mirrored teardown path away from shipping.
     private var transition: TransitionState? {
         get { storedTransition }
         set {
@@ -374,6 +386,7 @@ final class PlaybackEngine: @unchecked Sendable {
                     "plan dropped phase=\(old.phase) \(newValue == nil ? "cleared" : "replaced") "
                         + "from=\(old.from.rawValue) to=\(old.to.rawValue) \(journalRates)")
                 endTempoRampLocked(old)
+                endRateRestoreLocked(old)
             }
             storedTransition = newValue
         }
@@ -1907,6 +1920,39 @@ final class PlaybackEngine: @unchecked Sendable {
         releaseRatePadLocked(from)
     }
 
+    /// Put the *incoming* deck back at unity if the post-seam rate release was
+    /// still gliding it. `endTempoRampLocked`'s mirror image, for the other
+    /// deck and the other half of the hand-over.
+    ///
+    /// The two are deliberately separate rather than one function taking a
+    /// deck, because the thing being undone is different: the pre-seam glide is
+    /// a plan the deck has not yet paid for, while this is a release already in
+    /// progress on the deck that is carrying the music. Snapped rather than
+    /// glided for exactly that reason — the glide it was on lived in
+    /// `settleTickLocked`, which stops the moment the transition is gone, so
+    /// there is no longer anything that *could* finish the walk. A step at up to
+    /// 6 % is audible, and it is the price of the alternative being a deck left
+    /// there permanently.
+    ///
+    /// Guarded on `restoringRate`, the same way its twin is guarded on
+    /// `rampActive`: `settleTickLocked` clears the flag the instant the release
+    /// lands, so a hand-over that finished normally reaches this and does
+    /// nothing. **Do not call it from the teardown paths** — the `transition`
+    /// setter does, for all of them at once.
+    private func endRateRestoreLocked(_ tr: TransitionState) {
+        guard tr.restoringRate else { return }
+        tr.restoringRate = false
+        guard let to = deckStates[tr.to] else { return }
+        PlaybackJournal.note(String(
+            format: "rate release cut short deck=%@ was=×%.4f → ×1.0000 (plan lost mid-settle)",
+            tr.to.rawValue, to.timePitch.rate))
+        to.timePitch.rate = 1
+        // And the pad that was covering the bend goes with it — glided, not
+        // snapped, for the same reason as the ramp's: this deck is still
+        // playing, so it is the deck's own timer that walks the gain home.
+        releaseRatePadLocked(to)
+    }
+
     /// The wait can span minutes; idle at the slow tick and only switch to
     /// the 50 Hz ramp tick for the final approach.
     ///
@@ -2609,14 +2655,14 @@ final class PlaybackEngine: @unchecked Sendable {
             // is left running: it belongs to the deck, not to this transition,
             // and whatever happens to that deck next settles or clears it.
             //
-            // The bent-rate pad needs saying out loud, though, because
-            // `neutralizeEffectsLocked` snaps the rate back to unity and the
-            // pad is the thing that was covering for that rate. Left alone it
-            // would hold this deck — which *is* the music now — several dB down
-            // for the rest of the song. Released, not snapped: same gain, same
-            // slope, and it outlives this transition on the deck's own timer.
+            // The interrupted rate release, and the bent-rate pad that was
+            // covering it, are handed back by the `transition` setter's
+            // invariant — which has already run, three lines above. This case
+            // used to do both by hand, and being the *only* path that did is
+            // precisely what made the strand fragile: every other way of losing
+            // a settling transition would have left this deck bent. What is
+            // left here is the ordinary chain tidy-up.
             neutralizeEffectsLocked(to)
-            releaseRatePadLocked(to)
             silenceDeckLocked(from)
         }
     }

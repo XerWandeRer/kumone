@@ -2095,4 +2095,141 @@ struct PlaybackEngineSmokeTests {
             #expect(worst.padDeepenedBy < 0.001, "\(padding)")
         }
     }
+
+    /// **The `.settling` rate release has to survive losing its transition,
+    /// the same way the pre-seam glide does.**
+    ///
+    /// The two bends are mirror images and only one of them was covered. The
+    /// pre-seam glide bends `tr.from` and the `transition` setter hands it back
+    /// through `endTempoRampLocked` on every teardown path at once. The
+    /// post-seam release bends `tr.to` — the deck that *is* the music now — and
+    /// nothing structural took that one back: `endTempoRampLocked` addresses
+    /// `tr.from` only, and only while `rampActive`, which `beginOverlapLocked`
+    /// has already cleared by then. The single path that got it right,
+    /// `cancelTransitionLocked`'s `.settling` case, did it by hand.
+    ///
+    /// A deck stranded there sits at up to ±6 % with its headroom pad still
+    /// down, for the rest of the track, which is the "underwater" artifact
+    /// exactly. So this asks the same question of every way a release can be
+    /// interrupted, and asks it by *polling*: a rate that reads 1.0 the instant
+    /// after the interruption proves nothing if the next 50 ms tick re-bends it.
+    @Test func theSettlingReleaseSurvivesEveryTeardown() throws {
+        guard audioOutputAvailable else { return }
+        enum Interruption: String, CaseIterable {
+            /// The spent deck is restarted and runs out *inside* the release —
+            /// the drained-early path, whose `else` branch is a bare
+            /// `transition = nil` for every phase except `.overlapping`.
+            case spentDeckDrainsDuringRelease
+            /// The user pauses in the middle of the release and comes back.
+            case pauseMidRelease
+            /// A new track is started on the deck that is carrying the music
+            /// while its release is still gliding.
+            case playOntoSettlingDeck
+            /// The transition is dropped outright. Green today only because
+            /// `cancelTransitionLocked` hand-rolls the hand-back; kept as the
+            /// guard on that behaviour once the invariant owns it.
+            case cancelMidRelease
+        }
+        struct Outcome {
+            var transitionSurvived = false
+            var worstRateDeviation: Float = 0
+            var finalRate: Float = 1
+            var padTargetDB: Double = 0
+        }
+        // A big bend and a long release, so a stranded deck is unmistakable and
+        // there is room to interrupt the glide well before it lands.
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.95, incomingRate: 1.06,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 6))
+
+        for interruption in Interruption.allCases {
+            let result = withWatchdog("settlingTeardown-\(interruption.rawValue)",
+                                      timeout: 60) { () -> Outcome? in
+                var o = Outcome()
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                // 0 dBFS masters, so both decks really do owe a headroom pad
+                // and "was the pad let go of too" has teeth.
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a,
+                                            peakDBFS: 0)) != nil,
+                      (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .b,
+                                            peakDBFS: 0)) != nil
+                else { return nil }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: 2.6)
+                engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+                guard log.wait(timeout: 25, for: {
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }) else { return nil }
+
+                // Deck B is the music now, bent at 1.06 with a 6 s release
+                // running. Interrupt it a second in.
+                Thread.sleep(forTimeInterval: 1.0)
+                switch interruption {
+                case .spentDeckDrainsDuringRelease:
+                    // Deck A is the spent one. Try to put it back on the air
+                    // near the end of its file so it drains while the release
+                    // is still gliding — that is the only way to reach
+                    // `handleFromDeckDrainedLocked` from `.settling`.
+                    engine.play(deck: .a, from: 7.5)
+                    Thread.sleep(forTimeInterval: 1.5)
+                    o.transitionSurvived = engine.hasPendingTransition
+                case .pauseMidRelease:
+                    engine.pause()
+                    Thread.sleep(forTimeInterval: 1.5)
+                    engine.resume()
+                case .playOntoSettlingDeck:
+                    engine.play(deck: .b, from: 0.5)
+                case .cancelMidRelease:
+                    engine.cancelScheduledTransition()
+                }
+
+                // Let whatever is left of the release run out. Waiting on the
+                // transition clearing rather than on the rate looking close
+                // enough: a rate of 1.0006 is inside any sane tolerance and
+                // still mid-glide.
+                let deadline = Date().addingTimeInterval(14)
+                while Date() < deadline, engine.hasPendingTransition {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                // Now poll. The whole point: a stale target is re-applied by a
+                // *later* tick, so the reading that matters is never the first.
+                let pollEnd = Date().addingTimeInterval(1.5)
+                while Date() < pollEnd {
+                    let s = engine.effectSnapshot(of: .b)
+                    o.worstRateDeviation = max(o.worstRateDeviation, abs(s.rate - 1))
+                    o.finalRate = s.rate
+                    if abs(s.ratePadTargetDB) > abs(o.padTargetDB) {
+                        o.padTargetDB = s.ratePadTargetDB
+                    }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                return o
+            }
+            guard let o = result ?? nil else { continue }
+
+            let where_ = interruption.rawValue
+            let detuned = "\(where_): the deck carrying the music is still detuned "
+                + "\(o.worstRateDeviation) off unity (final ×\(o.finalRate)) — the "
+                + "settling release lost its transition and nothing handed the rate "
+                + "back, so this track plays underwater to the end"
+            let padded = "\(where_): the bent-rate headroom pad outlived the bend it "
+                + "covered (target \(o.padTargetDB) dB) — the rest of the song plays quiet"
+            #expect(o.worstRateDeviation < 0.001, "\(detuned)")
+            #expect(abs(o.padTargetDB) < 0.001, "\(padded)")
+
+            if interruption == .spentDeckDrainsDuringRelease {
+                // Reachability probe, reported rather than asserted either way:
+                // `finishOverlapLocked` resets the spent deck, which clears its
+                // source, so `play` finds nothing to schedule and the drain
+                // never fires. If that ever stops being true this records it.
+                print("settlingTeardown: spent deck restarted mid-release — "
+                      + "transition still pending afterwards: \(o.transitionSurvived)")
+            }
+        }
+    }
 }
