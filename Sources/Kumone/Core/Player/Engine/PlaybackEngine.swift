@@ -1079,7 +1079,19 @@ final class PlaybackEngine: @unchecked Sendable {
         // The pad belongs to a bend that is over too. Cleared without a fader
         // write for the same reason as the ride: this deck has just been
         // silenced, or is deliberately holding an echo tail's level.
+        //
+        // **The target goes with the value, and that is the whole point.**
+        // Zeroing `ratePadDB` alone leaves the deck reset but still *aiming* at
+        // the spent hand-over's pad, and the 20 Hz glide is a function of the
+        // gap between the two: it skips a sourceless deck, so a parked deck
+        // looks perfect — and then the next `loadFile` hands it a source and the
+        // very next tick starts walking the *new* track down to the *old*
+        // bend's headroom, 0.3 dB/s, for the rest of the song. Nothing ever
+        // takes it back either, because `resetDeckLocked` does not clear it: the
+        // deck stays that way for every track it is handed from then on, which
+        // in a two-deck rotation is every other track.
         state.ratePadDB = 0
+        state.ratePadTargetDB = 0
         state.ratePad = 1
     }
 
@@ -1286,6 +1298,11 @@ final class PlaybackEngine: @unchecked Sendable {
         // tail is unaffected: its level is already written into player.volume,
         // and nothing calls setFaderLocked on a sourceless deck.)
         state.trim = 1
+        // And for the pad's *ceiling*, which is sized from the outgoing
+        // material's peak: `loadFile` writes the new one immediately after this
+        // call, but `startStreaming` has no analysis to write, and a stream must
+        // not inherit the headroom budget of whatever file this deck held last.
+        state.padCeilingDB = 0
         // Same story for the hand-over's gain ride: it belonged to a transition
         // into material that is no longer here. Cleared without a fader write —
         // the deck has just been silenced above (or, for an echo tail,

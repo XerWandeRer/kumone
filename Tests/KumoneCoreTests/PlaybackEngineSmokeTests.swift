@@ -1924,4 +1924,175 @@ struct PlaybackEngineSmokeTests {
             + "still playing — nothing else ever will (\(after))"
         #expect(abs(after - 1) < 0.001, "\(stranded)")
     }
+
+    /// **A deck coming out of `resetDeckLocked` owes nothing to the hand-over
+    /// that just spent it.**
+    ///
+    /// Every test above this one asks its question of a *single* seam, and of
+    /// the deck that seam handed the music to. The field report that produced
+    /// this one could not be reproduced that way, because its signature only
+    /// appears from the second seam onwards: track 1 fine, track 2 wrong,
+    /// track 3 fine, track 4 wrong — alternating, because tracks alternate
+    /// between the decks and exactly one deck was carrying stale state.
+    ///
+    /// So this chains three seams the way `PlayerService` really drives them —
+    /// seam, then the next track loaded onto the deck the seam just spent —
+    /// and after each one polls **both** decks for a second and a half of real
+    /// playback. The poll is the point: a check taken the instant after a
+    /// `loadFile` passes even on the broken tree, because `resetDeckLocked`
+    /// genuinely does write every knob back. What it does not do is stop a
+    /// glide target the *previous* hand-over left on the deck from being
+    /// picked up again by the 20 Hz glide timer the moment the deck has a
+    /// source to write a fader for. That is a re-application, not a survival,
+    /// and only a poll across the following seconds can see it.
+    @Test func aChainOfSeamsLeavesEveryReusedDeckClean() throws {
+        guard audioOutputAvailable else { return }
+        /// The worst thing seen on one deck across one mid-track poll.
+        ///
+        /// The pad is judged by how much *deeper* it got, not by its absolute
+        /// value: a deck that was legitimately padded for the seam it has just
+        /// won is supposed to still be a few dB down here, because the release
+        /// is a deliberately inaudible 0.3 dB/s walk that outlives the
+        /// transition on the deck's own timer. What no deck may do mid-track is
+        /// get *further* down than it already was — that is a pad being
+        /// acquired, and nothing on this timeline is bent.
+        struct Worst: CustomStringConvertible {
+            var rateDeviation: Float = 0
+            var firstPadDB: Double?
+            var padDB: Double = 0
+            var padDeepenedBy: Double = 0
+            var padTargetDB: Double = 0
+            var volume: Float = 0
+            var description: String {
+                "rate 1±\(rateDeviation), pad \(padDB) dB → \(padTargetDB) dB "
+                    + "(deepened \(padDeepenedBy) dB), volume \(volume)"
+            }
+        }
+        // Labelled by which seam has just finished and which deck was polled.
+        typealias Observation = (label: String, deck: Deck, worst: Worst)
+
+        /// When the prefetcher gets to the deck the seam just spent. Both
+        /// orders happen in the field — the release runs for tens of seconds,
+        /// so whether the next `loadFile` lands inside it is a race between the
+        /// glide and the library.
+        enum Reuse: String, CaseIterable {
+            /// The release finished first; the deck was parked and idle.
+            case afterRelease
+            /// The next track arrives while the previous release is still
+            /// gliding, so the deck's glide timer is already awake.
+            case duringRelease
+        }
+
+        // 0 dBFS masters, so every deck really does owe a bent-rate headroom
+        // pad — the state this is hunting is only created by a deck that was
+        // padded and bent for a seam and then handed back for reuse.
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.95, incomingRate: 1.06,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 2))
+
+        var everything: [Observation] = []
+        for reuse in Reuse.allCases {
+        let result = withWatchdog("seamChain-\(reuse.rawValue)", timeout: 120) { () -> [Observation] in
+            var observations: [Observation] = []
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            engine.outputVolume = 0
+
+            /// Poll both decks for `seconds` of playing time and keep the worst
+            /// reading of each — a stale target is re-applied by a *later*
+            /// tick, so the interesting moment is never the first sample.
+            func pollBothDecks(_ label: String, seconds: TimeInterval) {
+                var worst: [Deck: Worst] = [.a: Worst(), .b: Worst()]
+                let deadline = Date().addingTimeInterval(seconds)
+                while Date() < deadline {
+                    for deck in [Deck.a, Deck.b] {
+                        let s = engine.effectSnapshot(of: deck)
+                        var w = worst[deck]!
+                        w.rateDeviation = max(w.rateDeviation, abs(s.rate - 1))
+                        let first = w.firstPadDB ?? s.ratePadDB
+                        w.firstPadDB = first
+                        w.padDeepenedBy = max(w.padDeepenedBy, first - s.ratePadDB)
+                        w.padDB = s.ratePadDB
+                        if abs(s.ratePadTargetDB) > abs(w.padTargetDB) {
+                            w.padTargetDB = s.ratePadTargetDB
+                        }
+                        w.volume = s.volume
+                        worst[deck] = w
+                    }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                for deck in [Deck.a, Deck.b] {
+                    observations.append((label, deck, worst[deck]!))
+                }
+            }
+
+            /// One seam: arm it, let it complete, then load the next track onto
+            /// the deck it spent — `PlayerService`'s own order — and watch what
+            /// the reused deck does across the following seconds.
+            func runSeam(_ label: String, from: Deck, to: Deck) -> Bool {
+                engine.scheduleTransition(.plain(plan), from: from, to: to)
+                let completed = log.wait(timeout: 25) {
+                    if case .transitionCompleted(from: from, to: to) = $0 { return true }
+                    return false
+                }
+                guard completed else { return false }
+                switch reuse {
+                case .afterRelease:
+                    // Let the rate release and the pad hand-back finish on
+                    // their own, exactly as an undisturbed player would.
+                    let deadline = Date().addingTimeInterval(10)
+                    while Date() < deadline, engine.hasPendingTransition {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                case .duringRelease:
+                    Thread.sleep(forTimeInterval: 1.0)
+                }
+                // The prefetcher fills the spent deck with the next track.
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: from,
+                                            peakDBFS: 0)) != nil else { return false }
+                pollBothDecks(label, seconds: 1.5)
+                return true
+            }
+
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a, peakDBFS: 0)) != nil,
+                  (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .b, peakDBFS: 0)) != nil
+            else { return observations }
+            engine.play(deck: .a, from: 2.6)
+
+            let tag = reuse.rawValue
+            guard runSeam("\(tag)/seam 1 (a→b), track 2 playing", from: .a, to: .b) else {
+                return observations
+            }
+            // Track 2 is on deck B and has been playing since the seam; put it
+            // back near the top so the next seam has its whole ramp window.
+            engine.seek(deck: .b, to: 2.6)
+            guard runSeam("\(tag)/seam 2 (b→a), track 3 playing", from: .b, to: .a) else {
+                return observations
+            }
+            engine.seek(deck: .a, to: 2.6)
+            _ = runSeam("\(tag)/seam 3 (a→b), track 4 playing", from: .a, to: .b)
+            return observations
+        }
+        everything.append(contentsOf: result ?? [])
+        }
+
+        guard !everything.isEmpty else { return }
+        for (label, deck, worst) in everything {
+            let here = "\(label): deck \(deck)"
+            let detuned = "\(here) is detuned mid-track — the phase vocoder is engaged on "
+                + "a deck no hand-over is bending, which is the \"underwater\" "
+                + "artifact (\(worst))"
+            let aiming = "\(here) is still aiming at a bent-rate headroom pad left over "
+                + "from an earlier seam — a reset deck must owe nothing to the "
+                + "hand-over that spent it (\(worst))"
+            let padding = "\(here) is being padded *down* mid-track — a headroom pad is "
+                + "being acquired by a deck nothing is bending (\(worst))"
+            #expect(worst.rateDeviation < 0.001, "\(detuned)")
+            #expect(abs(worst.padTargetDB) < 0.001, "\(aiming)")
+            #expect(worst.padDeepenedBy < 0.001, "\(padding)")
+        }
+    }
 }
