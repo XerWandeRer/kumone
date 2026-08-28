@@ -1,0 +1,399 @@
+import Testing
+@testable import KumoneCore
+import Foundation
+
+// The AutoMix queue-reorder mode's arithmetic and bookkeeping
+// (docs/automix-queue-predev.md). Three properties carry the whole design and
+// each gets its own test:
+//
+//   - **the tier dominates**. A stylistically perfect pair that can only be
+//     crossfaded must never outrank a pair that can be beat-matched, or the
+//     mode is optimising a proxy instead of the thing it claims to optimise.
+//   - **aging is unbounded**. "Every track gets played" has to be a property
+//     of the arithmetic, not a hope: keep losing and you eventually outrank a
+//     whole tier.
+//   - **mode off changes nothing**. The three-state replaces a Bool that has
+//     been persisted for as long as the app has existed, so a session written
+//     before the mode came back exactly as it was.
+//
+// No engine is constructed anywhere in here: the scorer is a pure function and
+// the selector's bookkeeping is reachable without a player.
+
+@Suite struct QueueOrderTests {
+
+    // MARK: - Fixtures
+
+    private func makeAnalysis(
+        bpm: Double = 120,
+        bpmConfidence: Double = 0.9,
+        duration: TimeInterval = 200,
+        keyPitchClass: Int? = nil,
+        keyIsMinor: Bool = false,
+        keyConfidence: Double = 0,
+        melProfile: [Float] = [],
+        energy: Float? = nil
+    ) -> TrackAnalysis {
+        let barLength = 4 * 60 / bpm
+        var a = TrackAnalysis(
+            version: TrackAnalysis.currentVersion,
+            bpm: bpm, bpmConfidence: bpmConfidence,
+            beats: stride(from: 0.4, to: duration, by: 60 / bpm).map { $0 },
+            downbeats: stride(from: 0.4, to: duration, by: barLength).map { $0 },
+            phraseBoundaries: [150, 90, 30],
+            rmsEnvelope: [Float](repeating: 0.5, count: Int(duration)),
+            outroFadeStart: nil, introEnd: 2, duration: duration,
+            melProfile: melProfile, keyPitchClass: keyPitchClass, keyIsMinor: keyIsMinor,
+            keyConfidence: keyConfidence, vocalActivity: [],
+            referenceLoudness: -12, peakDBFS: -6)
+        if let energy {
+            a.sections = [TrackAnalysis.Section(start: 0, end: duration, kind: .verse,
+                                                repetition: 2, energy: energy, vocalDensity: 1)]
+            a.structureConfidence = 0.8
+        }
+        return a
+    }
+
+    /// A `PlannedTransition` of a given shape, built by hand — the scorer takes
+    /// the plan as a parameter precisely so the tier can be stated rather than
+    /// coaxed out of the planner.
+    private func planned(_ tier: TransitionTier) -> PlannedTransition {
+        switch tier {
+        case .gapless:
+            return .plain(.gapless)
+        case .crossfade:
+            return .plain(.crossfade(duration: 6, outPoint: 180, inPoint: 0))
+        case .stagedCrossfade:
+            return PlannedTransition(
+                plan: .crossfade(duration: 6, outPoint: 180, inPoint: 0),
+                style: TransitionStyle(outroEffect: .fade, stagedEQ: true))
+        case .beatMatched, .rampedBeatMatched:
+            var plan = BeatMatchedPlan(
+                outPoint: 160, inPoint: 2, overlapBars: 8,
+                outgoingRate: 1.01, incomingRate: 0.99,
+                bassSwapOffset: 4, overlapDuration: 16)
+            if tier == .rampedBeatMatched {
+                plan.rampLeadSeconds = 13
+                plan.rampReleaseSeconds = 3
+            }
+            return .plain(.beatMatched(plan))
+        }
+    }
+
+    private func track(_ id: Int, artist: Int = 0, name: String? = nil) -> Track {
+        let artists = artist == 0 ? [] : [["id": artist, "name": "artist \(artist)"]]
+        let json: [String: Any] = [
+            "id": id, "name": name ?? "track \(id)", "ar": artists,
+            "al": ["id": 1, "name": "album"], "dt": 200_000,
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: json)
+        return try! JSONDecoder().decode(Track.self, from: data)
+    }
+
+    // MARK: - Tier ordering
+
+    @Test func theTierDominatesEveryContinuityTerm() {
+        // The crossfade candidate is perfect on every continuous term; the
+        // beat-matched one is as bad as it can be on all four. The tier must
+        // still win — this is predev §2.3's "tier 是主项" as an assertion.
+        let a = makeAnalysis(bpm: 120, keyPitchClass: 0, keyConfidence: 0.9,
+                             melProfile: [1, 0, 0, 0], energy: 0.6)
+        let twin = makeAnalysis(bpm: 120, keyPitchClass: 0, keyConfidence: 0.9,
+                                melProfile: [1, 0, 0, 0], energy: 0.6)
+        let stranger = makeAnalysis(bpm: 172, keyPitchClass: 6, keyConfidence: 0.9,
+                                    melProfile: [-1, 0, 0, 0], energy: 0.05)
+
+        let crossfade = QueueOrderScorer.score(
+            outgoing: a, incoming: twin, planned: planned(.crossfade))
+        let beatMatched = QueueOrderScorer.score(
+            outgoing: a, incoming: stranger, planned: planned(.beatMatched))
+
+        #expect(crossfade.tier == .crossfade)
+        #expect(beatMatched.tier == .beatMatched)
+        #expect(beatMatched.total > crossfade.total)
+    }
+
+    @Test func everyTierStepBeatsAPerfectScoreInTheTierBelow() {
+        // Stated as a property over the whole ladder rather than one pair: the
+        // four weights sum to 4 and the spacing is 10, so no arrangement of
+        // continuity terms can reach the next rung.
+        let a = makeAnalysis()
+        let b = makeAnalysis()
+        let ordered = TransitionTier.allCases.sorted()
+        for (lower, upper) in zip(ordered, ordered.dropFirst()) {
+            let best = QueueOrderScorer.score(outgoing: a, incoming: b, planned: planned(lower))
+            let worst = QueueOrderScorer.score(outgoing: nil, incoming: nil,
+                                               planned: planned(upper))
+            #expect(worst.total > best.total,
+                    "\(upper.label) must outrank \(lower.label) regardless of continuity")
+        }
+    }
+
+    @Test func aRampedBeatMatchOutranksASteppedOne() {
+        let a = makeAnalysis()
+        let stepped = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                             planned: planned(.beatMatched))
+        let ramped = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                            planned: planned(.rampedBeatMatched))
+        #expect(ramped.total > stepped.total)
+    }
+
+    // MARK: - Aging
+
+    @Test func agingIsUnboundedSoNothingStarves() {
+        // A track that can only ever be crossfaded, losing to a beat-matchable
+        // one over and over. The whole no-starvation claim is that this
+        // eventually stops being true — so find the round where it does.
+        let a = makeAnalysis()
+        let winnerScore = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                                 planned: planned(.rampedBeatMatched))
+        var rounds = 0
+        var loser = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                           planned: planned(.crossfade))
+        while loser.total <= winnerScore.total {
+            rounds += 1
+            #expect(rounds < 1000, "aging never overtook the better tier")
+            loser = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                           planned: planned(.crossfade),
+                                           lostRounds: rounds)
+        }
+        // Three tiers apart at the shipped ε — a bounded number of songs, not
+        // a bounded *fraction*, which is what "no starvation" has to mean.
+        #expect(rounds > 0)
+        #expect(rounds < 200)
+    }
+
+    @Test func agingOnlyMovesWithTheRoundsLost() {
+        let a = makeAnalysis()
+        let fresh = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                           planned: planned(.crossfade))
+        let aged = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                          planned: planned(.crossfade), lostRounds: 4)
+        #expect(fresh.aging == 0)
+        #expect(abs(aged.aging - 4 * QueueOrderConfig.standard.agingEpsilon) < 1e-9)
+        #expect(abs((aged.total - fresh.total) - aged.aging) < 1e-9)
+    }
+
+    // MARK: - Same-artist penalty
+
+    @Test func theSameArtistPenaltyIsSubtractedAndCanBeTurnedOff() {
+        let a = makeAnalysis()
+        let plain = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                           planned: planned(.crossfade))
+        let penalised = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                               planned: planned(.crossfade),
+                                               sharesArtist: true)
+        #expect(penalised.sameArtistPenalty == -QueueOrderConfig.standard.sameArtistPenalty)
+        #expect(abs((plain.total - penalised.total)
+                    - QueueOrderConfig.standard.sameArtistPenalty) < 1e-9)
+
+        var off = QueueOrderConfig.standard
+        off.sameArtistPenalty = 0
+        let unpenalised = QueueOrderScorer.score(outgoing: a, incoming: a,
+                                                 planned: planned(.crossfade),
+                                                 sharesArtist: true, config: off)
+        #expect(unpenalised.sameArtistPenalty == 0)
+    }
+
+    @Test func sharingAnArtistIsWhatTripsThePenaltyAndIdZeroIsNotAnArtist() {
+        #expect(QueueOrderSelector.sharesArtist(track(1, artist: 7), track(2, artist: 7)))
+        #expect(!QueueOrderSelector.sharesArtist(track(1, artist: 7), track(2, artist: 8)))
+        // 0 is the decoder's "unknown", not an artist two tracks have in common.
+        #expect(!QueueOrderSelector.sharesArtist(track(1, artist: 0), track(2, artist: 0)))
+        #expect(!QueueOrderSelector.sharesArtist(nil, track(2, artist: 7)))
+    }
+
+    // MARK: - Continuity terms
+
+    @Test func continuityTermsAbstainAtTheNeutralHalfRatherThanGuessing() {
+        // Every term has an "I cannot tell" answer, and it has to be 0.5 —
+        // neither a bonus nor a penalty — or an unanalyzable track would be
+        // systematically preferred or systematically buried.
+        let noTempo = makeAnalysis(bpmConfidence: 0.1)
+        #expect(QueueOrderScorer.tempoAffinity(noTempo, noTempo) == 0.5)
+        let noKey = makeAnalysis(keyConfidence: 0)
+        #expect(QueueOrderScorer.keyAffinity(noKey, noKey) == 0.5)
+        let noStyle = makeAnalysis(melProfile: [])
+        #expect(QueueOrderScorer.styleAffinity(noStyle, noStyle) == 0.5)
+    }
+
+    @Test func tempoAffinityFoldsDoubleTimeTheWayThePlannerDoes() {
+        let slow = makeAnalysis(bpm: 85)
+        let double = makeAnalysis(bpm: 170)
+        let awkward = makeAnalysis(bpm: 97)
+        #expect(QueueOrderScorer.tempoAffinity(slow, double) == 1)
+        #expect(QueueOrderScorer.tempoAffinity(slow, awkward) < 0.5)
+    }
+
+    @Test func keyAffinityIsWeightedByTheWeakerConfidence() {
+        let c = makeAnalysis(keyPitchClass: 0, keyConfidence: 0.9)
+        let sameKey = makeAnalysis(keyPitchClass: 0, keyConfidence: 0.9)
+        let tritone = makeAnalysis(keyPitchClass: 6, keyConfidence: 0.9)
+        #expect(QueueOrderScorer.keyAffinity(c, sameKey) > 0.9)
+        #expect(QueueOrderScorer.keyAffinity(c, tritone) < 0.1)
+        // A guess pulls its own verdict back toward the neutral half.
+        let unsure = makeAnalysis(keyPitchClass: 6, keyConfidence: 0.65)
+        let confident = QueueOrderScorer.keyAffinity(c, tritone)
+        let hedged = QueueOrderScorer.keyAffinity(c, unsure)
+        #expect(hedged > confident)
+        #expect(hedged < 0.5)
+    }
+
+    @Test func aHardEnergyDropCostsMoreThanTheSameSizedRise() {
+        let mid = makeAnalysis(energy: 0.5)
+        let quiet = makeAnalysis(energy: 0.2)
+        let loud = makeAnalysis(energy: 0.8)
+        let drop = QueueOrderScorer.energyContinuity(mid, quiet)
+        let rise = QueueOrderScorer.energyContinuity(mid, loud)
+        let flat = QueueOrderScorer.energyContinuity(mid, makeAnalysis(energy: 0.5))
+        #expect(flat == 1)
+        #expect(rise > drop)
+        #expect(drop < 1)
+    }
+
+    // MARK: - Tier derivation
+
+    @Test func theTierIsReadOffThePlanNeverReDecided() {
+        #expect(TransitionTier(planned(.gapless)) == .gapless)
+        #expect(TransitionTier(planned(.crossfade)) == .crossfade)
+        #expect(TransitionTier(planned(.stagedCrossfade)) == .stagedCrossfade)
+        #expect(TransitionTier(planned(.beatMatched)) == .beatMatched)
+        #expect(TransitionTier(planned(.rampedBeatMatched)) == .rampedBeatMatched)
+        #expect(TransitionTier(planned(.beatMatched)).isBeatMatched)
+        #expect(!TransitionTier(planned(.stagedCrossfade)).isBeatMatched)
+    }
+
+    // MARK: - Pool bookkeeping
+
+    @MainActor
+    @Test func thePoolIsTheWindowPlusEverythingAlreadyAnalyzed() {
+        let selector = QueueOrderSelector()
+        selector.config.window = 2
+        let remaining = (1...6).map { track($0) }
+        // Cold: only the window is reachable.
+        #expect(selector.pool(remaining: remaining).map(\.id) == [1, 2])
+
+        // A track further down the list that already has an analysis joins for
+        // free — predev §2.2's second half of the pool.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 5)
+        #expect(selector.pool(remaining: remaining).map(\.id) == [1, 2, 5])
+
+        // Something already inside the window does not appear twice.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 2)
+        #expect(selector.pool(remaining: remaining).map(\.id) == [1, 2, 5])
+    }
+
+    @MainActor
+    @Test func aPoolIsSettledOnlyOnceEveryCandidateHasBeenResolved() {
+        let selector = QueueOrderSelector()
+        let pool = [track(1), track(2)]
+        #expect(!selector.isSettled(pool))
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 1)
+        #expect(!selector.isSettled(pool))
+        selector.injectRefusalForTesting(trackID: 2)
+        #expect(selector.isSettled(pool))
+    }
+
+    @MainActor
+    @Test func onlyThePoolAgesAndTheWinnerIsForgiven() {
+        let selector = QueueOrderSelector()
+        selector.config.window = 4
+        let one = track(1), two = track(2), three = track(3)
+        for t in [one, two, three] {
+            selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: t.id)
+        }
+        selector.noteRound(chosen: one, pool: [one, two, three])
+        selector.noteRound(chosen: two, pool: [two, three])
+
+        // Track 3 lost twice; track 1 was never in the second pool, so it did
+        // not age for a round it was not offered.
+        #expect(selector.lostRoundsForTesting(three.id) == 2)
+        #expect(selector.lostRoundsForTesting(one.id) == 0)
+        // A winner starts clean again.
+        #expect(selector.lostRoundsForTesting(two.id) == 0)
+    }
+
+    @MainActor
+    @Test func aPickOnlyEverConsidersAnalyzedCandidatesAndTiesBreakOnListOrder() {
+        let selector = QueueOrderSelector()
+        let outgoing = makeAnalysis()
+        let pool = [track(1), track(2), track(3)]
+        // Nothing analyzed: nil, which is the caller's cue to leave the list
+        // order alone rather than wait for a download.
+        #expect(selector.pick(outgoing: nil, outgoingAnalysis: outgoing, pool: pool) == nil)
+
+        // Two identical candidates: the earlier one in the pool wins, so a
+        // pool the scorer cannot tell apart reproduces the user's list.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 2)
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 3)
+        let winner = selector.pick(outgoing: nil, outgoingAnalysis: outgoing, pool: pool)
+        #expect(winner?.id == 2)
+        #expect(selector.lastPick.map(\.track.id) == [2, 3])
+    }
+
+    @MainActor
+    @Test func resettingKeepsAnalysesAndDropsEverythingAboutTheOldQueue() {
+        let selector = QueueOrderSelector()
+        let one = track(1), two = track(2)
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 1)
+        selector.injectRefusalForTesting(trackID: 2)
+        selector.noteRound(chosen: one, pool: [one, two])
+        #expect(selector.lostRoundsForTesting(two.id) == 1)
+
+        selector.reset()
+        // The analysis is on disk anyway; forgetting it would buy nothing and
+        // cost a re-download.
+        #expect(selector.hasAnalysis(for: one))
+        #expect(selector.lostRoundsForTesting(two.id) == 0)
+        // A refusal described a queue that no longer exists.
+        #expect(!selector.isSettled([two]))
+        #expect(selector.lastPick.isEmpty)
+    }
+
+    // MARK: - Migration
+
+    @Test func aSessionWrittenBeforeTheModeExistedMigratesFromItsShuffleBool() {
+        // No `queueOrder` key at all — the shape every state file on disk has
+        // today.
+        let legacyShuffling = PlayerService.PersistedState(
+            queue: [], currentID: nil, repeatMode: "off", shuffle: true,
+            recentContexts: nil, queueOrder: nil)
+        let legacyListed = PlayerService.PersistedState(
+            queue: [], currentID: nil, repeatMode: "off", shuffle: false,
+            recentContexts: nil, queueOrder: nil)
+        #expect(PlayerService.restoredQueueOrder(legacyShuffling) == .shuffled)
+        #expect(PlayerService.restoredQueueOrder(legacyListed) == .listed)
+        #expect(QueueOrder(migratingShuffle: true) == .shuffled)
+        #expect(QueueOrder(migratingShuffle: false) == .listed)
+    }
+
+    @Test func anExplicitQueueOrderWinsOverTheLegacyBool() {
+        // Both keys present and disagreeing: a build that wrote `autoMix` also
+        // wrote `shuffle: false`, and a build that has since been downgraded
+        // and re-upgraded must not lose the mode.
+        let state = PlayerService.PersistedState(
+            queue: [], currentID: nil, repeatMode: "off", shuffle: false,
+            recentContexts: nil, queueOrder: "autoMix")
+        #expect(PlayerService.restoredQueueOrder(state) == .autoMix)
+    }
+
+    @Test func anUnknownQueueOrderFallsBackToTheBoolRatherThanFailing() {
+        let state = PlayerService.PersistedState(
+            queue: [], currentID: nil, repeatMode: "off", shuffle: true,
+            recentContexts: nil, queueOrder: "someFutureMode")
+        #expect(PlayerService.restoredQueueOrder(state) == .shuffled)
+    }
+
+    // MARK: - Config surface
+
+    @Test func theWeightsAreSweepableTheSameWayThePlannersAre() {
+        let moved = QueueOrderConfig.standard(overriding: ["agingEpsilon": 1.25, "window": 7])
+        #expect(moved.agingEpsilon == 1.25)
+        #expect(moved.window == 7)
+        // Unknown names are ignored and values are clamped, so a stale preset
+        // can never take the mode down.
+        let clamped = QueueOrderConfig.standard(
+            overriding: ["agingEpsilon": 9_999, "nonsense": 3])
+        #expect(clamped.agingEpsilon == 5)
+        #expect(QueueOrderConfig.standard.asDictionary["tierSpacing"] == 10)
+    }
+}

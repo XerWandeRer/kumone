@@ -222,12 +222,31 @@ final class QueueOrderSelector {
         lastPick = []
     }
 
+    // MARK: - Test hooks
+    //
+    // The pool arithmetic is worth asserting on and the fetch is not: it is a
+    // network call, and every property the bookkeeping has is a property of
+    // what the fetch *produced*, not of the fetching. So the two states a
+    // fetch can end in are settable directly.
+
+    func injectAnalysisForTesting(_ analysis: TrackAnalysis, forTrackID id: Int) {
+        analyses[id] = analysis
+        scanned.insert(id)
+    }
+
+    func injectRefusalForTesting(trackID id: Int) {
+        refused.insert(id)
+        scanned.insert(id)
+    }
+
+    func lostRoundsForTesting(_ id: Int) -> Int { lostRounds[id] ?? 0 }
+
     // MARK: - Fetching
 
     /// Whether the two tracks share a credited artist — the same-artist
     /// penalty's whole input. Artist id 0 is the decoder's "unknown" and never
     /// matches anything.
-    static func sharesArtist(_ a: Track?, _ b: Track) -> Bool {
+    nonisolated static func sharesArtist(_ a: Track?, _ b: Track) -> Bool {
         guard let a else { return false }
         let left = Set(a.artists.map(\.id).filter { $0 != 0 })
         guard !left.isEmpty else { return false }
