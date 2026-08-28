@@ -116,6 +116,47 @@ actor AudioCache {
         return analysis
     }
 
+    /// Every analysis sidecar on disk for the given tracks, **at any quality
+    /// level**, in one directory walk.
+    ///
+    /// This is the free half of the queue-order candidate pool (predev §2.2):
+    /// a track heard before already has a playback-quality analysis sitting
+    /// next to its audio, and asking for it costs no network call, no
+    /// download and no analyzer pass. Keyed by track ID rather than by `Key`
+    /// because the caller does not know — and must not have to resolve — which
+    /// level and container that track landed in.
+    ///
+    /// The best level present wins when a track has several, since a
+    /// playback-quality sidecar is strictly better than a scoring one and
+    /// costs the same to read.
+    func analyses(forTrackIDs ids: Set<Int>) -> [Int: TrackAnalysis] {
+        guard !ids.isEmpty,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        else { return [:] }
+        var best: [Int: (rank: Int, analysis: TrackAnalysis)] = [:]
+        for name in names where name.hasSuffix(Self.sidecarSuffix) {
+            // "<trackID>-<level>-<source>.<ext>.analysis.json"
+            let parts = name.split(separator: "-", maxSplits: 2, omittingEmptySubsequences: false)
+            guard parts.count == 3, let id = Int(parts[0]), ids.contains(id) else { continue }
+            let rank = Self.levelRank(String(parts[1]))
+            if let existing = best[id], existing.rank >= rank { continue }
+            guard let data = try? Data(contentsOf: directory.appendingPathComponent(name)),
+                  let analysis = try? JSONDecoder().decode(TrackAnalysis.self, from: data),
+                  analysis.version == TrackAnalysis.currentVersion else { continue }
+            best[id] = (rank, analysis)
+        }
+        return best.mapValues(\.analysis)
+    }
+
+    /// Quality levels cheapest first. Unknown names sort last, so a level this
+    /// build has never heard of is treated as the best thing on disk rather
+    /// than silently preferred against.
+    private static let levelLadder = ["standard", "higher", "exhigh", "lossless", "hires"]
+
+    private static func levelRank(_ level: String) -> Int {
+        levelLadder.firstIndex(of: level) ?? levelLadder.count
+    }
+
     func storeAnalysis(_ analysis: TrackAnalysis, for key: Key) {
         ensureDirectory()
         guard let data = try? JSONEncoder().encode(analysis) else { return }

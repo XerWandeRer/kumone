@@ -113,6 +113,17 @@ final class PlayerService: ObservableObject {
 
     @Published private(set) var queue: [Track] = []
     @Published private(set) var shuffledQueue: [Track] = []
+    /// The AutoMix order's working list: `queue` with the decided next track
+    /// spliced to `currentIndex + 1` as each pick is made.
+    ///
+    /// Materializing the choice into a list — rather than teaching the advance
+    /// path a second way to find "next" — is what keeps `currentIndex`
+    /// meaningful. `advanceToNext`, `previous`, `adoptTransitionedTrack` and
+    /// `upcomingTracks` are the code they always were, and predev §2.1's
+    /// display contract ("only the decided next is shown reordered; the rest
+    /// stays list order") falls out of the splice rather than needing its own
+    /// rule.
+    @Published private(set) var autoMixQueue: [Track] = []
     @Published private(set) var playNextList: [Track] = []
     @Published private(set) var currentIndex = -1
     @Published private(set) var currentTrack: Track?
@@ -134,7 +145,15 @@ final class PlayerService: ObservableObject {
         didSet { UserDefaults.standard.set(repeatMode.rawValue, forKey: "player.repeat") }
     }
 
-    @Published private(set) var shuffleEnabled = false
+    /// Which order the player walks its queue in (predev §2.1). The three
+    /// states are mutually exclusive by construction — there is one value —
+    /// and none of them ever reorders `queue` itself, so leaving a mode always
+    /// restores the list the user gave us.
+    @Published private(set) var queueOrder: QueueOrder = .listed
+    /// The old two-state name, kept as a read-only derivation so every call
+    /// site that only ever asked "is shuffle on" — the Dock menu, the two
+    /// transport bars, the persisted state — keeps working unchanged.
+    var shuffleEnabled: Bool { queueOrder == .shuffled }
     @Published var volume: Float = 1 {
         didSet {
             engine.outputVolume = volume
@@ -151,8 +170,14 @@ final class PlayerService: ObservableObject {
     @Published var activePanel: RightPanel?
     @Published var showNowPlaying = false
 
-    /// The list the player is walking through (shuffled or ordered).
-    var activeQueue: [Track] { shuffleEnabled ? shuffledQueue : queue }
+    /// The list the player is walking through.
+    var activeQueue: [Track] {
+        switch queueOrder {
+        case .listed: return queue
+        case .shuffled: return shuffledQueue
+        case .autoMix: return autoMixQueue
+        }
+    }
 
     var upcomingTracks: [Track] {
         guard !activeQueue.isEmpty, currentIndex >= 0 else { return playNextList }
@@ -278,6 +303,10 @@ final class PlayerService: ObservableObject {
                 // test here. It runs before the guard below because a paused or
                 // buffering player is precisely when the panel is being read.
                 if AutoMixDebugModel.shared.isActive { self.publishDebugNow() }
+                // The queue-order pick rides this tick for the same reason:
+                // with the mode off it is one optional test, and with it on
+                // there is no second timer to own.
+                self.updateAutoMixPick()
                 guard self.isPlaying, self.deckLoaded, !self.isScrubbing else { return }
                 let seconds = self.engine.position(of: self.activeDeck)
                 guard seconds.isFinite else { return }
@@ -364,11 +393,16 @@ final class PlayerService: ObservableObject {
         self.source = source
         playNextList.removeAll()
         let startTrack = track ?? tracks[0]
-        if shuffleEnabled {
+        queueOrderSelector?.reset()
+        switch queueOrder {
+        case .listed:
+            currentIndex = tracks.firstIndex(where: { $0.id == startTrack.id }) ?? 0
+        case .shuffled:
             reshuffle(keeping: startTrack)
             currentIndex = 0
-        } else {
-            currentIndex = tracks.firstIndex(where: { $0.id == startTrack.id }) ?? 0
+        case .autoMix:
+            reorderForAutoMix(keeping: startTrack)
+            currentIndex = 0
         }
         startPlaying(activeQueue[currentIndex])
     }
@@ -479,15 +513,45 @@ final class PlayerService: ObservableObject {
     }
 
     func toggleShuffle() {
-        guard !isFMMode else { return }
-        shuffleEnabled.toggle()
-        guard let current = currentTrack else { return }
-        if shuffleEnabled {
+        setQueueOrder(shuffleEnabled ? .listed : .shuffled)
+    }
+
+    /// The AutoMix order's own switch. Mutual exclusion with shuffle is not a
+    /// rule enforced here — it is `QueueOrder` having one value at a time.
+    func toggleAutoMixOrder() {
+        setQueueOrder(queueOrder == .autoMix ? .listed : .autoMix)
+    }
+
+    /// Whether the AutoMix order can do anything at all. It picks by planning,
+    /// and planning needs analyses — which iOS and an AutoMix-off player never
+    /// compute. The UI hides the switch rather than offering an inert one.
+    var autoMixOrderAvailable: Bool { analysisWanted }
+
+    func setQueueOrder(_ order: QueueOrder) {
+        guard !isFMMode, queueOrder != order else { return }
+        let current = currentTrack
+        queueOrder = order
+        syncQueueOrderSelector()
+        autoMixPickCommitted = false
+        switch order {
+        case .listed:
+            shuffledQueue = []
+            autoMixQueue = []
+            if let current {
+                currentIndex = queue.firstIndex(where: { $0.id == current.id }) ?? 0
+            }
+        case .shuffled:
+            autoMixQueue = []
+            guard let current else { break }
             reshuffle(keeping: current)
             currentIndex = 0
-        } else {
-            currentIndex = queue.firstIndex(where: { $0.id == current.id }) ?? 0
+        case .autoMix:
+            shuffledQueue = []
+            guard let current else { break }
+            reorderForAutoMix(keeping: current)
+            currentIndex = 0
         }
+        persistState()
         schedulePrefetch()
     }
 
@@ -537,11 +601,15 @@ final class PlayerService: ObservableObject {
             playNextList.remove(at: idx)
             return
         }
-        if let idx = queue.firstIndex(where: { $0.id == track.id }), idx != currentIndex || shuffleEnabled {
+        if let idx = queue.firstIndex(where: { $0.id == track.id }),
+           idx != currentIndex || queueOrder != .listed {
             queue.remove(at: idx)
         }
         if let idx = shuffledQueue.firstIndex(where: { $0.id == track.id }) {
             shuffledQueue.remove(at: idx)
+        }
+        if let idx = autoMixQueue.firstIndex(where: { $0.id == track.id }), idx != currentIndex {
+            autoMixQueue.remove(at: idx)
         }
         schedulePrefetch()
     }
@@ -552,10 +620,12 @@ final class PlayerService: ObservableObject {
         guard !isFMMode || !isPlaying else { return }
         recordRecent(.fm)
         isFMMode = true
-        shuffleEnabled = false
+        queueOrder = .listed
+        syncQueueOrderSelector()
         repeatMode = .off
         queue = []
         shuffledQueue = []
+        autoMixQueue = []
         playNextList = []
         currentIndex = -1
         source = .none
@@ -671,6 +741,8 @@ final class PlayerService: ObservableObject {
         prefetchedNext = nil
         currentAnalysis = nil
         currentLocalURL = nil
+        // A new track is a new decision round for the queue-order mode.
+        autoMixPickCommitted = false
         AutoMixDebugModel.shared.clearNext()
         isBuffering = false
         enginePaused = false
@@ -964,6 +1036,19 @@ final class PlayerService: ObservableObject {
     /// (Re)start the pipeline for the current auto-advance target. Call after
     /// playback starts and whenever the upcoming list changes.
     private func schedulePrefetch() {
+        // AutoMix order decides *which* track is next, and until it has there
+        // is nothing to prefetch: committing to the list's answer now would
+        // download the wrong song and arm it before the choice was made.
+        // `updateAutoMixPick` calls back in here the moment it decides — at the
+        // latest at `autoMixDeadline`, which is sized so the winner still has
+        // time to be downloaded, analyzed and armed.
+        if autoMixPickPending {
+            prefetchTask?.cancel()
+            prefetchedNext = nil
+            AutoMixDebugModel.shared.setNextTitle(
+                nil, stage: .deferred("AutoMix order is still choosing"))
+            return
+        }
         prefetchTask?.cancel()
         let target = autoAdvanceTarget()
         if let armed = pendingTransitionTrack {
@@ -1358,6 +1443,10 @@ final class PlayerService: ObservableObject {
             let result = await self.analysis(for: key, fileURL: fileURL)
             guard generation == self.resolveGeneration, let result else { return }
             self.currentAnalysis = result
+            // The outgoing side of every candidate score just arrived; a pick
+            // that was waiting on it can now be made. Harmless once the pick
+            // is committed — `updateAutoMixPick` returns on the first guard.
+            self.updateAutoMixPick()
             self.replanArmedTransition()
         }
     }
@@ -1715,6 +1804,121 @@ final class PlayerService: ObservableObject {
         shuffledQueue = [first] + rest
     }
 
+    /// The AutoMix order's equivalent: the same "current track first, the rest
+    /// behind it" contract shuffle has, except the rest keeps list order —
+    /// nothing is decided yet, and predev §2.1 forbids pretending otherwise.
+    private func reorderForAutoMix(keeping first: Track) {
+        autoMixQueue = [first] + queue.filter { $0.id != first.id }
+    }
+
+    // MARK: - AutoMix queue order (predev §2.2 / §2.4)
+
+    /// Nil whenever the mode is off — which is the whole of predev §5.3's
+    /// regression contract. A player in `.listed` or `.shuffled` allocates no
+    /// selector, scores nothing and issues no candidate request.
+    private var queueOrderSelector: QueueOrderSelector?
+    /// The pick for the track now playing has been made (or deliberately
+    /// declined). Cleared by `startPlaying`, so every track gets exactly one
+    /// decision round.
+    private var autoMixPickCommitted = false
+
+    /// How long before the end of the track the pick is made even if
+    /// candidates are still downloading.
+    ///
+    /// The winner does not go straight to the engine: it still has to be
+    /// re-resolved, downloaded at *playback* quality and re-analyzed by the
+    /// ordinary prefetch path (a lossy file's beat grid may not be aligned to
+    /// the real one — predev §2.2), and a stem hand-over then wants
+    /// `stemPrerenderLead` = 60 s on top. 90 s covers both with room for a
+    /// slow transfer; the fraction floor keeps a short track from deciding
+    /// before it has played at all.
+    private static let autoMixDecisionLead: TimeInterval = 90
+
+    private var autoMixDeadline: TimeInterval {
+        max(duration - Self.autoMixDecisionLead, duration * 0.35)
+    }
+
+    /// The mode is on and owes an answer — so the prefetch pipeline must wait
+    /// rather than commit to whatever the list happens to say next.
+    private var autoMixPickPending: Bool {
+        queueOrderSelector != nil && queueOrder == .autoMix
+            && !autoMixPickCommitted && !isFMMode && playNextList.isEmpty
+    }
+
+    private func syncQueueOrderSelector() {
+        guard queueOrder == .autoMix, autoMixOrderAvailable else {
+            queueOrderSelector = nil
+            return
+        }
+        guard queueOrderSelector == nil else {
+            queueOrderSelector?.reset()
+            return
+        }
+        let selector = QueueOrderSelector()
+        selector.onCandidateReady = { [weak self] in self?.updateAutoMixPick() }
+        queueOrderSelector = selector
+    }
+
+    /// Everything still ahead of the playhead in the working list.
+    private func autoMixRemaining() -> [Track] {
+        guard currentIndex >= 0, currentIndex + 1 < activeQueue.count else { return [] }
+        return Array(activeQueue[(currentIndex + 1)...])
+    }
+
+    /// Polled from the progress tick while the mode owes a decision: top the
+    /// candidate pool up, and pick as soon as there is nothing left to wait
+    /// for — or when the deadline arrives, whichever comes first.
+    ///
+    /// Costs one optional test per tick with the mode off.
+    private func updateAutoMixPick() {
+        guard autoMixPickPending, let selector = queueOrderSelector else { return }
+        let remaining = autoMixRemaining()
+        // Nothing to choose between: let the ordinary pipeline have the track
+        // the list already points at.
+        guard remaining.count > 1 else { return commitAutoMixPick(nil, pool: []) }
+
+        let pool = selector.pool(remaining: remaining)
+        selector.ensureCandidates(pool)
+
+        let atDeadline = duration > 0 && progress >= autoMixDeadline
+        // Scoring against a missing outgoing analysis is not scoring: every
+        // candidate comes back `.gapless` and the order would be pure aging.
+        // So the pick waits for the playing track's own analysis too — up to
+        // the deadline, where the list order takes over.
+        guard atDeadline || (currentAnalysis != nil && selector.isSettled(pool)) else { return }
+        let winner = selector.pick(
+            outgoing: currentTrack, outgoingAnalysis: currentAnalysis, pool: pool,
+            plannerConfig: plannerConfig,
+            outgoingLyricLineEnds: currentLocalURL
+                .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
+        commitAutoMixPick(winner, pool: pool)
+    }
+
+    /// Freeze the decision for this track and hand the pipeline the result.
+    ///
+    /// **This is the one change to the advance path.** Rather than teach
+    /// `advanceToNext` a second way to find "next", the winner is spliced to
+    /// `currentIndex + 1` — so `currentIndex + 1` is still the answer, and
+    /// every index-based path downstream is untouched. A nil winner (nothing
+    /// analyzed by the deadline) leaves the list exactly as it was: the mode
+    /// never holds up a hand-over waiting for a download.
+    private func commitAutoMixPick(_ winner: Track?, pool: [Track]) {
+        autoMixPickCommitted = true
+        if let winner {
+            queueOrderSelector?.noteRound(chosen: winner, pool: pool)
+            spliceAutoMixNext(winner)
+        }
+        schedulePrefetch()
+    }
+
+    private func spliceAutoMixNext(_ track: Track) {
+        let target = currentIndex + 1
+        guard target < autoMixQueue.count,
+              let from = autoMixQueue.firstIndex(where: { $0.id == track.id }),
+              from > currentIndex, from != target else { return }
+        autoMixQueue.insert(autoMixQueue.remove(at: from), at: target)
+    }
+
     // MARK: - Persistence
 
     private static let recentContextsLimit = 6
@@ -1777,13 +1981,20 @@ final class PlayerService: ObservableObject {
         }
     }
 
-    private struct PersistedState: Codable {
+    struct PersistedState: Codable {
         var queue: [Track]
         var currentID: Int?
         var repeatMode: String
+        /// The pre-`QueueOrder` two-state flag. Still written, so a build
+        /// without the queue-order mode reads a sane session back; still read,
+        /// as the migration source for a state file written before
+        /// `queueOrder` existed.
         var shuffle: Bool
         /// Optional so state files written before recents existed still decode.
         var recentContexts: [PlayContext]?
+        /// Optional for the same reason — absent means "migrate from
+        /// `shuffle`". See `QueueOrder.init(migratingShuffle:)`.
+        var queueOrder: String?
     }
 
     private func persistState() {
@@ -1792,7 +2003,8 @@ final class PlayerService: ObservableObject {
             currentID: currentTrack?.id,
             repeatMode: repeatMode.rawValue,
             shuffle: shuffleEnabled,
-            recentContexts: recentContexts
+            recentContexts: recentContexts,
+            queueOrder: queueOrder.rawValue
         )
         guard let data = try? JSONEncoder().encode(state) else { return }
         let url = Self.stateFileURL
@@ -1811,9 +2023,15 @@ final class PlayerService: ObservableObject {
         recentContexts = Array((state.recentContexts ?? []).prefix(Self.recentContextsLimit))
         guard !state.queue.isEmpty else { return }
         queue = state.queue
-        shuffleEnabled = state.shuffle
-        if shuffleEnabled {
-            shuffledQueue = queue.shuffled()
+        queueOrder = PlayerService.restoredQueueOrder(state)
+        syncQueueOrderSelector()
+        switch queueOrder {
+        case .listed: break
+        case .shuffled: shuffledQueue = queue.shuffled()
+        // No pick has been made for a session that has not started playing,
+        // so the working list is the plain queue — which is what the mode
+        // shows anyway until the first decision lands.
+        case .autoMix: autoMixQueue = queue
         }
         if let id = state.currentID,
            let idx = activeQueue.firstIndex(where: { $0.id == id }) {
@@ -1825,6 +2043,14 @@ final class PlayerService: ObservableObject {
                 await loadLyrics(for: activeQueue[idx], generation: resolveGeneration)
             }
         }
+    }
+
+    /// The queue order a persisted session restores to, migrating a state file
+    /// written before the mode existed. Static and pure so the migration is
+    /// testable without a player.
+    nonisolated static func restoredQueueOrder(_ state: PersistedState) -> QueueOrder {
+        state.queueOrder.flatMap(QueueOrder.init(rawValue:))
+            ?? QueueOrder(migratingShuffle: state.shuffle)
     }
 
     private static var stateFileURL: URL {
