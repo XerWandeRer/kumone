@@ -40,6 +40,7 @@ struct AutoMixDebugPanel: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     nowGroup
+                    orderGroup
                     nextGroup
                     planGroup
                     prerenderGroup
@@ -62,7 +63,10 @@ struct AutoMixDebugPanel: View {
             .padding(.vertical, 8)
         }
         .font(.system(size: 11, design: .monospaced))
-        .frame(minWidth: 420, minHeight: 460)
+        // Wide enough for the queue-order candidate table's ten columns; the
+        // ScrollView only scrolls vertically, so a narrower window would clip
+        // the totals rather than wrap them.
+        .frame(minWidth: 560, minHeight: 460)
         // The model only publishes while a window is open; nothing ticks for a
         // panel nobody has asked for.
         .onAppear { model.activate() }
@@ -127,6 +131,75 @@ struct AutoMixDebugPanel: View {
                 DebugRow(".lrc", next.hasLyricSidecar ? "present" : "missing")
             }
         }
+    }
+
+    /// The queue-order pick: what the selector is choosing between, and the
+    /// arithmetic that decided it.
+    ///
+    /// Present in every mode — reading "mode listed" is how you find out the
+    /// switch is off — but the table only exists once there is something to
+    /// choose between.
+    @ViewBuilder
+    private var orderGroup: some View {
+        let order = model.snapshot.order
+        DebugGroup("Queue order") {
+            DebugRow("mode", order.mode)
+            if order.mode == "autoMix" {
+                DebugRow("state", order.state)
+                DebugRow("pool", "\(order.analyzed)/\(order.poolSize) analyzed")
+                DebugRow("deadline", order.deadline.map {
+                    AutoMixDebugFormat.clock($0) + String(format: " (%.0fs)", $0)
+                } ?? "—")
+                if order.candidates.isEmpty {
+                    DebugRow("candidates", "none scored yet")
+                } else {
+                    candidateHeader
+                    ForEach(order.candidates) { candidate in
+                        candidateRow(candidate)
+                    }
+                    Text(verbatim: "tempo / key / style / energy are 0–1 and only sort "
+                         + "inside a tier; aging is unbounded, which is what keeps a "
+                         + "track from starving.")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
+                }
+            }
+        }
+    }
+
+    private var candidateHeader: some View {
+        HStack(spacing: 6) {
+            Text(verbatim: "candidate").frame(width: 128, alignment: .leading)
+            Text(verbatim: "tier").frame(width: 92, alignment: .leading)
+            ForEach(["tmp", "key", "sty", "enr", "age", "art"], id: \.self) { column in
+                Text(verbatim: column).frame(width: 34, alignment: .trailing)
+            }
+            Text(verbatim: "total").frame(width: 44, alignment: .trailing)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+        .foregroundStyle(.secondary)
+    }
+
+    private func candidateRow(_ c: AutoMixDebugCandidate) -> some View {
+        HStack(spacing: 6) {
+            Text(verbatim: c.title)
+                .lineLimit(1).truncationMode(.tail)
+                .frame(width: 128, alignment: .leading)
+            Text(verbatim: c.tier).frame(width: 92, alignment: .leading)
+            ForEach(Array([c.tempo, c.key, c.style, c.energy, c.aging, c.samePenalty]
+                          .enumerated()), id: \.offset) { _, value in
+                Text(verbatim: String(format: "%.2f", value))
+                    .frame(width: 34, alignment: .trailing)
+            }
+            Text(verbatim: String(format: "%.2f", c.total))
+                .frame(width: 44, alignment: .trailing)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 10, weight: c.chosen ? .bold : .regular, design: .monospaced))
+        .foregroundStyle(c.chosen ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.primary))
     }
 
     @ViewBuilder

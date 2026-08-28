@@ -1596,6 +1596,66 @@ final class PlayerService: ObservableObject {
             analyzed: currentAnalysis != nil,
             deckA: deck(.a, gains.a),
             deckB: deck(.b, gains.b)))
+        publishDebugOrder()
+    }
+
+    /// How long a preview scoring pass is reused for while the pick is still
+    /// pending. The table has to be *live* to be worth anything — the whole
+    /// question is "what is it weighing right now" — but a pass costs one
+    /// `TransitionPlanner.plan` per candidate, which is not a thing to run
+    /// five times a second. Two seconds is faster than a listener can read a
+    /// row and slow enough to be free.
+    private static let debugOrderPreviewInterval: TimeInterval = 2
+
+    private var lastDebugOrderPreview: Date = .distantPast
+
+    /// The queue-order group. Only ever called from `publishDebugNow`, which
+    /// only the open panel calls — so the preview pass below cannot cost a
+    /// closed window anything.
+    private func publishDebugOrder() {
+        guard let selector = queueOrderSelector else {
+            AutoMixDebugModel.shared.setOrder(AutoMixDebugOrder(mode: queueOrder.rawValue))
+            return
+        }
+        let pool = selector.pool(remaining: autoMixRemaining())
+        // While the pick is pending, re-score for display. This does not age
+        // anything — `noteRound` is the only thing that moves a counter — so
+        // previewing is free of consequence, and after the commit the table is
+        // the real one, frozen.
+        if autoMixPickPending, currentAnalysis != nil,
+           Date().timeIntervalSince(lastDebugOrderPreview) >= Self.debugOrderPreviewInterval {
+            lastDebugOrderPreview = Date()
+            _ = selector.pick(
+                outgoing: currentTrack, outgoingAnalysis: currentAnalysis, pool: pool,
+                plannerConfig: plannerConfig,
+                outgoingLyricLineEnds: currentLocalURL
+                    .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
+        }
+        let candidates = selector.lastPick.enumerated().map { index, candidate in
+            AutoMixDebugCandidate(
+                id: candidate.track.id, title: candidate.track.name,
+                tier: candidate.score.tier.label,
+                tempo: candidate.score.tempoAffinity, key: candidate.score.keyAffinity,
+                style: candidate.score.styleAffinity, energy: candidate.score.energyContinuity,
+                aging: candidate.score.aging, samePenalty: candidate.score.sameArtistPenalty,
+                total: candidate.score.total, chosen: index == 0)
+        }
+        let state: String
+        if !playNextList.isEmpty {
+            state = "stood down — a manual “play next” is sovereign"
+        } else if autoMixPickCommitted {
+            state = "decided"
+        } else if currentAnalysis == nil {
+            state = "waiting for the playing track's own analysis"
+        } else {
+            state = "choosing"
+        }
+        AutoMixDebugModel.shared.setOrder(AutoMixDebugOrder(
+            mode: queueOrder.rawValue, state: state,
+            poolSize: pool.count,
+            analyzed: pool.filter(selector.hasAnalysis).count,
+            deadline: duration > 0 ? autoMixDeadline : nil,
+            candidates: candidates))
     }
 
     private func publishDebugPlan(_ planned: PlannedTransition, next: PrefetchedNext) {

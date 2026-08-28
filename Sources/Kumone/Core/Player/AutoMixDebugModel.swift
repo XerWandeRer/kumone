@@ -125,6 +125,45 @@ struct AutoMixDebugPlan: Equatable {
     var inPointSource: String?
 }
 
+/// One row of the queue-order candidate table: a track the selector scored,
+/// with the score broken into the terms that produced it.
+///
+/// A bare total is not reviewable — "why did it pick that one" is answered by
+/// seeing which term carried the decision, and whether the tier or the aging
+/// did it.
+struct AutoMixDebugCandidate: Identifiable, Equatable {
+    /// The track ID: stable across ticks, so SwiftUI keeps rows in place while
+    /// the scores move under them.
+    let id: Int
+    var title: String
+    var tier: String
+    var tempo: Double
+    var key: Double
+    var style: Double
+    var energy: Double
+    var aging: Double
+    var samePenalty: Double
+    var total: Double
+    /// The one the selector took (or would take right now, while it is still
+    /// choosing).
+    var chosen: Bool
+}
+
+/// The "Queue order" group: what the AutoMix order is choosing between.
+struct AutoMixDebugOrder: Equatable {
+    /// listed / shuffled / autoMix.
+    var mode = "listed"
+    /// "choosing", "decided", or why neither applies.
+    var state = "off"
+    /// Candidates in the pool, and how many of them have an analysis in hand.
+    var poolSize = 0
+    var analyzed = 0
+    /// Playback position by which the pick is made regardless.
+    var deadline: TimeInterval?
+    /// Best first.
+    var candidates: [AutoMixDebugCandidate] = []
+}
+
 /// The stem pre-render's own little state machine, mirrored from
 /// `PlayerService.updateStemPrerender`.
 enum AutoMixPrerenderState: Equatable {
@@ -229,6 +268,7 @@ struct AutoMixDebugSnapshot: Equatable {
     var now = AutoMixDebugNow()
     var next = AutoMixDebugNext()
     var plan: AutoMixDebugPlan?
+    var order = AutoMixDebugOrder()
     var prerender = AutoMixPrerenderState.idle
     /// Newest first; the last three seams.
     var seams: [AutoMixDebugSeam] = []
@@ -338,6 +378,15 @@ final class AutoMixDebugModel: ObservableObject {
         // fields are only meaningful together with the title above them.
         if live.next.title != title { live.next = AutoMixDebugNext(title: title) }
         live.next.stage = stage
+        publish()
+    }
+
+    /// Test hook: the queue-order group as recorded, without opening a window.
+    var currentOrderForTesting: AutoMixDebugOrder { live.order }
+
+    func setOrder(_ order: AutoMixDebugOrder) {
+        guard live.order != order else { return }
+        live.order = order
         publish()
     }
 
