@@ -398,6 +398,206 @@ struct TransitionSegmentTests {
         #expect(doubled.isEmpty,
                 "two sources were at full level at once at \(doubled.map { Double($0) / 10 })")
     }
+
+    // MARK: - Rate and pad hygiene across the splice
+
+    /// **The splice has to leave both decks as clean as the live overlap does.**
+    ///
+    /// Every rate/pad test in the suite drives the *live* hand-over. The
+    /// segment path reaches the same two decks by a completely different route
+    /// — `beginOverlapLocked` never runs, so the incoming deck is never bent or
+    /// padded by the engine at all (its rate restore is rendered *into* the
+    /// audio), and the outgoing deck is bent by the pre-seam glide and then
+    /// retired by `retireOutgoingForSegmentLocked`, which deliberately stops
+    /// short of `resetDeckLocked` so an abort can resume it. That leaves a
+    /// window where the deck is stopped, still loaded, and still carrying the
+    /// pad bookkeeping of a bend that is over.
+    ///
+    /// So: run a beat-matched seam through the segment, on 0 dBFS masters so
+    /// both decks really owe a headroom pad, and ask the deck the segment
+    /// replaced and the deck that took over the same questions the live path is
+    /// held to — by polling, because a stale glide target is re-applied by a
+    /// later tick and never by the first one.
+    @Test func theSegmentSplicePathKeepsBothDecksClean() throws {
+        guard audioOutputAvailable else { return }
+        enum Ending: String, CaseIterable {
+            /// The splice runs to its own end and hands back normally.
+            case completes
+            /// Torn down while the segment is sounding.
+            case cancelledMidSegment
+            /// The deck the segment replaced is put back on the air *after*
+            /// `retireOutgoingForSegmentLocked` has stopped it but before the
+            /// splice finishes — the one window where a retired deck is
+            /// stopped, still loaded, and never reset.
+            case playRetiredDeckMidSegment
+        }
+        /// Worst reading seen on one deck across a poll.
+        ///
+        /// The pad is judged on where it is *heading* and on whether it got any
+        /// deeper, never on its absolute value — an aborted splice puts the
+        /// outgoing deck back on the air still wearing the pad its bend needed,
+        /// and letting go of that at an inaudible 0.3 dB/s is the design, so
+        /// 6.5 dB takes 21 s to walk off and any absolute check just measures
+        /// how long the test waited. What must be true is that it is on its way
+        /// to zero and nothing is pushing it back down.
+        struct Worst: CustomStringConvertible {
+            var rateDeviation: Float = 0
+            var padTargetDB: Double = 0
+            var firstPadDB: Double?
+            var padDB: Double = 0
+            var padDeepenedBy: Double = 0
+            var neutral = true
+            var volume: Float = 0
+            var description: String {
+                "rate 1±\(rateDeviation), pad \(padDB) dB → \(padTargetDB) dB "
+                    + "(deepened \(padDeepenedBy) dB), effectsNeutral \(neutral), "
+                    + "volume \(volume)"
+            }
+        }
+
+        // A bent seam with a real pre-seam glide: the ramp window sits at
+        // [outPoint − handoff − lead, outPoint − handoff] = [3.5, 5.5] on the
+        // outgoing track, and the splice takes over at 5.5.
+        let beat = BeatMatchedPlan(
+            outPoint: 6, inPoint: 1, overlapBars: 4,
+            outgoingRate: 0.96, incomingRate: 1.05,
+            bassSwapOffset: 1.5, overlapDuration: 3,
+            rampLeadSeconds: 2, rampReleaseSeconds: 2)
+        var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+        style.stemTechnique = .vocalDuck(depthDB: -9)
+        let planned = PlannedTransition(plan: .beatMatched(beat), style: style)
+        var req = request(planned)
+        req.planned = planned
+        let segment = try TransitionSegmentRenderer.render(req, provider: silentVocals)
+
+        for ending in Ending.allCases {
+            let result = withWatchdog("spliceHygiene-\(ending.rawValue)",
+                                      timeout: 70) { () -> [(String, Deck, Worst)]? in
+                var observations: [(String, Deck, Worst)] = []
+                let engine = PlaybackEngine()
+                let events = SegmentEventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: SegmentFixtures.outgoing, on: .a,
+                                            peakDBFS: 0)) != nil,
+                      (try? engine.loadFile(at: SegmentFixtures.incoming, on: .b,
+                                            peakDBFS: 0)) != nil
+                else { return nil }
+                engine.outputVolume = 0
+
+                func poll(_ label: String, seconds: TimeInterval) {
+                    var worst: [Deck: Worst] = [.a: Worst(), .b: Worst()]
+                    let deadline = Date().addingTimeInterval(seconds)
+                    while Date() < deadline {
+                        for deck in [Deck.a, Deck.b] {
+                            let s = engine.effectSnapshot(of: deck)
+                            var w = worst[deck]!
+                            w.rateDeviation = max(w.rateDeviation, abs(s.rate - 1))
+                            if abs(s.ratePadTargetDB) > abs(w.padTargetDB) {
+                                w.padTargetDB = s.ratePadTargetDB
+                            }
+                            let first = w.firstPadDB ?? s.ratePadDB
+                            w.firstPadDB = first
+                            w.padDeepenedBy = max(w.padDeepenedBy, first - s.ratePadDB)
+                            w.padDB = s.ratePadDB
+                            w.neutral = w.neutral && s.effectsAreNeutral
+                            w.volume = s.volume
+                            worst[deck] = w
+                        }
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                    for deck in [Deck.a, Deck.b] {
+                        observations.append((label, deck, worst[deck]!))
+                    }
+                }
+
+                // Start inside the pre-seam ramp's approach so deck A is really
+                // bent and padded by the time the splice takes over.
+                engine.play(deck: .a, from: 3.0)
+                engine.scheduleTransition(planned, from: .a, to: .b)
+                Thread.sleep(forTimeInterval: 0.3)
+                engine.armTransitionSegment(segment)
+                guard engine.hasArmedSegment else { return nil }
+
+                // Teeth: everything below is only worth asserting if the deck
+                // the segment is about to replace really is bent and padded
+                // when it hands over. Recorded, not assumed — a plan whose ramp
+                // silently resolved away would make every check that follows
+                // pass by doing nothing.
+                Thread.sleep(forTimeInterval: 1.2)
+                let bent = engine.effectSnapshot(of: .a)
+                observations.append(("\(ending.rawValue)/PRE-SPLICE BEND", .a, Worst(
+                    rateDeviation: abs(bent.rate - 1), padTargetDB: bent.ratePadTargetDB,
+                    padDB: bent.ratePadDB, neutral: bent.effectsAreNeutral,
+                    volume: bent.volume)))
+
+                switch ending {
+                case .completes:
+                    guard events.wait(timeout: 25, for: {
+                        if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }) else { return nil }
+                case .cancelledMidSegment, .playRetiredDeckMidSegment:
+                    // Wait until the segment is actually sounding and past its
+                    // head crossfade, i.e. deck A has been retired.
+                    let deadline = Date().addingTimeInterval(20)
+                    while Date() < deadline, !engine.segmentIsPlaying {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                    guard engine.segmentIsPlaying else { return nil }
+                    Thread.sleep(forTimeInterval: 1.2)
+                    if ending == .playRetiredDeckMidSegment {
+                        engine.play(deck: .a, from: 1.0)
+                    } else {
+                        engine.cancelScheduledTransition()
+                    }
+                }
+
+                // Let every release the teardown started run its course.
+                let settle = Date().addingTimeInterval(14)
+                while Date() < settle, engine.hasPendingTransition {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                Thread.sleep(forTimeInterval: 1.0)
+                poll("\(ending.rawValue)/after the splice", seconds: 1.5)
+
+                // The alternation check: the next track lands on whichever deck
+                // is spent, and must not inherit anything from this seam.
+                let spent: Deck = ending == .completes ? .a : .b
+                guard (try? engine.loadFile(at: SegmentFixtures.outgoing, on: spent,
+                                            peakDBFS: 0)) != nil else { return observations }
+                engine.play(deck: spent, from: 0.5)
+                poll("\(ending.rawValue)/next track on \(spent)", seconds: 1.5)
+                return observations
+            }
+            guard let observations = result ?? nil else { continue }
+
+            for (label, deck, worst) in observations {
+                let here = "\(label): deck \(deck)"
+                if label.hasSuffix("PRE-SPLICE BEND") {
+                    // The inverse assertion, and the reason the rest mean
+                    // anything: this deck must be genuinely bent and padded on
+                    // its way into the splice.
+                    let toothless = "\(here) was never bent or padded on its way into "
+                        + "the splice, so every hygiene check below passes vacuously "
+                        + "— the plan's tempo ramp or headroom pad resolved away (\(worst))"
+                    #expect(worst.rateDeviation > 0.005 && worst.padDB < -0.05,
+                            "\(toothless)")
+                    continue
+                }
+                let detuned = "\(here) is detuned — the splice left the phase vocoder "
+                    + "engaged on a deck nothing is bending (\(worst))"
+                let aiming = "\(here) is still aiming at a headroom pad from the seam "
+                    + "the segment carried (\(worst))"
+                let held = "\(here) is being padded *down* — a headroom pad is being "
+                    + "acquired by a deck the splice is no longer bending (\(worst))"
+                let coloured = "\(here) has a chain the splice never handed back (\(worst))"
+                #expect(worst.rateDeviation < 0.001, "\(detuned)")
+                #expect(abs(worst.padTargetDB) < 0.001, "\(aiming)")
+                #expect(worst.padDeepenedBy < 0.001, "\(held)")
+                #expect(worst.neutral, "\(coloured)")
+            }
+        }
+    }
 }
 
 } // extension PlaybackEngineSmokeTests

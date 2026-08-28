@@ -821,6 +821,13 @@ final class PlaybackEngine: @unchecked Sendable {
     /// Test hook: is a pre-rendered segment armed for the pending transition?
     var hasArmedSegment: Bool { queue.sync { transition?.segment != nil } }
 
+    /// Test hook: is a pre-rendered segment currently carrying the hand-over?
+    /// The phase a test has to wait for before it can say anything about the
+    /// deck the segment replaced — `retireOutgoingForSegmentLocked` runs inside
+    /// it, and that is the one window where a deck is stopped, still loaded and
+    /// not yet reset.
+    var segmentIsPlaying: Bool { queue.sync { transition?.phase == .segmentPlaying } }
+
     /// Snapshot of one deck's fader + effect parameters. Test hook: the only
     /// way to assert that a transition left the reused deck neutral.
     struct DeckEffectSnapshot: Sendable, Equatable {
@@ -2251,6 +2258,19 @@ final class PlaybackEngine: @unchecked Sendable {
     /// The outgoing deck has been crossfaded away. Stopped and silenced, but
     /// deliberately **not** `resetDeckLocked`: its file stays loaded so an
     /// aborted splice can resume normal playback from the mapped position.
+    ///
+    /// **Why it can leave the ride/pad bookkeeping alone.** This deck was bent
+    /// and padded by the pre-seam glide, and nothing here hands either back —
+    /// which is safe only because two other things always do, between them
+    /// covering every way out of the splice. The completing path is
+    /// `finishSegmentLocked`, which calls `resetDeckLocked` on this deck a few
+    /// lines later. Every *other* path goes through the `transition` setter, and
+    /// `endTempoRampLocked` still fires there because `rampActive` is untouched
+    /// on the segment path: only `beginOverlapLocked` clears that flag, and a
+    /// spliced hand-over never runs it. So an abort resumes this deck with its
+    /// rate at unity and its pad already gliding home, and a completion resets
+    /// it outright. Leaving the deck stopped-but-loaded here is what makes the
+    /// abort possible; the invariant is what makes it clean.
     private func retireOutgoingForSegmentLocked(_ state: DeckState) {
         state.generation += 1   // orphan the completion the stop fires
         hardSilenceFaderLocked(state)
