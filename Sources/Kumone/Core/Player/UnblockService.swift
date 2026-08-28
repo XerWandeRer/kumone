@@ -22,11 +22,14 @@ enum UnblockService {
         if let url = await pyncmd(track) {
             return Resolved(url: url, source: "pyncmd")
         }
-        if let url = await kuwo(track) {
-            return Resolved(url: url, source: String(localized: "酷我音乐"))
-        }
+        // kugou before kuwo: kuwo's convert_url increasingly serves a
+        // "请在酷我音乐APP播放" promo clip instead of the real audio, so keep it
+        // as the last resort rather than the first fallback (#44).
         if let url = await kugou(track) {
             return Resolved(url: url, source: String(localized: "酷狗音乐"))
+        }
+        if let url = await kuwo(track) {
+            return Resolved(url: url, source: String(localized: "酷我音乐"))
         }
         return nil
     }

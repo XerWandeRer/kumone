@@ -48,6 +48,7 @@ struct SettingsView: View {
                 }
                 #endif
                 Toggle("显示歌词翻译", isOn: $settings.showLyricsTranslation)
+                Toggle("逐字歌词（卡拉OK）", isOn: $settings.verbatimLyrics)
                 Toggle("显示日文歌词罗马音", isOn: $settings.showLyricsRomaji)
                 Text("日文歌词上方显示罗马音，缺少官方罗马音时自动生成读音")
                     .font(.caption)
@@ -94,6 +95,13 @@ struct SettingsView: View {
                     Text("未登录")
                         .foregroundStyle(.secondary)
                 }
+            }
+
+            Section("更新") {
+                Toggle("启动时自动检查更新", isOn: $settings.autoCheckUpdates)
+                Text("关闭后启动不再自动弹出更新提示，仍可手动检查更新")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("关于") {

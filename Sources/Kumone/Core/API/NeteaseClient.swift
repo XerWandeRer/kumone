@@ -142,7 +142,8 @@ final class NeteaseClient: @unchecked Sendable {
 
     /// POST to `https://interface.music.163.com/eapi<path>` with eapi encryption.
     /// The digest is computed over the corresponding `/api<path>` path.
-    func eapi(_ path: String, _ payload: [String: Any] = [:]) async throws -> Data {
+    func eapi(_ path: String, _ payload: [String: Any] = [:],
+              cookieOverrides: [String: String] = [:]) async throws -> Data {
         let apiPath = "/api" + path
         var body = payload
         var header: [String: String] = [
@@ -169,7 +170,8 @@ final class NeteaseClient: @unchecked Sendable {
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("https://music.163.com", forHTTPHeaderField: "Referer")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.setValue(cookieHeader(extra: ["os": "pc", "appver": "3.1.17"]), forHTTPHeaderField: "Cookie")
+        request.setValue(cookieHeader(extra: ["os": "pc", "appver": "3.1.17"], overrides: cookieOverrides),
+                         forHTTPHeaderField: "Cookie")
         request.httpBody = Self.encodeForm(form)
         return try await perform(request)
     }

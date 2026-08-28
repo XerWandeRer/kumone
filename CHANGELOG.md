@@ -6,6 +6,68 @@
 section the English bullets come first, followed by their Simplified Chinese
 counterparts. 段落格式：`## <版本号> - <日期>`，条目必须写成单行。
 
+## 0.3.12 - 2026-08-27
+
+### Improved / 改进
+
+- **iOS + macOS**: stronger contrast for karaoke (逐字) lyrics — unsung characters are dimmer, so the word-by-word highlight is more obvious. Only songs that have NetEase verbatim (`yrc`) lyrics show it; others keep line-level highlighting.
+- **iOS + macOS**：逐字歌词（卡拉OK）对比度加强——未唱的字更暗，逐字高亮更明显。仅对有网易云逐字歌词（`yrc`）的歌曲生效，其余保持整行高亮。
+
+## 0.3.11 - 2026-08-27
+
+### Added / 新增
+
+- Karaoke (word-by-word) lyrics: when a song has NetEase verbatim (`yrc`) lyrics, the active line highlights character by character — sung characters bright, the current one fading in, the rest dim — synced live to playback. Songs without verbatim lyrics keep line-level highlighting. New setting 逐字歌词（卡拉OK）, on by default.
+- 逐字歌词（卡拉OK）：当歌曲有网易云的逐字歌词（`yrc`）时，当前行会逐字高亮——已唱的字亮、正在唱的字渐亮、未唱的字暗——实时跟随播放。没有逐字歌词的歌曲保持整行高亮。设置新增「逐字歌词（卡拉OK）」，默认开启。
+
+### Fixed / 修复
+
+- iOS: turning off "启动时自动检查更新" now actually stops the launch update sheet — the 0.3.9 toggle's iOS gate had silently not been applied. (#42)
+- iOS：关闭「启动时自动检查更新」现在真的会停掉启动时的更新弹窗——0.3.9 那个开关的 iOS 侧判断此前未生效。（#42）
+
+## 0.3.10 - 2026-08-27
+
+### Added / 新增
+
+- iOS: an opt-in concise now-playing mode (简洁模式) alongside classic and immersive — focused artwork/lyrics/controls, tap-to-switch, draggable lyrics with seek, a half-screen queue, and an AirPlay entry. Default is unchanged (immersive). Thanks @AL-Pinecore (#41).
+- iOS：新增可选的「简洁模式」播放页（与经典/沉浸并列）——聚焦的封面/歌词/控制、点击切换、可拖动歌词并跳转、半屏队列、AirPlay 入口。默认仍是沉浸模式。感谢 @AL-Pinecore（#41）。
+- The four playing-indicator bars are now driven by the real audio spectrum (via MTAudioProcessingTap, with per-band adaptive windows); sources without a tappable stream keep the previous sine-wave animation. Thanks @XerWandeRer (#39, revisits #14).
+- 「正在播放」那一行的四根柱子现在由真实音频频谱驱动（MTAudioProcessingTap，每频段自适应窗口）；无法挂载 tap 的音源保持原有的正弦波动画。感谢 @XerWandeRer（#39，重启 #14）。
+
+### Fixed / 修复
+
+- iOS 26: an empty translucent block no longer appears above the tab bar when nothing is playing — the mini-player accessory was always attached; it is now attached only when there is a current track. (#35)
+- iOS 26：无歌曲播放时，Tab Bar 上方不再出现一个空的半透明块——迷你播放器的系统配件此前一直挂载，现在仅在有当前歌曲时才挂载。（#35）
+
+## 0.3.9 - 2026-08-27
+
+### Added / 新增
+
+- Settings → 更新: a "启动时自动检查更新" toggle. Off suppresses the launch update sheet on iOS and disables Sparkle's scheduled checks on macOS; manual check still works. (#42)
+- 设置 → 更新：新增「启动时自动检查更新」开关。关闭后 iOS 启动不再自动弹更新提示、macOS 停用 Sparkle 定时检查；仍可手动检查。（#42）
+
+### Fixed / 修复
+
+- macOS: clicking the Dock icon reopens the main window after it was closed (e.g. while desktop lyrics keeps the app running). Thanks @kitiho (#34, fixes #30).
+- macOS：主窗口关闭后（例如桌面歌词让 App 常驻时）点击 Dock 图标可重新打开主窗口。感谢 @kitiho（#34，修复 #30）。
+- iOS #31: the bottom mini-player text no longer turns white/unreadable after entering search — the accessory's colour scheme is pinned to the app appearance.
+- iOS #31：进入搜索后底部迷你播放条文字不再变白看不清——已把该控件的配色方案固定为 App 外观。
+- iOS #37: the volume slider in the now-playing page works again — a nested GeometryReader was silently swallowing the drag.
+- iOS #37：播放页的音量滑轨恢复可用——此前一个嵌套的 GeometryReader 把拖动吞掉了。
+- 最近播放（最近一周）now records plays: the client was sending only the `play` weblog and never the `startplay` one that writes the recent-plays list. Thanks @fanyuexiang for the root cause (#33).
+- 最近播放（最近一周）现在能记录了：客户端此前只发了 `play` 打卡、从未发写入「最近播放」列表的 `startplay`。感谢 @fanyuexiang 的根因分析（#33）。
+- Gray-track unblock tries 酷狗 before 酷我 — 酷我 increasingly returns a "请在酷我音乐APP播放" promo clip instead of the song, so it is now the last resort. (#44)
+- 灰色歌曲解锁改为先试酷狗再试酷我——酷我越来越多返回「请在酷我音乐APP播放」的提示音而非歌曲，现降为最后备选。（#44）
+
+### Improved / 改进
+
+- Performance: an idle, loaded home page no longer burns ~16% CPU. MarqueeText now animates a render-server CATextLayer instead of a forever SwiftUI animation; the active lyric line is computed once and published only on change; shelves use LazyHStack. Thanks @XerWandeRer (#38).
+- 性能：静止的首页不再持续占用约 16% CPU。跑马灯改为在 render server 侧的 CATextLayer 上做动画（不再是永不停止的 SwiftUI 动画）；当前歌词行集中计算、仅在换行时广播；货架改用 LazyHStack。感谢 @XerWandeRer（#38）。
+- iOS: best-effort now-playing hardening (declare the media session as audio) for the "can't tap back into the app from the system Now Playing / Dynamic Island" reports, which otherwise look like an iOS 26/27-beta issue. (#36, #40)
+- iOS：对「无法从系统正在播放 / 灵动岛点回 App」的问题做了尽力而为的加固（声明媒体会话为音频）；该问题很可能是 iOS 26/27 beta 的系统问题。（#36、#40）
+- CI: releases can auto-bump the Homebrew cask (guarded so a missing token can't fail a release). Thanks @Goooler (#43).
+- CI：发布可自动提交 Homebrew cask 版本更新（已加保护，缺 token 也不会让发布失败）。感谢 @Goooler（#43）。
+
 ## 0.3.8 - 2026-08-25
 
 ### Fixed / 修复

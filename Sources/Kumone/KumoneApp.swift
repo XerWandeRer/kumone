@@ -105,9 +105,15 @@ public struct KumoneApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static weak var shared: AppDelegate?
+
     private var keyMonitor: Any?
+    /// Installed by the SwiftUI main scene. Calling it recreates the scene
+    /// when its NSWindow was released after the user closed the last window.
+    var openMainWindow: (() -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Self.shared = self
         // Space toggles play/pause unless a text field is being edited.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             let noModifiers = event.modifierFlags
@@ -142,10 +148,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            sender.windows.first { $0.identifier?.rawValue.contains("main") ?? false }?
-                .makeKeyAndOrderFront(nil)
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows _: Bool) -> Bool {
+        // `hasVisibleWindows` includes helper windows such as desktop lyrics.
+        // If the WindowGroup has already released its NSWindow, use the
+        // SwiftUI scene action below to create it again.
+        if let mainWindow = sender.windows.first(where: {
+            $0.styleMask.contains(.titled) && $0.canBecomeMain
+        }), !mainWindow.isVisible {
+            mainWindow.makeKeyAndOrderFront(nil)
+        } else if !sender.windows.contains(where: {
+            $0.isVisible && $0.styleMask.contains(.titled) && $0.canBecomeMain
+        }) {
+            openMainWindow?()
         }
         return true
     }

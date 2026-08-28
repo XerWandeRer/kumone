@@ -412,6 +412,9 @@ final class PlaybackEngine: @unchecked Sendable {
     /// the transition timer on purpose — the release outlives the transition.
     private var rideTimer: DispatchSourceTimer?
     private var configObserver: NSObjectProtocol?
+    /// Set through `setOutputSampleSink`; kept so the tap can be put back after
+    /// a configuration change rebuilds the graph.
+    private var outputSampleSink: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     // MARK: - Init
 
@@ -954,6 +957,34 @@ final class PlaybackEngine: @unchecked Sendable {
 
     /// Test hook: whether any transition is still scheduled or running.
     var hasPendingTransition: Bool { queue.sync { transition != nil } }
+
+    /// Hand every buffer of the engine's final mixed output to `block`, for a
+    /// meter or an analyzer. Pass nil to stop.
+    ///
+    /// The tap sits on `mainMixerNode`'s output, so it hears both decks, the
+    /// pre-rendered segment and the user's volume — whatever a listener hears,
+    /// with no dependence on which deck is live or how a hand-over is running.
+    /// A tap does not touch the graph's connections, so this is safe at any
+    /// time; it is reinstalled after a configuration change, where the mixer's
+    /// format can move under it.
+    ///
+    /// `block` runs on a real-time audio thread: it must not allocate, lock or
+    /// hop actors, and it must not call back into the engine.
+    func setOutputSampleSink(_ block: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+        queue.sync {
+            outputSampleSink = block
+            installOutputSampleSinkLocked()
+        }
+    }
+
+    private func installOutputSampleSinkLocked() {
+        let mixer = engine.mainMixerNode
+        mixer.removeTap(onBus: 0)
+        guard let sink = outputSampleSink else { return }
+        mixer.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
+            sink(buffer)
+        }
+    }
 
     /// Test hook: report the peak magnitude one deck contributes to the mixer,
     /// once per render buffer.
@@ -2711,6 +2742,9 @@ final class PlaybackEngine: @unchecked Sendable {
         for state in deckStates.values {
             connectChainLocked(state, format: graphFormat)
         }
+        // The mixer's output format can have changed with the device; a tap
+        // left over from the old one would be a format mismatch.
+        installOutputSampleSinkLocked()
         let anyActive = deckStates.values.contains {
             if case .none = $0.source { return false }
             return true

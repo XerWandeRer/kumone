@@ -22,6 +22,11 @@ enum Theme {
     enum Layout {
         static let contentInset: CGFloat = 24
         static let cardSize: CGFloat = 160
+        /// Row height for a shelf of cover cards: artwork, then up to two lines
+        /// of title and one of subtitle.
+        static let coverShelfHeight: CGFloat = 226
+        /// Row height for a shelf of artist cards: circular artwork, one name.
+        static let artistShelfHeight: CGFloat = 196
         static let sidebarWidth: CGFloat = 220
         static let playerBarHeight: CGFloat = 56
         /// Gap between the floating player bar and the window's bottom edge.

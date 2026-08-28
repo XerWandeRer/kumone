@@ -153,7 +153,7 @@ struct HomeView: View {
             }
 
             if !model.recommendPlaylists.isEmpty {
-                Shelf(title: "推荐歌单") {
+                Shelf(title: "推荐歌单", rowHeight: Theme.Layout.coverShelfHeight) {
                     ForEach(Array(model.recommendPlaylists.prefix(12).enumerated()), id: \.element.id) { index, playlist in
                         playlistCard(playlist)
                             .staggeredAppearance(index: index, id: "home-rec-\(playlist.id)")
@@ -162,7 +162,7 @@ struct HomeView: View {
             }
 
             if !model.radarPlaylists.isEmpty {
-                Shelf(title: "雷达歌单") {
+                Shelf(title: "雷达歌单", rowHeight: Theme.Layout.coverShelfHeight) {
                     ForEach(model.radarPlaylists) { radar in
                         NavigationLink(value: Destination.playlist(radar.id)) {
                             CoverCardBody(
@@ -179,7 +179,7 @@ struct HomeView: View {
             }
 
             if !model.toplists.isEmpty {
-                Shelf(title: "排行榜", seeAll: nil) {
+                Shelf(title: "排行榜", seeAll: nil, rowHeight: Theme.Layout.coverShelfHeight) {
                     ForEach(model.toplists) { toplist in
                         NavigationLink(value: Destination.playlist(toplist.id)) {
                             toplistCard(toplist)
@@ -190,7 +190,7 @@ struct HomeView: View {
             }
 
             if !model.newAlbums.isEmpty {
-                Shelf(title: "新碟上架") {
+                Shelf(title: "新碟上架", rowHeight: Theme.Layout.coverShelfHeight) {
                     ForEach(model.newAlbums) { album in
                         albumCard(album)
                     }
@@ -198,7 +198,7 @@ struct HomeView: View {
             }
 
             if !model.topArtists.isEmpty {
-                Shelf(title: "推荐歌手") {
+                Shelf(title: "推荐歌手", rowHeight: Theme.Layout.artistShelfHeight) {
                     ForEach(model.topArtists) { artist in
                         artistCard(artist)
                     }

@@ -206,6 +206,8 @@ struct PlayOverlayButton: View {
         .opacity(visible ? 1 : 0)
         .scaleEffect(visible ? 1 : 0.7)
         .animation(AppAnimation.spring, value: visible)
+        // Opacity alone leaves it clickable while invisible.
+        .allowsHitTesting(visible)
         #else
         EmptyView()
         #endif
@@ -215,87 +217,223 @@ struct PlayOverlayButton: View {
 // MARK: - Marquee
 
 /// Scrolls text horizontally when it overflows, with faded edges.
+///
+/// Driven by Core Animation rather than SwiftUI. This view sits permanently in
+/// the player bar, and a `repeatForever` SwiftUI animation keeps the entire view
+/// graph re-rendering for as long as it runs — measured at ~15% of a core, for
+/// as long as the current title happened to be long enough to scroll. A
+/// `CABasicAnimation` is handed to the render server once and then costs this
+/// process nothing.
 struct MarqueeText: View {
     let text: String
-    var font: Font = .system(size: 13, weight: .medium)
-
-    @State private var textWidth: CGFloat = 0
-    @State private var containerWidth: CGFloat = 0
-    @State private var offset: CGFloat = 0
-    @State private var animating = false
-
-    private var needsMarquee: Bool { textWidth > containerWidth + 1 }
+    var fontSize: CGFloat = 13
+    var fontWeight: PlatformFont.Weight = .medium
 
     var body: some View {
-        GeometryReader { geo in
-            HStack(spacing: 32) {
-                marqueeLabel
-                if needsMarquee {
-                    marqueeLabel
-                }
-            }
-            .offset(x: offset)
-            .frame(maxHeight: .infinity, alignment: .leading)
-            .onAppear { containerWidth = geo.size.width }
-            .onChange(of: geo.size.width) { newValue in containerWidth = newValue }
-        }
-        .clipped()
-        .mask(edgeFadeMask)
-        .onChange(of: text) { _ in
-            restart()
-        }
-        .onChange(of: needsMarquee) { _ in
-            restart()
-        }
-        .background(
-            Text(text)
-                .font(font)
-                .fixedSize()
-                .hidden()
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.onAppear { textWidth = geo.size.width }
-                            .onChange(of: geo.size.width) { newValue in textWidth = newValue }
-                    }
-                )
-        )
-    }
-
-    private var marqueeLabel: some View {
-        Text(text)
-            .font(font)
-            .lineLimit(1)
-            .fixedSize()
-    }
-
-    private var edgeFadeMask: some View {
-        LinearGradient(
-            stops: [
-                .init(color: animating ? .clear : .black, location: 0),
-                .init(color: .black, location: animating ? 0.06 : 0),
-                .init(color: .black, location: needsMarquee ? 0.94 : 1),
-                .init(color: needsMarquee ? .clear : .black, location: 1),
-            ],
-            startPoint: .leading, endPoint: .trailing
-        )
-    }
-
-    private func restart() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            offset = 0
-            animating = false
-        }
-        guard needsMarquee, !Platform.isReduceMotionEnabled else { return }
-        let distance = textWidth + 32
-        let duration = Double(distance) / 24
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
-            guard needsMarquee else { return }
-            animating = true
-            withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
-                offset = -distance
-            }
-        }
+        MarqueeTextView.Representable(text: text, fontSize: fontSize, weight: fontWeight)
     }
 }
+
+final class MarqueeTextView: PlatformView {
+    /// Gap between the two copies of the text.
+    private static let gap: CGFloat = 32
+    /// Points per second.
+    private static let speed: CGFloat = 24
+    /// Pause before a new title starts travelling, so it can be read first.
+    private static let leadIn: CFTimeInterval = 1.6
+    private static let fadeFraction = 0.06
+
+    private let scroller = CALayer()
+    private let first = CATextLayer()
+    private let second = CATextLayer()
+    private let fade = CAGradientLayer()
+
+    private var text: String
+    private var fontSize: CGFloat
+    private var weight: PlatformFont.Weight
+    private var textWidth: CGFloat = 0
+    /// Guards against re-running layout on every display cycle: the host view
+    /// calls layout() each frame while an animation is in flight, and tearing
+    /// the animation down and rebuilding it there costs more than the SwiftUI
+    /// version ever did.
+    private var laidOutFor: CGSize = .zero
+    private var needsMarquee: Bool { textWidth > bounds.width + 1 }
+
+    /// `NSView.layer` is optional (needs `wantsLayer`); `UIView.layer` is not.
+    /// A single optional accessor lets the shared setup code work on both.
+    private var hostLayer: CALayer? { layer }
+
+    init(text: String, fontSize: CGFloat, weight: PlatformFont.Weight) {
+        self.text = text
+        self.fontSize = fontSize
+        self.weight = weight
+        super.init(frame: .zero)
+        #if os(macOS)
+        wantsLayer = true
+        #endif
+        hostLayer?.addSublayer(scroller)
+        scroller.addSublayer(first)
+        scroller.addSublayer(second)
+        hostLayer?.mask = fade
+        fade.startPoint = CGPoint(x: 0, y: 0.5)
+        fade.endPoint = CGPoint(x: 1, y: 0.5)
+        for textLayer in [first, second] {
+            textLayer.contentsScale = 2
+            textLayer.truncationMode = .none
+            textLayer.isWrapped = false
+        }
+        applyText()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    func update(text: String, fontSize: CGFloat, weight: PlatformFont.Weight) {
+        guard text != self.text || fontSize != self.fontSize || weight != self.weight else { return }
+        self.text = text
+        self.fontSize = fontSize
+        self.weight = weight
+        applyText()
+        relayout()
+    }
+
+    private var font: PlatformFont { .systemFont(ofSize: fontSize, weight: weight) }
+
+    private var labelColor: CGColor {
+        #if os(macOS)
+        return NSColor.labelColor.cgColor
+        #else
+        return UIColor.label.cgColor
+        #endif
+    }
+
+    private func applyText() {
+        let font = self.font
+        textWidth = (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        for textLayer in [first, second] {
+            textLayer.string = text
+            textLayer.font = font
+            textLayer.fontSize = fontSize
+            textLayer.foregroundColor = labelColor
+        }
+    }
+
+    #if os(macOS)
+    override func layout() {
+        super.layout()
+        guard bounds.size != laidOutFor else { return }
+        relayout()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // A CGColor is a snapshot; unlike a dynamic NSColor it won't follow the
+        // appearance on its own.
+        first.foregroundColor = labelColor
+        second.foregroundColor = labelColor
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        let scale = window?.backingScaleFactor ?? 2
+        first.contentsScale = scale
+        second.contentsScale = scale
+        relayout()
+    }
+    #else
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.size != laidOutFor else { return }
+        relayout()
+    }
+
+    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+        super.traitCollectionDidChange(previous)
+        first.foregroundColor = labelColor
+        second.foregroundColor = labelColor
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        let scale = window?.screen.scale ?? 2
+        first.contentsScale = scale
+        second.contentsScale = scale
+        relayout()
+    }
+    #endif
+
+    private func relayout() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        laidOutFor = bounds.size
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        let lineHeight = ceil(font.ascender - font.descender)
+        let y = ((bounds.height - lineHeight) / 2).rounded()
+        first.frame = CGRect(x: 0, y: y, width: textWidth, height: lineHeight)
+        second.frame = CGRect(x: textWidth + Self.gap, y: y, width: textWidth, height: lineHeight)
+        second.isHidden = !needsMarquee
+        scroller.anchorPoint = .zero
+        scroller.bounds = CGRect(x: 0, y: 0,
+                                 width: textWidth * 2 + Self.gap, height: bounds.height)
+        scroller.position = .zero
+        fade.frame = bounds
+        fade.colors = fadeColors()
+        fade.locations = fadeLocations()
+
+        CATransaction.commit()
+        restartAnimation()
+    }
+
+    private func fadeColors() -> [CGColor] {
+        let opaque = PlatformColor.black.cgColor
+        let clear = PlatformColor.black.withAlphaComponent(0).cgColor
+        guard needsMarquee else { return [opaque, opaque, opaque, opaque] }
+        return [clear, opaque, opaque, clear]
+    }
+
+    private func fadeLocations() -> [NSNumber] {
+        guard needsMarquee else { return [0, 0, 1, 1] }
+        return [0, NSNumber(value: Self.fadeFraction),
+                NSNumber(value: 1 - Self.fadeFraction), 1]
+    }
+
+    private func restartAnimation() {
+        scroller.removeAnimation(forKey: "marquee")
+        guard needsMarquee, !Platform.isReduceMotionEnabled else { return }
+
+        let distance = textWidth + Self.gap
+        let animation = CABasicAnimation(keyPath: "position.x")
+        animation.byValue = -distance
+        animation.duration = CFTimeInterval(distance / Self.speed)
+        animation.repeatCount = .infinity
+        animation.isRemovedOnCompletion = false
+        animation.beginTime = CACurrentMediaTime() + Self.leadIn
+        scroller.add(animation, forKey: "marquee")
+    }
+
+    // MARK: Bridge
+
+    struct Representable: PlatformViewRepresentable {
+        let text: String
+        let fontSize: CGFloat
+        let weight: PlatformFont.Weight
+
+        #if os(macOS)
+        func makeNSView(context: Context) -> MarqueeTextView {
+            MarqueeTextView(text: text, fontSize: fontSize, weight: weight)
+        }
+        func updateNSView(_ view: MarqueeTextView, context: Context) {
+            view.update(text: text, fontSize: fontSize, weight: weight)
+        }
+        #else
+        func makeUIView(context: Context) -> MarqueeTextView {
+            MarqueeTextView(text: text, fontSize: fontSize, weight: weight)
+        }
+        func updateUIView(_ view: MarqueeTextView, context: Context) {
+            view.update(text: text, fontSize: fontSize, weight: weight)
+        }
+        #endif
+    }
+}
+

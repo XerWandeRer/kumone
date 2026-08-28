@@ -118,13 +118,13 @@ private struct DesktopLyricsSurface: View {
 
 private struct DesktopLyricsBox: View {
     @EnvironmentObject private var player: PlayerService
-    @ObservedObject private var clock = PlayerService.shared.clock
+    @ObservedObject private var lyricsCursor = PlayerService.shared.lyricsCursor
     @EnvironmentObject private var settings: SettingsManager
 
     private var currentLine: LyricLine? {
-        guard player.isPlaying || clock.progress > 0,
+        guard player.isPlaying || PlayerService.shared.progress > 0,
               let lyrics = player.lyrics, !lyrics.isEmpty,
-              let index = lyrics.activeIndex(at: clock.progress + 0.2) else { return nil }
+              let index = lyricsCursor.activeIndex else { return nil }
         return lyrics.lines[index]
     }
 

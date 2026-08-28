@@ -177,18 +177,41 @@ enum NeteaseAPI {
         _ = try await weapi(CodeOnly.self, "/cloud/del", ["songIds": "[\(id)]"])
     }
 
-    static func scrobble(trackID: Int, sourceID: Int, seconds: Int) async {
-        let log: [[String: Any]] = [[
+    /// `startplay` weblog — writes the song into the 最近播放 (recent-plays)
+    /// list. NetEase needs this *and* the `play` weblog; sending only `play`
+    /// (as before) bumped the listening ranking but never wrote 最近播放 (#33).
+    static func scrobbleStart(trackID: Int, sourceID: Int) async {
+        await sendWeblog([[
+            "action": "startplay",
+            "json": [
+                "id": trackID, "type": "song",
+                "mainsite": "1", "mainsiteWeb": "1",
+                "content": "id=\(sourceID)",
+            ],
+        ]])
+    }
+
+    /// `play` weblog — increments the listening-ranking play count and time.
+    static func scrobbleFinish(trackID: Int, sourceID: Int, seconds: Int) async {
+        await sendWeblog([[
             "action": "play",
             "json": [
                 "download": 0, "end": "playend", "id": trackID,
                 "sourceId": String(sourceID), "time": seconds,
                 "type": "song", "wifi": 0, "source": "list",
+                "mainsite": "1", "mainsiteWeb": "1",
+                "content": "id=\(sourceID)",
             ],
-        ]]
+        ]])
+    }
+
+    /// Routed via eapi with the desktop-client cookie (`os=osx`) to match the
+    /// reference scrobble implementation.
+    private static func sendWeblog(_ log: [[String: Any]]) async {
         guard let data = try? JSONSerialization.data(withJSONObject: log),
               let logs = String(data: data, encoding: .utf8) else { return }
-        _ = try? await client.weapi("/feedback/weblog", ["logs": logs])
+        _ = try? await client.eapi("/feedback/weblog", ["logs": logs],
+                                   cookieOverrides: ["os": "osx"])
     }
 
     // MARK: - Playlists
@@ -365,8 +388,17 @@ enum NeteaseAPI {
     }
 
     static func lyric(id: Int) async throws -> LyricResponse {
-        try await weapi(LyricResponse.self, "/song/lyric",
-                        ["id": id, "lv": -1, "kv": -1, "tv": -1, "rv": -1])
+        // `/song/lyric/v1` also returns verbatim (word-by-word) `yrc`. Fall back
+        // to the classic endpoint if it yields nothing usable, so plain lyrics
+        // never regress.
+        if let v1 = try? await weapi(LyricResponse.self, "/song/lyric/v1",
+            ["id": id, "cp": false,
+             "lv": 0, "kv": 0, "tv": 0, "rv": 0, "yv": 0, "ytv": 0, "yrv": 0]),
+            (v1.lrc?.lyric?.isEmpty == false) || (v1.yrc?.lyric?.isEmpty == false) {
+            return v1
+        }
+        return try await weapi(LyricResponse.self, "/song/lyric",
+                               ["id": id, "lv": -1, "kv": -1, "tv": -1, "rv": -1])
     }
 
     struct FMResponse: Decodable {

@@ -93,6 +93,18 @@ final class PlaybackClock: ObservableObject {
     @Published var progress: TimeInterval = 0
 }
 
+/// Which lyric line is current.
+///
+/// Every lyric view used to derive this itself, which meant observing the clock
+/// and re-rendering on every tick just to discover the line hadn't changed —
+/// and for the now-playing page, whose body is the whole immersive layout, that
+/// was five full re-evaluations a second. Computing it once here and publishing
+/// only on a change turns that into one re-render per lyric line.
+@MainActor
+final class LyricsCursor: ObservableObject {
+    @Published var activeIndex: Int?
+}
+
 @MainActor
 final class PlayerService: ObservableObject {
     static let shared = PlayerService()
@@ -112,6 +124,7 @@ final class PlayerService: ObservableObject {
     @Published private(set) var unblockSource: String?
     @Published private(set) var isTrial = false
     let clock = PlaybackClock()
+    let lyricsCursor = LyricsCursor()
     /// Passthrough to the clock so existing `progress` reads/writes keep working.
     var progress: TimeInterval {
         get { clock.progress }
@@ -164,6 +177,18 @@ final class PlayerService: ObservableObject {
     private var currentCacheKey: AudioCache.Key?
     private var currentRemoteURL: URL?
     private var progressTimer: Timer?
+
+    /// Live playback position straight off the deck, for smooth per-frame
+    /// karaoke highlighting (the published `progress` is intentionally coarse —
+    /// it only moves when the scrubber would visibly move).
+    ///
+    /// Falls back to `progress` whenever no deck is carrying a source, so a
+    /// paused or unloaded player still reports where the playhead sits.
+    var livePlaybackTime: TimeInterval {
+        guard deckLoaded else { return progress }
+        let t = engine.position(of: activeDeck)
+        return t.isFinite ? t : progress
+    }
     private var resolveGeneration = 0
     /// True while the engine is paused by us (togglePlayPause/pause/
     /// interruption). When false, "resume" must re-issue play() instead —
@@ -202,12 +227,21 @@ final class PlayerService: ObservableObject {
     private var currentLyricLRC: String?
     private var consecutiveFailures = 0
     private var scrobbled = false
+    private var startScrobbled = false
 
     private init() {
         volume = UserDefaults.standard.object(forKey: "player.volume") as? Float ?? 0.8
         engine.outputVolume = volume
         repeatMode = UserDefaults.standard.string(forKey: "player.repeat")
             .flatMap(RepeatMode.init) ?? .off
+
+        // The playing indicator's band levels, straight off the engine's mixer:
+        // installed once here and never touched again, so no track change, seek
+        // or hand-over has to think about it. The closure runs on the audio
+        // thread and only writes floats into a preallocated store.
+        engine.setOutputSampleSink { buffer in
+            AudioSpectrum.shared.ingest(buffer)
+        }
 
         #if os(iOS)
         // The engine configures the AVAudioSession lazily on first start.
@@ -246,7 +280,17 @@ final class PlayerService: ObservableObject {
                 if AutoMixDebugModel.shared.isActive { self.publishDebugNow() }
                 guard self.isPlaying, self.deckLoaded, !self.isScrubbing else { return }
                 let seconds = self.engine.position(of: self.activeDeck)
-                if seconds.isFinite, abs(seconds - self.progress) > 0.05 {
+                guard seconds.isFinite else { return }
+
+                // Lyrics need this cadence to stay in sync; the cursor itself
+                // only publishes when the line actually changes.
+                self.updateLyricsCursor(at: seconds)
+
+                // The scrubber does not. Publishing the position every tick
+                // re-renders it — and SwiftUI rebuilds the display list for the
+                // whole tree each time — to move the thumb a fraction of a
+                // pixel. Half a second is still smoother than the eye needs.
+                if abs(seconds - self.progress) > 0.45 {
                     self.progress = seconds
                     NowPlayingManager.shared.updateElapsed(seconds, rate: 1)
                 }
@@ -355,6 +399,7 @@ final class PlayerService: ObservableObject {
             engine.pause()
             enginePaused = true
             isPlaying = false
+            AudioSpectrum.shared.reset()
         } else if !deckLoaded {
             // Restored session: re-resolve the source.
             startPlaying(track, indexUnchanged: true)
@@ -376,6 +421,7 @@ final class PlayerService: ObservableObject {
         engine.pause()
         enginePaused = true
         isPlaying = false
+        AudioSpectrum.shared.reset()
         NowPlayingManager.shared.updateElapsed(progress, rate: 0)
     }
 
@@ -401,7 +447,19 @@ final class PlayerService: ObservableObject {
         startPlaying(activeQueue[idx])
     }
 
-    func seek(to seconds: TimeInterval) {
+    /// Recomputes the current lyric line, publishing only on a change.
+    /// The lead makes a line light up just before it is sung.
+    private func updateLyricsCursor(at seconds: TimeInterval) {
+        let index = lyrics?.activeIndex(at: seconds + 0.2)
+        if index != lyricsCursor.activeIndex {
+            lyricsCursor.activeIndex = index
+        }
+    }
+
+    /// `completion` runs once the playhead is at `seconds`. The engine seeks
+    /// synchronously, so it runs before this returns — the parameter exists for
+    /// the AVPlayer-shaped call sites in the UI.
+    func seek(to seconds: TimeInterval, completion: (@MainActor () -> Void)? = nil) {
         // An armed/overlapping hand-over is anchored to the old timeline —
         // cancel it, seek, then re-arm from the prefetched file.
         //
@@ -413,9 +471,11 @@ final class PlayerService: ObservableObject {
         let wasArmed = transitionArmed
         if wasArmed { disarmTransition() }
         progress = seconds
+        updateLyricsCursor(at: seconds)
         engine.seek(deck: activeDeck, to: seconds)
         NowPlayingManager.shared.updateElapsed(seconds, rate: isPlaying ? 1 : 0)
         if wasArmed { armTransitionIfReady() }
+        completion?()
     }
 
     func toggleShuffle() {
@@ -437,6 +497,26 @@ final class PlayerService: ObservableObject {
         // Repeat-one forbids auto hand-overs; the other modes change what
         // comes after the final queue entry.
         schedulePrefetch()
+    }
+
+    /// Single-button mode cycle for the iOS minimal transport row:
+    /// sequential → loop all → loop one → shuffle → sequential.
+    func cyclePlaybackMode() {
+        guard !isFMMode else { return }
+        if shuffleEnabled {
+            toggleShuffle()
+            repeatMode = .off
+        } else {
+            switch repeatMode {
+            case .off:
+                repeatMode = .all
+            case .all:
+                repeatMode = .one
+            case .one:
+                repeatMode = .off
+                toggleShuffle()
+            }
+        }
     }
 
     /// Jump to a track in the upcoming list (queue panel click).
@@ -605,7 +685,13 @@ final class PlayerService: ObservableObject {
         lyrics = nil
         currentLyricLRC = nil
         scrobbled = false
+        startScrobbled = false
         isPlaying = true
+        lyricsCursor.activeIndex = nil
+        // Before the URL is even resolved: holds the bars still rather than
+        // letting them fall back to the decorative animation for the moment it
+        // takes to find out whether this source can be tapped.
+        AudioSpectrum.shared.beginPreparing()
         resolveGeneration += 1
         let generation = resolveGeneration
 
@@ -729,6 +815,8 @@ final class PlayerService: ObservableObject {
                 persistCurrentLyricsSidecar()
                 engine.play(deck: activeDeck, from: 0)
                 isPlaying = true
+                AudioSpectrum.shared.markTapped()
+                scrobbleStartIfNeeded(track)
                 duration = fileDuration
                 NowPlayingManager.shared.updateMetadata(for: track, duration: fileDuration)
                 ensureCurrentAnalysis(key: key, fileURL: local)
@@ -754,6 +842,8 @@ final class PlayerService: ObservableObject {
                               writingTo: partURL, on: activeDeck)
         engine.play(deck: activeDeck, from: 0)
         isPlaying = true
+        AudioSpectrum.shared.markTapped()
+        scrobbleStartIfNeeded(track)
 
         if let time = resolved.durationMS, time > 0 {
             duration = TimeInterval(time) / 1000
@@ -1104,7 +1194,10 @@ final class PlayerService: ObservableObject {
             cancelStemPrerender()
         }
         let splice = signature.outPoint - TransitionSegmentRenderer.handoff
-        let remaining = splice - progress
+        // The live playhead, not the published `progress`: that one is only
+        // republished when the scrubber would visibly move, so it can sit up to
+        // half a second behind — half a second of runway this decision spends.
+        let remaining = splice - livePlaybackTime
 
         switch stemPrerenderState {
         case .settled:
@@ -1351,6 +1444,7 @@ final class PlayerService: ObservableObject {
         let response = try? await NeteaseAPI.lyric(id: track.id)
         guard generation == resolveGeneration else { return }
         lyrics = response.map(LyricsParser.parse)
+        updateLyricsCursor(at: livePlaybackTime)
         currentLyricLRC = response?.lrc?.lyric
         persistCurrentLyricsSidecar()
     }
@@ -1407,7 +1501,7 @@ final class PlayerService: ObservableObject {
             title: currentTrack?.name,
             phase: debugPhaseLabel(),
             deck: activeDeck.rawValue.uppercased(),
-            position: progress,
+            position: livePlaybackTime,
             duration: duration,
             trimDB: loudnessTrimDB(for: currentAnalysis),
             analyzed: currentAnalysis != nil,
@@ -1592,13 +1686,24 @@ final class PlayerService: ObservableObject {
 
     // MARK: - Scrobble
 
+    /// Tell the server the track started, once per track. Called from the
+    /// point playback actually begins — the cache-hit path and the streaming
+    /// path both reach it, and `startPlaying` clears the flag.
+    private func scrobbleStartIfNeeded(_ track: Track) {
+        guard !startScrobbled else { return }
+        startScrobbled = true
+        let tid = track.id
+        let sid = source.sourceID
+        Task.detached { await NeteaseAPI.scrobbleStart(trackID: tid, sourceID: sid) }
+    }
+
     private func scrobbleIfNeeded(completed: Bool) {
         guard let track = currentTrack, !scrobbled, progress > 1 else { return }
         scrobbled = true
         let seconds = completed ? Int(duration) : Int(progress)
         let sourceID = source.sourceID
         Task.detached {
-            await NeteaseAPI.scrobble(trackID: track.id, sourceID: sourceID, seconds: seconds)
+            await NeteaseAPI.scrobbleFinish(trackID: track.id, sourceID: sourceID, seconds: seconds)
         }
     }
 

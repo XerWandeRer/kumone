@@ -1,6 +1,9 @@
 import SwiftUI
 
 struct MainWindow: View {
+#if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+#endif
     @EnvironmentObject private var player: PlayerService
     @EnvironmentObject private var account: AccountStore
     @EnvironmentObject private var settings: SettingsManager
@@ -50,6 +53,12 @@ struct MainWindow: View {
         .playerChrome(detailWidth: detailWidth)
         .environment(\.openLogin, { showLogin = true })
         .task {
+#if os(macOS)
+            // Keep this action in the app delegate: when the user closes the
+            // last WindowGroup window, there is no view left to receive a
+            // Dock reopen event directly.
+            AppDelegate.shared?.openMainWindow = { openWindow(id: "main") }
+#endif
             DesktopLyricsController.shared.sync(with: settings.showDesktopLyrics)
             await account.bootstrap()
         }

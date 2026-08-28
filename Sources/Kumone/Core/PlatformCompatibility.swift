@@ -4,6 +4,9 @@ import SwiftUI
 
 public typealias PlatformImage = NSImage
 public typealias PlatformColor = NSColor
+public typealias PlatformView = NSView
+public typealias PlatformFont = NSFont
+public typealias PlatformViewRepresentable = NSViewRepresentable
 
 public extension Image {
     init(platformImage: PlatformImage) {
@@ -59,6 +62,9 @@ import SwiftUI
 
 public typealias PlatformImage = UIImage
 public typealias PlatformColor = UIColor
+public typealias PlatformView = UIView
+public typealias PlatformFont = UIFont
+public typealias PlatformViewRepresentable = UIViewRepresentable
 
 public extension Image {
     init(platformImage: PlatformImage) {

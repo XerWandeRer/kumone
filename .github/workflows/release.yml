@@ -132,3 +132,23 @@ jobs:
             "dist/$APP_NAME-$VERSION.zip" \
             "dist/$APP_NAME-iOS-$VERSION.ipa" \
             dist/appcast.xml
+
+      - name: Bump Homebrew cask
+        # Best-effort: a missing GH_HOMEBREW_TOKEN (or a brew failure) must not
+        # fail the release — the app/IPA/appcast are already published above.
+        continue-on-error: true
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GH_HOMEBREW_TOKEN || secrets.HOMEBREW_GITHUB_API_TOKEN || secrets.GH_TOKEN || secrets.PAT }}
+        run: |
+          SHA="$(shasum -a 256 "dist/$APP_NAME-$VERSION.zip" | awk '{print $1}')"
+          git config --global user.email "41898282+github-actions@users.noreply.github.com"
+          git config --global user.name "github-actions"
+          brew update
+          brew tap owo-network/brew
+          brew bump-cask-pr \
+            --version="$VERSION" \
+            --sha256="$SHA" \
+            --no-browse \
+            --no-audit \
+            owo-network/brew/kumone
+

@@ -90,6 +90,18 @@ struct Shelf<Content: View>: View {
     let title: LocalizedStringKey
     var seeAll: (() -> Void)?
     var spacing: CGFloat = 16
+    /// Height of one row of cards.
+    ///
+    /// Supplying it lets the shelf build its cards lazily, which matters more
+    /// than it sounds: a plain `HStack` instantiates every card in the shelf and
+    /// keeps it in the responder tree, so hit testing walks all of them on every
+    /// frame of a *vertical* scroll — including the ones scrolled off the side
+    /// and never seen. Measured at roughly half the cost of scrolling the home
+    /// page. It has to be stated rather than measured because a `LazyHStack`
+    /// reports no height until something has been scrolled into view, which
+    /// leaves the enclosing horizontal ScrollView with nothing to lay out
+    /// against and collapses the whole page.
+    var rowHeight: CGFloat?
     @ViewBuilder var content: () -> Content
 
     var body: some View {
@@ -97,14 +109,32 @@ struct Shelf<Content: View>: View {
             SectionHeader(title: title, action: seeAll)
                 .padding(.horizontal, Theme.Layout.contentInset)
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(alignment: .top, spacing: spacing) {
-                    Color.clear.frame(width: max(0, Theme.Layout.contentInset - spacing), height: 1)
-                    content()
-                    Color.clear.frame(width: max(0, Theme.Layout.contentInset - spacing), height: 1)
-                }
-                .padding(.vertical, 6)
+                cards
+                    .padding(.vertical, 6)
             }
             .compatScrollClipDisabled()
+        }
+    }
+
+    private var edgeInset: some View {
+        Color.clear.frame(width: max(0, Theme.Layout.contentInset - spacing), height: 1)
+    }
+
+    @ViewBuilder
+    private var cards: some View {
+        if let rowHeight {
+            LazyHStack(alignment: .top, spacing: spacing) {
+                edgeInset
+                content()
+                edgeInset
+            }
+            .frame(height: rowHeight)
+        } else {
+            HStack(alignment: .top, spacing: spacing) {
+                edgeInset
+                content()
+                edgeInset
+            }
         }
     }
 }
