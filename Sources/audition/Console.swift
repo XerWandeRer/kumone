@@ -375,6 +375,8 @@ final class Console: @unchecked Sendable {
                     "stemCacheHit": r.stemCacheHit,
                     "outgoingTrimDB": r.outgoingTrimDB,
                     "incomingTrimDB": r.incomingTrimDB,
+                    "rideDB": r.rideDB,
+                    "rideReleaseSeconds": r.rideReleaseSeconds,
                     "normalizationGainDB": r.normalizationGainDB,
                 ]
                 if let m = r.measuredLUFS { payload["measuredLUFS"] = m }

@@ -74,6 +74,22 @@ enum LoudnessCompensation {
         return trim
     }
 
+    /// How much further a track already sitting at `trimDB` may be pushed up
+    /// before its peak crosses the same ceiling `trimDB` was guarded against.
+    ///
+    /// The whole-track trim above spends this headroom once, at load time; the
+    /// **transition gain ride** (`TransitionPlanner.rideDB`) is a second, time-
+    /// varying boost stacked on the same deck, so it has to be told what is
+    /// left. Returns 0 — no boost at all — when the peak is unknown, because
+    /// the guard's whole job is to be conservative about what it cannot see.
+    static func boostHeadroomDB(
+        for analysis: TrackAnalysis?, afterTrimDB trimDB: Double,
+        config: Config = .standard
+    ) -> Double {
+        guard let peak = analysis?.peakDBFS, peak.isFinite else { return 0 }
+        return max(0, config.peakCeilingDBFS - (peak + config.downmixPeakAllowanceDB + trimDB))
+    }
+
     /// dB → linear gain, the multiplier a fader is scaled by.
     static func gain(fromDB db: Double) -> Float { Float(pow(10.0, db / 20.0)) }
 }

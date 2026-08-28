@@ -530,9 +530,145 @@ import Foundation
                 "the splice must not leave a silent gap (\(across))")
     }
 
+    // MARK: - Transition gain ride
+
+    /// The release envelope, as a pure function: full value at the seam, a
+    /// constant dB-per-second slope, and a hard floor at unity in both
+    /// directions (a ride never overshoots past 0 into the other sign).
+    @Test func theRideReleasesAtAConstantSlopeAndStopsAtUnity() {
+        let rate = TransitionAutomation.rideReleaseDBPerSecond
+        #expect(rate == 0.3)
+
+        // A cut: −4 dB unwinds upward and lands exactly on 0.
+        #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 0) == -4)
+        #expect(abs(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 1) - -3.7) < 1e-9)
+        #expect(abs(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 10) - -1) < 1e-9)
+        #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 13.334) == 0)
+        #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 60) == 0)
+        // A boost unwinds downward, and also stops at 0.
+        #expect(abs(TransitionAutomation.rideDB(2, secondsAfterOverlap: 1) - 1.7) < 1e-9)
+        #expect(TransitionAutomation.rideDB(2, secondsAfterOverlap: 7) == 0)
+        // Before the seam is the seam.
+        #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: -5) == -4)
+        // No ride, no envelope.
+        #expect(TransitionAutomation.rideDB(0, secondsAfterOverlap: 3) == 0)
+
+        // The cap's worth takes just over 13 s — the number the post-roll and
+        // the engine's glide are both sized against.
+        #expect(abs(TransitionAutomation.rideReleaseDuration(-4) - 4 / 0.3) < 1e-9)
+        #expect(TransitionAutomation.rideReleaseDuration(0) == 0)
+    }
+
+    /// End to end through the offline graph: the ride really does shrink the
+    /// level difference across the hand-over, and really does hand it back
+    /// afterwards. Two equal-amplitude tones, so any difference between them
+    /// in the finished WAV is the ride and nothing else.
+    @Test func renderAppliesTheRideAcrossTheOverlapAndReleasesItAfter() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audition-ride-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let a = directory.appendingPathComponent("a.caf")
+        let b = directory.appendingPathComponent("b.caf")
+        // The case the ride exists for: a quiet outro (4 dB down) meeting a hot
+        // opening. Two tones, so any level difference in the finished WAV is
+        // the material and the ride and nothing else.
+        try writeTone(440, seconds: 40, amplitude: 0.5 * 0.63096, to: a)
+        try writeTone(880, seconds: 40, to: b)
+        let planned = PlannedTransition(
+            plan: .crossfade(duration: 4, outPoint: 20, inPoint: 0), style: .plain)
+
+        func render(ride: Double, name: String) throws
+            -> (OfflineTransitionRenderer.Result, (Double, Double) -> ToneEnergy) {
+            var options = OfflineTransitionRenderer.Options()
+            options.preRoll = 3
+            options.postRoll = 3
+            options.rideDB = ride
+            // The blind-test normalization is a whole-file gain; it would
+            // rescale both renders differently and hide exactly what we are
+            // measuring here.
+            options.normalizeToLUFS = nil
+            let url = directory.appendingPathComponent("\(name).wav")
+            let result = try OfflineTransitionRenderer.render(
+                planned, outgoing: a, incoming: b, to: url, options: options)
+            return (result, try toneEnergy(in: url))
+        }
+
+        // Ride 0 is the untouched render: post-roll not stretched, and the
+        // whole gain path is the one that existed before the ride.
+        let (flat, flatTones) = try render(ride: 0, name: "flat")
+        #expect(flat.rideDB == 0)
+        #expect(flat.rideReleaseSeconds == 0)
+        #expect(abs(flat.duration - 10) < 0.2, "3 + 4 + 3 (\(flat.duration))")
+
+        // −4 dB: the incoming deck is held down for the whole overlap, then
+        // let go of over 4 / 0.3 ≈ 13.3 s, which the post-roll stretches to fit.
+        let (ridden, tones) = try render(ride: -4, name: "ridden")
+        #expect(abs(ridden.rideDB - -4) < 1e-9)
+        #expect(abs(ridden.rideReleaseSeconds - 4 / 0.3) < 1e-9)
+        #expect(ridden.duration > 20, "the release must fit inside the file (\(ridden.duration))")
+
+        // The overlap runs 3…7 s into the file. Sample just past its end, where
+        // the incoming fader is fully open and the release has barely begun.
+        let heldFlat = flatTones(7.05, 7.45).at880
+        let held = tones(7.05, 7.45).at880
+        let ratio = Double(held / heldFlat)
+        #expect(abs(20 * log10(ratio) - -4) < 0.6,
+                "the incoming deck should sit ~4 dB down at the seam (\(ratio))")
+
+        // …and back at its own level once the release has run out.
+        let released = tones(19.5, 20.3).at880
+        #expect(abs(20 * log10(Double(released / heldFlat))) < 0.5,
+                "the ride must be fully released by then (\(released) vs \(heldFlat))")
+
+        // Monotone in between: a ride that wandered would be audible.
+        let mid1 = tones(10.0, 10.5).at880
+        let mid2 = tones(15.0, 15.5).at880
+        #expect(held < mid1 && mid1 < mid2 && mid2 <= released * 1.02,
+                "the release should climb steadily (\(held) \(mid1) \(mid2) \(released))")
+
+        // The whole point: the level *difference* across the seam. The outgoing
+        // tail measures 4 dB below the incoming opening, so without a ride the
+        // new track arrives 4 dB hot; with one it arrives level. The outgoing
+        // deck is untouched either way — the ride is one-sided by construction —
+        // so this is the same comparison a listener makes.
+        let outAtSeam = tones(2.5, 2.9).at440
+        #expect(abs(tones(2.5, 2.9).at440 - flatTones(2.5, 2.9).at440) < 0.005,
+                "the outgoing deck must be identical with and without a ride")
+        let flatGap = 20 * log10(Double(heldFlat / outAtSeam))
+        let riddenGap = 20 * log10(Double(held / outAtSeam))
+        #expect(abs(flatGap - 4) < 0.6, "the un-ridden seam is a 4 dB step (\(flatGap))")
+        #expect(abs(riddenGap) < 0.6, "the ride levels it (\(riddenGap))")
+    }
+
+    /// A `.gapless` seam has no overlap to ride over, so the renderer ignores
+    /// the ride entirely rather than drifting the new track's opening.
+    @Test func aGaplessRenderIgnoresTheRide() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audition-ride-gapless-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let a = directory.appendingPathComponent("a.caf")
+        let b = directory.appendingPathComponent("b.caf")
+        try writeTone(440, seconds: 10, to: a)
+        try writeTone(880, seconds: 10, to: b)
+
+        var options = OfflineTransitionRenderer.Options()
+        options.preRoll = 3
+        options.postRoll = 3
+        options.rideDB = -4
+        let result = try OfflineTransitionRenderer.render(
+            .plain(.gapless), outgoing: a, incoming: b,
+            to: directory.appendingPathComponent("out.wav"), options: options)
+        #expect(result.rideDB == 0)
+        #expect(abs(result.duration - 6) < 0.2, "post-roll untouched (\(result.duration))")
+    }
+
     // MARK: - Helpers
 
-    private func writeTone(_ hz: Double, seconds: Double, to url: URL) throws {
+    private func writeTone(_ hz: Double, seconds: Double, amplitude: Double = 0.5,
+                           to url: URL) throws {
         let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
         let file = try AVAudioFile(forWriting: url, settings: format.settings)
         let frames = AVAudioFrameCount(seconds * format.sampleRate)
@@ -540,7 +676,7 @@ import Foundation
         buffer.frameLength = frames
         let data = buffer.floatChannelData!
         for frame in 0..<Int(frames) {
-            let sample = Float(0.5 * sin(2 * .pi * hz * Double(frame) / format.sampleRate))
+            let sample = Float(amplitude * sin(2 * .pi * hz * Double(frame) / format.sampleRate))
             data[0][frame] = sample
             data[1][frame] = sample
         }

@@ -410,3 +410,45 @@ renders in `renders/` are for.
 With both findings addressed, the same 15 pairs now split 7 `clash` / 6
 `neutral` / 2 `compatible`; the remaining clashes come from the loudness and
 tempo signals, not from timbre.
+
+### The loudness gate now reads a three-stage residual
+
+Loudness stayed the corpus's first killer even after the tail window was
+anchored at `outroFadeStart` and the whole-track trims landed, because the two
+are different problems. `LoudnessCompensation` aligns two *masters*; it cannot
+align two *seconds*. A quiet piano outro meeting a full-band opening is 8 dB
+apart at the seam however well the integrated loudness matches.
+
+So the gate is measured after **both** gain stages a hand-over gets:
+
+| stage | field | what closed it |
+|---|---|---|
+| ① raw | `rawLoudnessGapDB` | nothing — the bare local RMS difference |
+| ② trimmed | `trimmedLoudnessGapDB` | the two decks' whole-track playback trims |
+| ③ ridden | `loudnessGapDB` — **the gate** | the transition gain ride |
+
+The **gain ride** (`TransitionPlanner.rideDB`, knob `rideMaxDB`, default ±4 dB)
+is the DJ gesture the corpus kept asking for: hold the incoming deck off its own
+level for the length of the overlap, then push it back up slowly enough that
+nobody hears it happen (`TransitionAutomation.rideReleaseDBPerSecond`, 0.3 dB/s,
+so the full cap unwinds over ~13 s). It rides the **incoming deck only** — the
+outgoing deck is already audible at full level when the overlap starts, so any
+ride on it would be the very level step the feature exists to remove, and it is
+never given its level back anyway. A boost is held to the incoming track's own
+peak headroom, the same clip guard the load-time trim runs. `rideMaxDB = 0` is
+the off switch and puts the gate back on the stage-② residual.
+
+On the 47-pair corpus, standard config against `--set rideMaxDB=0`:
+
+| | ride off | ride on |
+|---|---|---|
+| `loudness gap` as first elimination | 22 | **18** |
+| pairs over the 4.5 dB tolerance line | 22 | **18** |
+| pairs over the 6.5 dB red line | 15 | **10** |
+| tier `compatible` / `neutral` / `clash` | 7 / 12 / 28 | **9 / 11 / 27** |
+| `beatMatched` plans | 3 | **4** |
+| gate-visible gap, median / mean | 3.74 / 4.94 dB | **2.75 / 3.58 dB** |
+| mean overlap | 5.54 s | **5.66 s** |
+
+35 of 47 pairs ride at all; median |ride| 1.35 dB, mean 1.83 dB, and 4.00 dB
+(the cap) at the top.

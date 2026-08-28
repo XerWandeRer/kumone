@@ -144,6 +144,19 @@ enum StemTechnique: Sendable, Equatable {
 struct PlannedTransition: Sendable {
     let plan: TransitionPlan
     let style: TransitionStyle
+    /// **Transition gain ride**, in dB, for the *incoming* deck: held for the
+    /// whole overlap and then released back to unity at
+    /// `TransitionAutomation.rideReleaseDBPerSecond`. Negative holds the
+    /// incoming track down, positive lifts it; see `TransitionPlanner.rideDB`
+    /// for how it is derived and why only one deck rides.
+    ///
+    /// It lives here rather than in `TransitionPlan` (pure mechanics: when and
+    /// how long) or `TransitionStyle` (how the hand-over *sounds*) because it
+    /// is neither — it is a gain decision about one deck, of a piece with the
+    /// load-time trim the engine already carries. Defaulted to 0 so
+    /// `PlannedTransition(plan:style:)` and `.plain` keep every existing
+    /// caller, and the whole gain path, bit-identical.
+    var rideDB: Double = 0
 
     static func plain(_ plan: TransitionPlan) -> PlannedTransition {
         PlannedTransition(plan: plan, style: .plain)

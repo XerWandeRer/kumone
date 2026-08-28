@@ -258,13 +258,22 @@ public enum Audition {
         /// The key gate turned a compatible pair into a neutral one.
         public let demotedByKey: Bool
 
-        /// Level gap at the hand-over after the per-track loudness trims —
-        /// what the gate judges, and what the listener hears.
+        /// Level gap at the hand-over after **both** gain stages — the
+        /// per-track loudness trims and the transition gain ride. This is what
+        /// the tier gate judges, and what the listener hears at the seam.
         public let loudnessGapDB: Double
-        /// The same gap before compensation, and the two trims that closed it.
+        /// The same gap after the trims but before the ride (stage two).
+        public let trimmedLoudnessGapDB: Double
+        /// The same gap before any compensation (stage one), and the two trims
+        /// that closed the first part of it.
         public let rawLoudnessGapDB: Double
         public let outgoingTrimDB: Double
         public let incomingTrimDB: Double
+        /// Signed gain ride the incoming deck is held at across the overlap,
+        /// in dB (negative = held down). See `TransitionPlanner.rideDB`.
+        public let rideDB: Double
+        /// How long that ride takes to unwind back to unity after the overlap.
+        public let rideReleaseSeconds: TimeInterval
         /// Whole-track mastered loudness (LUFS) of each side, nil when unknown.
         public let outgoingLoudnessLUFS: Double?
         public let incomingLoudnessLUFS: Double?
@@ -383,15 +392,24 @@ public enum Audition {
             planned = applyFade(fadeOverride, to: planned, outgoingDuration: out.duration)
             overridden = true
         }
+        // Every override below carries `rideDB` through untouched. The ride is
+        // a level match between two *tracks*, derived from their local RMS
+        // windows and the trims they will play at — none of which a hand-picked
+        // style, stem technique or seam changes. Recomputing it from a moved
+        // window would also make the console's three-stage loudness narrative
+        // disagree with the tier gate, which is decided long before any of
+        // these run. Move the seam, keep the level match.
         if let styleOverride {
             planned = PlannedTransition(plan: planned.plan,
-                                        style: style(styleOverride, basedOn: planned.style))
+                                        style: style(styleOverride, basedOn: planned.style),
+                                        rideDB: planned.rideDB)
             overridden = true
         }
         if let stemOverride {
             var style = planned.style
             style.stemTechnique = stemOverride.technique
-            planned = PlannedTransition(plan: planned.plan, style: style)
+            planned = PlannedTransition(plan: planned.plan, style: style,
+                                        rideDB: planned.rideDB)
             overridden = true
         }
 
@@ -445,9 +463,12 @@ public enum Audition {
             tier: name(of: effectiveTier),
             demotedByKey: demoted,
             loudnessGapDB: signals.loudnessGapDB,
+            trimmedLoudnessGapDB: signals.trimmedLoudnessGapDB,
             rawLoudnessGapDB: signals.rawLoudnessGapDB,
             outgoingTrimDB: signals.outgoingTrimDB,
             incomingTrimDB: signals.incomingTrimDB,
+            rideDB: planned.rideDB,
+            rideReleaseSeconds: TransitionAutomation.rideReleaseDuration(planned.rideDB),
             outgoingLoudnessLUFS: out.referenceLoudness,
             incomingLoudnessLUFS: inc.referenceLoudness,
             timbreDistance: signals.timbreDistance,
@@ -506,6 +527,11 @@ public enum Audition {
         /// compensation, so the render is what the player would do.
         public let outgoingTrimDB: Double
         public let incomingTrimDB: Double
+        /// The hand-over's gain ride the incoming deck was held at across the
+        /// overlap (dB), and how long its release took to unwind. Both are
+        /// audible in the file: the render carries the ride's whole envelope.
+        public let rideDB: Double
+        public let rideReleaseSeconds: TimeInterval
         /// Blind-test level matching: what the finished mix measured and the
         /// constant gain applied to bring it to `normalizationTargetLUFS`.
         /// Purely a fairness device for A/B listening; no product counterpart.
@@ -530,6 +556,8 @@ public enum Audition {
         // The render plays the decks at exactly the trims the product would.
         options.outgoingTrimDB = decision.signals.outgoingTrimDB
         options.incomingTrimDB = decision.signals.incomingTrimDB
+        // …and at exactly the gain ride it would ride, release included.
+        options.rideDB = decision.planned.rideDB
         let result = try OfflineTransitionRenderer.render(
             decision.planned,
             outgoing: decision.outgoingURL, incoming: decision.incomingURL,
@@ -547,6 +575,8 @@ public enum Audition {
                              stemFallbackReason: result.stemFallbackReason,
                              outgoingTrimDB: result.outgoingTrimDB,
                              incomingTrimDB: result.incomingTrimDB,
+                             rideDB: result.rideDB,
+                             rideReleaseSeconds: result.rideReleaseSeconds,
                              measuredLUFS: result.measuredLUFS,
                              normalizationGainDB: result.normalizationGainDB,
                              normalizationTargetLUFS: result.normalizationTargetLUFS)
@@ -618,7 +648,7 @@ public enum Audition {
                 plan: .crossfade(duration: fade,
                                  outPoint: min(outPoint, max(0, outgoingDuration - fade)),
                                  inPoint: inPoint),
-                style: planned.style)
+                style: planned.style, rideDB: planned.rideDB)
         case .beatMatched(let p):
             return PlannedTransition(
                 plan: .beatMatched(BeatMatchedPlan(
@@ -626,12 +656,12 @@ public enum Audition {
                     inPoint: p.inPoint, overlapBars: p.overlapBars,
                     outgoingRate: p.outgoingRate, incomingRate: p.incomingRate,
                     bassSwapOffset: fade / 2, overlapDuration: fade)),
-                style: planned.style)
+                style: planned.style, rideDB: planned.rideDB)
         case .gapless:
             return PlannedTransition(
                 plan: .crossfade(duration: fade,
                                  outPoint: max(0, outgoingDuration - fade), inPoint: 0),
-                style: planned.style)
+                style: planned.style, rideDB: planned.rideDB)
         }
     }
 
@@ -680,11 +710,11 @@ public enum Audition {
                     outPoint: g.outPoint, inPoint: g.inPoint, overlapBars: bars,
                     outgoingRate: p.outgoingRate, incomingRate: p.incomingRate,
                     bassSwapOffset: g.overlap / 2, overlapDuration: g.overlap)),
-                style: planned.style)
+                style: planned.style, rideDB: planned.rideDB)
         case .crossfade, .gapless:
             return PlannedTransition(
                 plan: .crossfade(duration: g.overlap, outPoint: g.outPoint, inPoint: g.inPoint),
-                style: planned.style)
+                style: planned.style, rideDB: planned.rideDB)
         }
     }
 

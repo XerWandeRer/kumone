@@ -910,6 +910,168 @@ struct PlaybackEngineSmokeTests {
         #expect(abs(snapshots[1].trim - 1.2589) < 0.001, "+2 dB = ×1.2589")
     }
 
+    /// The transition gain ride, end to end on the live graph: full value for
+    /// the whole overlap, then a slow glide back to unity that outlives the
+    /// transition itself.
+    @Test func theRideIsHeldAcrossTheOverlapAndThenGlidesBack() throws {
+        guard audioOutputAvailable else { return }
+        let planned = PlannedTransition(
+            plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+            style: .plain, rideDB: -4)
+        struct Outcome {
+            var duringOverlap: PlaybackEngine.DeckEffectSnapshot?
+            var justAfter: PlaybackEngine.DeckEffectSnapshot?
+            var laterStillGliding: PlaybackEngine.DeckEffectSnapshot?
+            var transitionCleared = false
+        }
+        let result = withWatchdog("rideGlide", timeout: 45) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return o }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 4.7)
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            // Out point is ~0.5 s away; sample a second in, mid-overlap.
+            Thread.sleep(forTimeInterval: 1.2)
+            o.duringOverlap = engine.effectSnapshot(of: .b)
+
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                if log.contains({
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }) { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            Thread.sleep(forTimeInterval: 0.3)
+            o.justAfter = engine.effectSnapshot(of: .b)
+            // The release runs for 4 / 0.3 ≈ 13 s. Long before that is up the
+            // transition state machine must already have let go.
+            Thread.sleep(forTimeInterval: 2.0)
+            o.transitionCleared = !engine.hasPendingTransition
+            o.laterStillGliding = engine.effectSnapshot(of: .b)
+            return o
+        }
+        guard let o = result, let during = o.duringOverlap, let after = o.justAfter,
+              let later = o.laterStillGliding else { return }
+
+        // Held at its full value while the two decks share the room.
+        #expect(abs(during.rideDB - -4) < 0.001,
+                "the ride must be at full value across the overlap (\(during))")
+        #expect(abs(during.rideTargetDB - -4) < 0.001, "…and not yet gliding anywhere")
+
+        // Released the moment the overlap ends: heading for unity, not there yet.
+        #expect(after.rideTargetDB == 0, "the release must be aimed at unity (\(after))")
+        #expect(after.rideDB < 0 && after.rideDB > -4,
+                "the release must have started but not finished (\(after))")
+        // …and it does not hold the transition open while it runs.
+        #expect(o.transitionCleared,
+                "the ride release must not block the transition state machine")
+        #expect(later.rideDB > after.rideDB && later.rideDB < 0,
+                "the glide must keep climbing after the transition cleared (\(after.rideDB) → \(later.rideDB))")
+        // ~0.3 dB/s, give or take a slow timer's leeway.
+        let elapsed = 2.0
+        let moved = later.rideDB - after.rideDB
+        #expect(abs(moved - 0.3 * elapsed) < 0.15,
+                "the release slope must be ~0.3 dB/s (moved \(moved) in \(elapsed)s)")
+        // The ride is a *fader* multiplier and nothing else.
+        #expect(later.effectsAreNeutral, "the ride must not touch EQ, rate or delay (\(later))")
+        #expect(abs(later.volume
+                    - later.trim * LoudnessCompensation.gain(fromDB: later.rideDB)) < 0.002,
+                "the deck's level must be exactly trim × ride (\(later))")
+        #expect(later.isNeutral, "'fader open' now means trim × ride (\(later))")
+    }
+
+    /// A ride of 0 — every `.plain` hand-over, every AutoMix-off and iOS path —
+    /// must leave the gain path exactly where it was before the ride existed.
+    @Test func aZeroRideChangesNothing() throws {
+        guard audioOutputAvailable else { return }
+        let planned = PlannedTransition(
+            plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0), style: .plain)
+        #expect(planned.rideDB == 0, "the memberwise default must be no ride")
+        let result = withWatchdog("zeroRide", timeout: 45) {
+            () -> [PlaybackEngine.DeckEffectSnapshot] in
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return [] }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 4.7)
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
+                if log.contains({
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }) { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            Thread.sleep(forTimeInterval: 0.6)
+            return [engine.effectSnapshot(of: .a), engine.effectSnapshot(of: .b)]
+        }
+        guard let snapshots = result, snapshots.count == 2 else { return }
+        #expect(snapshots[0].isParked, "outgoing deck parked silent (\(snapshots[0]))")
+        #expect(snapshots[1].rideDB == 0 && snapshots[1].rideTargetDB == 0,
+                "no ride anywhere on the incoming deck (\(snapshots[1]))")
+        #expect(abs(snapshots[1].volume - 1) < 0.001,
+                "a fully open, untrimmed, un-ridden fader is literally 1 (\(snapshots[1]))")
+        #expect(snapshots[1].isNeutral)
+    }
+
+    /// Pause, seek and a re-issued play all settle a running release to its
+    /// target instead of leaving it drifting under a track the listener has
+    /// just re-aimed. Every one of those moments is silent or muted, so the
+    /// jump is inaudible — see `PlaybackEngine.settleRideLocked`.
+    @Test func pauseAndSeekSettleTheRideImmediately() throws {
+        guard audioOutputAvailable else { return }
+        func runRide(interrupt: @escaping (PlaybackEngine) -> Void)
+            -> PlaybackEngine.DeckEffectSnapshot? {
+            withWatchdog("rideSettle", timeout: 45) {
+                () -> PlaybackEngine.DeckEffectSnapshot? in
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                      (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil
+                else { return nil }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: 4.7)
+                engine.scheduleTransition(
+                    PlannedTransition(
+                        plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                        style: .plain, rideDB: -4),
+                    from: .a, to: .b)
+                let deadline = Date().addingTimeInterval(10)
+                while Date() < deadline {
+                    if log.contains({
+                        if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                        return false
+                    }) { break }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                Thread.sleep(forTimeInterval: 0.4)
+                interrupt(engine)
+                Thread.sleep(forTimeInterval: 0.5)
+                return engine.effectSnapshot(of: .b)
+            } ?? nil
+        }
+
+        for (label, interrupt) in [
+            ("pause", { (e: PlaybackEngine) in e.pause() }),
+            ("seek", { (e: PlaybackEngine) in e.seek(deck: .b, to: 1.0) }),
+            ("play", { (e: PlaybackEngine) in e.play(deck: .b, from: 1.0) }),
+        ] {
+            guard let s = runRide(interrupt: interrupt) else { continue }
+            #expect(s.rideDB == 0,
+                    "\(label) must settle the release to its target at once (\(s))")
+            #expect(s.rideTargetDB == 0)
+        }
+    }
+
     // (h) Cancelling mid-overlap (seek / skip / disarm) must also leave both
     // decks neutral — the reset invariant, on the interrupted path.
     @Test func cancelDuringStyledOverlapResetsDecks() throws {

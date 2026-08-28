@@ -364,9 +364,118 @@ import Foundation
         #expect(abs(s.outgoingTrimDB - -6) < 1e-6)
         #expect(abs(s.incomingTrimDB - 3) < 1e-6)
         #expect(abs(s.rawLoudnessGapDB - 22) < 0.3)
-        // 22 raw − 6 (cut) − 3 (boost) = 13 dB the compensation could not close.
-        #expect(abs(s.loudnessGapDB - 13) < 0.3)
+        // 22 raw − 6 (cut) − 3 (boost) = 13 dB the trims could not close…
+        #expect(abs(s.trimmedLoudnessGapDB - 13) < 0.3)
+        // …of which the ride takes its own 4 dB cap's worth (the incoming
+        // track is the quiet side, and its −30 dBFS peak leaves ample room for
+        // a lift), leaving 9 dB for the gate — still a clash.
+        #expect(abs(s.rideDB - 4) < 1e-6)
+        #expect(abs(s.loudnessGapDB - 9) < 0.3)
         #expect(TransitionPlanner.tier(of: s) == .clash)
+    }
+
+    /// The three stages are exactly that: each one is measured after the one
+    /// before it, and the tier gate reads only the last.
+    @Test func theGateReadsWhatBothGainStagesLeftBehind() {
+        // A 6 dB local gap with matched masters: the trims have nothing to do,
+        // so the ride is the only thing that closes it — and it can close all
+        // of it, well inside its 4 dB cap once the direction is right.
+        let quietTail = [Float](repeating: 0.5 * 0.501, count: 200)  // −6 dB
+        let loudOpening = [Float](repeating: 0.5, count: 200)
+        let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14)
+        let incoming = makeAnalysis(bpm: 120, rmsEnvelope: loudOpening, referenceLoudness: -14)
+
+        let s = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming)
+        #expect(abs(s.outgoingTrimDB) < 1e-6)
+        #expect(abs(s.incomingTrimDB) < 1e-6)
+        // Stage 1 and 2 agree: nothing for the whole-track trims to absorb.
+        #expect(abs(s.rawLoudnessGapDB - 6) < 0.2)
+        #expect(abs(s.trimmedLoudnessGapDB - 6) < 0.2)
+        // Stage 3: a quiet outro meeting a hot opening — the incoming deck is
+        // held *down*, so the ride is negative, and it clips at the 4 dB cap.
+        #expect(abs(s.rideDB - -4) < 1e-6)
+        #expect(abs(s.loudnessGapDB - 2) < 0.2)
+        // 6 dB alone would have been a clash; 2 dB is inside the tolerance line.
+        #expect(TransitionPlanner.tier(of: s) == .compatible)
+    }
+
+    /// The cap is a cap in both directions, and a boost is additionally held
+    /// to the incoming track's own peak headroom — the same clip guard the
+    /// load-time trim runs.
+    @Test func theRideIsCappedAndPeakGuarded() {
+        let c = TransitionPlanner.Config.standard
+        let roomy = makeAnalysis(peakDBFS: -30)
+        // Cut side: unbounded by peaks, bounded by the cap.
+        #expect(TransitionPlanner.rideDB(forTrimmedGapDB: -20, incoming: roomy,
+                                         incomingTrimDB: 0, config: c) == -c.rideMaxDB)
+        // Boost side: the cap bites first when there is plenty of headroom.
+        #expect(TransitionPlanner.rideDB(forTrimmedGapDB: 20, incoming: roomy,
+                                         incomingTrimDB: 0, config: c) == c.rideMaxDB)
+        // A hot master leaves 2 dB (−6 peak + 3 downmix allowance vs a −1
+        // ceiling), and that, not the cap, is the limit.
+        let hot = makeAnalysis(peakDBFS: -6)
+        #expect(abs(TransitionPlanner.rideDB(forTrimmedGapDB: 20, incoming: hot,
+                                             incomingTrimDB: 0, config: c) - 2) < 1e-9)
+        // A track whose peak is unknown never gets a boost at all.
+        #expect(TransitionPlanner.rideDB(forTrimmedGapDB: 20, incoming: makeAnalysis(peakDBFS: nil),
+                                         incomingTrimDB: 0, config: c) == 0)
+        // A gap smaller than the cap is closed exactly, not over-ridden.
+        #expect(abs(TransitionPlanner.rideDB(forTrimmedGapDB: -1.5, incoming: roomy,
+                                             incomingTrimDB: 0, config: c) - -1.5) < 1e-9)
+    }
+
+    /// `rideMaxDB = 0` is the off switch: the gate goes back to reading the
+    /// trim-only residual, exactly as it did before the ride existed.
+    @Test func aZeroCapTurnsTheRideOff() {
+        let quietTail = [Float](repeating: 0.5 * 0.501, count: 200)
+        let loudOpening = [Float](repeating: 0.5, count: 200)
+        let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14)
+        let incoming = makeAnalysis(bpm: 120, rmsEnvelope: loudOpening, referenceLoudness: -14)
+
+        var off = TransitionPlanner.Config.standard
+        off.rideMaxDB = 0
+        let s = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming, config: off)
+        #expect(s.rideDB == 0)
+        #expect(abs(s.loudnessGapDB - s.trimmedLoudnessGapDB) < 1e-9)
+        #expect(TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                       config: off).rideDB == 0)
+    }
+
+    /// Both gain stages are the same feature and the same user switch: with
+    /// compensation off, neither the trim nor the ride is applied.
+    @Test func compensationOffAlsoTurnsTheRideOff() {
+        let quietTail = [Float](repeating: 0.5 * 0.501, count: 200)
+        let loudOpening = [Float](repeating: 0.5, count: 200)
+        var off = TransitionPlanner.Config.standard
+        off.loudnessCompensation = false
+        let s = TransitionPlanner.signals(
+            outgoing: makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14),
+            incoming: makeAnalysis(bpm: 120, rmsEnvelope: loudOpening, referenceLoudness: -14),
+            config: off)
+        #expect(s.outgoingTrimDB == 0)
+        #expect(s.incomingTrimDB == 0)
+        #expect(s.rideDB == 0)
+        #expect(abs(s.loudnessGapDB - s.rawLoudnessGapDB) < 1e-9)
+    }
+
+    /// The plan carries the ride to the engine — but only when there is an
+    /// overlap to ride over. `.gapless` (short tracks, no analysis, AutoMix
+    /// off) stays at ride 0, which is what keeps the whole gain path
+    /// bit-identical on those paths.
+    @Test func thePlanCarriesTheRideOnlyWhenThereIsAnOverlap() {
+        let quietTail = [Float](repeating: 0.5 * 0.501, count: 200)
+        let loudOpening = [Float](repeating: 0.5, count: 200)
+        let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14)
+        let incoming = makeAnalysis(bpm: 120, rmsEnvelope: loudOpening, referenceLoudness: -14)
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming)
+        #expect(abs(planned.rideDB - -4) < 1e-6)
+
+        // No analysis at all → gapless → no ride.
+        #expect(TransitionPlanner.plan(outgoing: nil, incoming: incoming).rideDB == 0)
+        // Too short to transition → gapless → no ride.
+        let tiny = makeAnalysis(duration: 20, rmsEnvelope: loudOpening)
+        #expect(TransitionPlanner.plan(outgoing: tiny, incoming: incoming).rideDB == 0)
+        #expect(PlannedTransition.plain(.gapless).rideDB == 0)
     }
 
     /// Tracks with no loudness reading (never analyzed at v6) behave exactly
@@ -379,8 +488,15 @@ import Foundation
             incoming: makeAnalysis(bpm: 120, rmsEnvelope: quietEnv))
         #expect(s.outgoingTrimDB == 0)
         #expect(s.incomingTrimDB == 0)
-        #expect(abs(s.loudnessGapDB - s.rawLoudnessGapDB) < 1e-9)
-        #expect(abs(s.loudnessGapDB - 8) < 0.2)
+        // Nothing to trim against, so stages 1 and 2 are the same number.
+        #expect(abs(s.trimmedLoudnessGapDB - s.rawLoudnessGapDB) < 1e-9)
+        #expect(abs(s.trimmedLoudnessGapDB - 8) < 0.2)
+        // The ride, though, is derived from the *RMS envelopes* and needs no
+        // loudness reading at all — an unmeasured pair still gets its seam
+        // levelled, up to whatever the incoming track's peak allows (a −6 dBFS
+        // peak leaves 2 dB, which is what bites here rather than the 4 dB cap).
+        #expect(abs(s.rideDB - 2) < 1e-9)
+        #expect(abs(s.loudnessGapDB - 6) < 0.2)
     }
 
     @Test func timbreClashForcesShortFade() {

@@ -42,6 +42,17 @@ enum OfflineTransitionRenderer {
         var outgoingTrimDB: Double = 0
         var incomingTrimDB: Double = 0
 
+        /// The hand-over's gain ride for the incoming deck, in dB
+        /// (`PlannedTransition.rideDB`), applied exactly as the live engine
+        /// applies it: full value for the whole overlap, then released at
+        /// `TransitionAutomation.rideReleaseDBPerSecond`. 0 — the default — is
+        /// the un-ridden render, bit-identical to what this produced before.
+        ///
+        /// The post-roll is stretched when needed so the release finishes
+        /// inside the rendered file: the whole point of auditioning a ride is
+        /// hearing that you cannot hear it being let go of.
+        var rideDB: Double = 0
+
         /// Loudness the finished file is normalized to before it is written, or
         /// nil to write it at its natural level.
         ///
@@ -74,6 +85,10 @@ enum OfflineTransitionRenderer {
         /// The trims the two decks played at (dB), mirroring the product.
         var outgoingTrimDB: Double = 0
         var incomingTrimDB: Double = 0
+        /// The gain ride the incoming deck was held at across the overlap, and
+        /// how long its release took to unwind inside this file.
+        var rideDB: Double = 0
+        var rideReleaseSeconds: TimeInterval = 0
         /// Blind-test normalization: what the summed mix measured before it was
         /// written, and the constant gain applied to land it on the target.
         /// Nil/0 when normalization was off or the mix could not be measured.
@@ -142,6 +157,17 @@ enum OfflineTransitionRenderer {
         let rateHeadroom = 1.1
         let outPoint = planned.plan.outPoint
         let overlap = geometry.overlapDuration
+
+        // Gain ride: only over an overlap, exactly like the planner and the
+        // live engine. Stretch the post-roll so the release — up to ~13 s at
+        // 0.3 dB/s — finishes inside the file, plus a second of the track at
+        // its own level to land on.
+        var rideDB: Double = 0
+        if case .gapless = planned.plan {} else { rideDB = options.rideDB }
+        let rideRelease = TransitionAutomation.rideReleaseDuration(rideDB)
+        let postRoll = rideRelease > 0
+            ? max(options.postRoll, rideRelease + 1)
+            : options.postRoll
 
         let engine = AVAudioEngine()
         let decks = (0..<2).map { _ -> OfflineDeck in OfflineDeck(engine: engine, format: format) }
@@ -239,7 +265,7 @@ enum OfflineTransitionRenderer {
                 seconds: (preRoll + overlap) * rateHeadroom + 1, format: format)
             let inBuffer = try loadSegment(
                 incomingURL, from: inPoint,
-                seconds: (overlap + settleDuration + options.postRoll) * rateHeadroom + 1,
+                seconds: (overlap + settleDuration + postRoll) * rateHeadroom + 1,
                 format: format)
 
             // --- Stem layer: rewrite the outgoing deck's overlap window
@@ -286,6 +312,9 @@ enum OfflineTransitionRenderer {
                 to.eq.bands[DeckChain.Band.mid.rawValue].gain = TransitionAutomation.midCutDB
                 to.eq.bands[DeckChain.Band.high.rawValue].gain = TransitionAutomation.highCutDB
             }
+            // `beginOverlapLocked`: the ride goes on at full value while the
+            // incoming fader is still 0, so it never steps anything audible.
+            to.setRide(db: rideDB)
             to.setFader(0)
             to.player.play()
 
@@ -328,7 +357,20 @@ enum OfflineTransitionRenderer {
                 to.timePitch.rate = 1
             }
 
-            // --- Settling.
+            // --- Settling, and the start of the ride release.
+            //
+            // `releaseRideLocked` fires the moment the overlap ends, so the
+            // release clock starts here and keeps running *through* settling
+            // and into the post-roll — in the live engine it is a deck-level
+            // glide that outlives the transition entirely, and this is that
+            // same envelope, stepped at the same 50 Hz.
+            var sinceOverlap: TimeInterval = 0
+            func rideStep() {
+                guard rideDB != 0 else { return }
+                to.setRide(db: TransitionAutomation.rideDB(
+                    rideDB, secondsAfterOverlap: sinceOverlap))
+            }
+
             if restoringRate || tailRinging {
                 var settled: TimeInterval = 0
                 while settled < settleDuration {
@@ -340,19 +382,34 @@ enum OfflineTransitionRenderer {
                         from.delay.wetDryMix = s.outgoingDelayWetDryMix
                         from.delay.feedback = s.outgoingDelayFeedback
                     }
+                    rideStep()
                     try pump(tickFrames)
                     written += tickFrames
                     settled += tickSeconds
+                    sinceOverlap += tickSeconds
                 }
                 from.setFader(0)
                 DeckChain.neutralize(timePitch: from.timePitch, eq: from.eq, delay: from.delay)
                 to.timePitch.rate = 1
             }
 
-            // --- Post-roll: the incoming track alone.
-            let postFrames = AVAudioFrameCount((options.postRoll * sampleRate).rounded())
-            try pump(postFrames)
-            written += postFrames
+            // --- Post-roll: the incoming track alone, still letting go of the
+            // ride for as long as the release has left to run.
+            var post: TimeInterval = 0
+            while rideDB != 0, post < postRoll, sinceOverlap < rideRelease {
+                rideStep()
+                try pump(tickFrames)
+                written += tickFrames
+                post += tickSeconds
+                sinceOverlap += tickSeconds
+            }
+            if rideDB != 0 { to.setRide(db: 0) }
+            let postFrames = AVAudioFrameCount(
+                (max(0, postRoll - post) * sampleRate).rounded())
+            if postFrames > 0 {
+                try pump(postFrames)
+                written += postFrames
+            }
         }
 
         // --- Blind-test normalization, then the one and only file write.
@@ -366,6 +423,8 @@ enum OfflineTransitionRenderer {
                       renderSeconds: Date().timeIntervalSince(started),
                       outgoingTrimDB: options.outgoingTrimDB,
                       incomingTrimDB: options.incomingTrimDB,
+                      rideDB: rideDB,
+                      rideReleaseSeconds: rideRelease,
                       measuredLUFS: normalization.measuredLUFS,
                       normalizationGainDB: normalization.gainDB,
                       normalizationTargetLUFS: options.normalizeToLUFS,
@@ -482,10 +541,25 @@ enum OfflineTransitionRenderer {
 
         /// Loudness-compensation multiplier; see `PlaybackEngine.DeckState.trim`.
         var trim: Float = 1
+        /// Transition gain ride multiplier, and the last level a caller asked
+        /// the fader for — the same pair `PlaybackEngine.DeckState` keeps, so
+        /// changing the ride between automation ticks re-writes the fader
+        /// through the current curve value rather than clobbering it.
+        var ride: Float = 1
+        var faderRequest: Float = 1
 
         /// The single fader writer, mirroring `PlaybackEngine.setFaderLocked`:
-        /// callers speak in 0–1 and the trim is folded in here.
-        func setFader(_ value: Float) { player.volume = value * trim }
+        /// callers speak in 0–1 and both gains are folded in here.
+        func setFader(_ value: Float) {
+            faderRequest = value
+            player.volume = value * trim * ride
+        }
+
+        /// Move the ride and re-apply the fader through it.
+        func setRide(db: Double) {
+            ride = LoudnessCompensation.gain(fromDB: db)
+            setFader(faderRequest)
+        }
 
         func apply(_ p: TransitionAutomation.DeckParameters) {
             setFader(p.fader)

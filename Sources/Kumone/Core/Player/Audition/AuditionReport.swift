@@ -150,6 +150,10 @@ extension Audition {
         public let rawTier: String
         public let tier: String
         public let demotedByKey: Bool
+        /// The transition gain ride, and how long it takes to unwind. Broken
+        /// out of the prose so the console can chip it next to the deck trims.
+        public let rideDB: Double
+        public let rideReleaseSeconds: TimeInterval
         public let chain: [ChainStep]
         /// The gates the planner walked, and — when the pair had already lost
         /// its beat-match at the tier — the ones it walked into the shadow
@@ -184,6 +188,8 @@ extension Audition {
             rawTier: d.rawTier,
             tier: d.tier,
             demotedByKey: d.demotedByKey,
+            rideDB: d.rideDB,
+            rideReleaseSeconds: d.rideReleaseSeconds,
             chain: chain(d, config: c),
             gates: d.planTrace.gates.map { gateReport($0, blocker: d.planTrace.blocker?.id) },
             shadowGates: d.planTrace.shadowGates.map { gateReport($0, blocker: nil) },
@@ -257,8 +263,9 @@ extension Audition {
 
         var out: [SignalReport] = []
 
-        // 1. Loudness — measured *after* the per-track playback trims, so the
-        // gate only ever punishes the part the compensation could not absorb.
+        // 1. Loudness — measured after *both* gain stages (the per-track
+        // playback trims, then the transition gain ride), so the gate only ever
+        // punishes the part neither of them could absorb.
         let loud = d.loudnessGapDB
         func lufs(_ v: Double?) -> String {
             v.map { String(format: "%.1f LUFS", $0) } ?? "未测出"
@@ -273,10 +280,31 @@ extension Audition {
                 lufs(d.outgoingLoudnessLUFS), lufs(d.incomingLoudnessLUFS))
         } else {
             compensation = String(
-                format: "（母带响度 出曲 %@ / 入曲 %@，播放时分别加 %+.2f dB 和 %+.2f dB 的增益；"
-                    + "补偿前的原始音量差是 %.2f dB，上面这个数是补偿之后剩下的部分。）",
+                format: "（母带响度 出曲 %@ / 入曲 %@，播放时分别加 %+.2f dB 和 %+.2f dB 的增益。）",
                 lufs(d.outgoingLoudnessLUFS), lufs(d.incomingLoudnessLUFS),
-                d.outgoingTrimDB, d.incomingTrimDB, d.rawLoudnessGapDB)
+                d.outgoingTrimDB, d.incomingTrimDB)
+        }
+        // The three-stage story, in the order the two gain stages happen:
+        // raw local gap → what the whole-track trims left → what the ride left.
+        // The gate reads the last number and nothing else.
+        var stages: String
+        if !c.loudnessCompensation {
+            stages = ""
+        } else if abs(d.rideDB) < 0.005 {
+            stages = String(
+                format: "局部落差原本 %.2f dB，整曲响度补偿之后剩 %.2f dB；"
+                    + "已经在容忍范围内（或没有可用的响度读数），交接时不需要再动推子。",
+                d.rawLoudnessGapDB, d.trimmedLoudnessGapDB)
+        } else {
+            let absorbed = d.trimmedLoudnessGapDB - loud
+            let direction = d.rideDB < 0 ? "压低" : "抬高"
+            stages = String(
+                format: "局部落差原本 %.2f dB，整曲响度补偿之后剩 %.2f dB；"
+                    + "交接时再把入曲%@ %.2f dB（吸收掉 %.2f dB，过渡走完用 %.1f 秒悄悄推回原位），"
+                    + "最后落到 %.2f dB —— %@。",
+                d.rawLoudnessGapDB, d.trimmedLoudnessGapDB,
+                direction, abs(d.rideDB), absorbed, d.rideReleaseSeconds, loud,
+                loud > c.neutralLoudnessDB ? "仍在容忍线之外" : "已在容忍线之内")
         }
         let loudnessVerdict: String
         if loud > c.clashLoudnessDB {
@@ -303,7 +331,7 @@ extension Audition {
                     SignalMark(label: "红线", value: c.clashLoudnessDB,
                                field: "clashLoudnessDB")],
             state: state(loud, neutral: c.neutralLoudnessDB, clash: c.clashLoudnessDB),
-            verdict: loudnessVerdict + compensation))
+            verdict: loudnessVerdict + stages + compensation))
 
         // 2. Timbre
         let timbre = d.timbreDistance

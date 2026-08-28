@@ -47,6 +47,37 @@ enum TransitionAutomation {
     /// How long a beat-matched incoming deck takes to ramp back to rate 1.0.
     static let rateRestoreDuration: TimeInterval = 1.5
 
+    /// How fast a transition gain ride (`PlannedTransition.rideDB`) is let go
+    /// of once the overlap is over, in dB per second.
+    ///
+    /// This is the "and then push it back up" half of the DJ's gesture, and it
+    /// only works if nobody notices it happening. 0.3 dB/s is an order of
+    /// magnitude under the ~1 dB just-noticeable step and slow enough that the
+    /// change never presents itself as an *event*: the full ±4 dB ride takes
+    /// just over 13 s to unwind, so the new track arrives at its own level
+    /// somewhere in its first verse without a single audible move.
+    ///
+    /// It is deliberately far longer than the `.echoOut` tail or the rate
+    /// restore, which is why the ride is **not** part of the settling phase —
+    /// the transition state machine must be free to finish and clear while the
+    /// release is still running. The engine carries it on the deck instead.
+    static let rideReleaseDBPerSecond: Double = 0.3
+
+    /// The ride level, in dB, `elapsed` seconds after the overlap ended.
+    /// A linear-in-dB release to 0, which is a constant-slope fader move —
+    /// the shape a hand on a trim knob makes.
+    static func rideDB(_ ride: Double, secondsAfterOverlap elapsed: TimeInterval) -> Double {
+        guard ride != 0, ride.isFinite else { return 0 }
+        let released = rideReleaseDBPerSecond * Swift.max(0, elapsed)
+        return ride > 0 ? Swift.max(0, ride - released) : Swift.min(0, ride + released)
+    }
+
+    /// How long `ride` takes to unwind to unity.
+    static func rideReleaseDuration(_ ride: Double) -> TimeInterval {
+        guard ride.isFinite else { return 0 }
+        return abs(ride) / rideReleaseDBPerSecond
+    }
+
     // MARK: - Output
 
     /// Every automated parameter of one deck's chain, at one instant.

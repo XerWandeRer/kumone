@@ -798,6 +798,12 @@ function describeRender(r) {
   if (r.outgoingTrimDB || r.incomingTrimDB) {
     bits.push(`播放增益 出 ${sgn(r.outgoingTrimDB)} / 入 ${sgn(r.incomingTrimDB)} dB`);
   }
+  // The transition gain ride: held across the overlap, then let go of slowly.
+  // Both halves are in the rendered file, so this is audible, not just a number.
+  if (r.rideDB) {
+    bits.push(`交接补偿 入 ${sgn(r.rideDB)} dB`
+      + `（叠加期间全额，之后 ${fmt(r.rideReleaseSeconds, 1)}s 推回原位）`);
+  }
   if (r.normalizationTargetLUFS !== undefined) {
     bits.push(`盲听归一 ${fmt(r.measuredLUFS, 1)} → ${fmt(r.normalizationTargetLUFS, 1)} LUFS`
       + `（${sgn(r.normalizationGainDB)} dB，只影响这个文件的响度，不影响过渡本身）`);

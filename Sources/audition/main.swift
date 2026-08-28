@@ -107,11 +107,16 @@ func explain(_ d: Audition.Decision) -> String {
     lines.append("  loudness gap  \(f(d.loudnessGapDB)) dB"
                  + "   [neutral > \(f(th("neutralLoudnessDB"), 1)),"
                  + " clash > \(f(th("clashLoudnessDB"), 1))]")
-    // The gap above is post-compensation; show what produced it.
+    // The gap above is what survived both gain stages; show all three.
     lines.append("  loudness      \(optional(d.outgoingLoudnessLUFS, 1)) →"
                  + " \(optional(d.incomingLoudnessLUFS, 1)) LUFS"
                  + "   trim \(f(d.outgoingTrimDB)) / \(f(d.incomingTrimDB)) dB"
                  + "  (raw gap \(f(d.rawLoudnessGapDB)) dB)")
+    lines.append("  gain ride     \(f(d.rideDB)) dB on the incoming deck"
+                 + "   [cap ±\(f(th("rideMaxDB"), 1)),"
+                 + " released over \(f(d.rideReleaseSeconds, 1))s]"
+                 + "  \(f(d.rawLoudnessGapDB)) → \(f(d.trimmedLoudnessGapDB))"
+                 + " → \(f(d.loudnessGapDB)) dB")
     lines.append("  timbre dist   \(f(d.timbreDistance, 3))"
                  + "      [neutral > \(f(th("neutralTimbreDistance"), 2)),"
                  + " clash > \(f(th("clashTimbreDistance"), 2))]")
@@ -322,6 +327,13 @@ func runRender(_ args: Arguments) {
         if let reason = r.stemFallbackReason {
             stemLine = "\n    stem NOT applied, rendered whole-mix: \(reason)"
         }
+        // The hand-over's gain ride, envelope and all — the render carries the
+        // release too, so it is in the file you are about to play.
+        var rideLine = ""
+        if abs(r.rideDB) > 0.005 {
+            rideLine = "\n    gain ride \(f(r.rideDB)) dB on the incoming deck across the "
+                + "overlap, released over \(f(r.rideReleaseSeconds, 1))s afterwards"
+        }
         // Blind-test level matching, applied to the finished file only.
         var normLine = ""
         if let target = r.normalizationTargetLUFS {
@@ -335,7 +347,7 @@ func runRender(_ args: Arguments) {
             \(f(r.duration))s of audio, hand-over at \(mmss(r.overlapStart)) \
           (overlap \(f(r.overlapDuration))s)
             rendered in \(f(r.renderSeconds))s — \(f(r.realtimeFactor, 1))× real time
-            deck trims \(f(r.outgoingTrimDB)) / \(f(r.incomingTrimDB)) dB (as the player would)\(normLine)\(stemLine)
+            deck trims \(f(r.outgoingTrimDB)) / \(f(r.incomingTrimDB)) dB (as the player would)\(rideLine)\(normLine)\(stemLine)
             afplay \(r.outputURL.path)
           """)
     } catch {
@@ -558,6 +570,7 @@ func runBatch(_ args: Arguments) {
         rows.append("| \(d.outgoingName) → \(d.incomingName) | \(d.tier)"
                     + (d.demotedByKey ? " (key)" : "")
                     + " | \(f(d.loudnessGapDB)) | \(f(d.rawLoudnessGapDB))"
+                    + " | \(f(d.trimmedLoudnessGapDB)) | \(f(d.rideDB))"
                     + " | \(f(d.outgoingTrimDB))/\(f(d.incomingTrimDB))"
                     + " | \(f(d.timbreDistance, 3))"
                     + " | \(optional(d.tempoRatio, 3)) | \(d.keyDistance.map(String.init) ?? "—")"
@@ -614,23 +627,34 @@ func runBatch(_ args: Arguments) {
             + "mean \(f(mean)) · max \(f(sorted.last!))"
     }
     let rawGaps = decisions.map(\.rawLoudnessGapDB)
+    let trimmedGaps = decisions.map(\.trimmedLoudnessGapDB)
     let gaps = decisions.map(\.loudnessGapDB)
     let trims = decisions.flatMap { [$0.outgoingTrimDB, $0.incomingTrimDB] }
-    summary.append("**Loudness gap (dB)** — before compensation: \(spread(rawGaps))")
+    let rides = decisions.map(\.rideDB)
+    summary.append("**Loudness gap (dB)** — ① raw: \(spread(rawGaps))")
     summary.append("")
-    summary.append("**Loudness gap (dB)** — after compensation (what the tier gate reads): "
-                   + "\(spread(gaps))")
+    summary.append("**Loudness gap (dB)** — ② after the whole-track trims: \(spread(trimmedGaps))")
+    summary.append("")
+    summary.append("**Loudness gap (dB)** — ③ after the transition gain ride "
+                   + "(what the tier gate reads): \(spread(gaps))")
     summary.append("")
     summary.append("**Per-track playback trim (dB)** — \(spread(trims))")
+    summary.append("")
+    let ridden = rides.filter { abs($0) > 0.005 }
+    summary.append("**Transition gain ride (dB, signed, on the incoming deck)** — "
+                   + "\(ridden.count)/\(rides.count) pairs ride at all; "
+                   + "over those: \(spread(ridden.map { abs($0) })) of |ride|")
     summary.append("")
     let neutralLine = Audition.standardConfig["neutralLoudnessDB"] ?? 0
     let clashLine = Audition.standardConfig["clashLoudnessDB"] ?? 0
     func over(_ xs: [Double], _ line: Double) -> Int { xs.filter { $0 > line }.count }
-    summary.append("**Pairs the loudness signal alone would demote** — "
+    summary.append("**Pairs the loudness signal alone would demote** (① → ② → ③) — "
                    + "over the tolerance line (\(f(neutralLine, 1)) dB): "
-                   + "\(over(rawGaps, neutralLine)) → \(over(gaps, neutralLine)); "
+                   + "\(over(rawGaps, neutralLine)) → \(over(trimmedGaps, neutralLine))"
+                   + " → \(over(gaps, neutralLine)); "
                    + "over the red line (\(f(clashLine, 1)) dB): "
-                   + "\(over(rawGaps, clashLine)) → \(over(gaps, clashLine))")
+                   + "\(over(rawGaps, clashLine)) → \(over(trimmedGaps, clashLine))"
+                   + " → \(over(gaps, clashLine))")
     summary.append("")
     summary.append(contentsOf: eliminationSection(decisions))
 
@@ -659,10 +683,11 @@ func runBatch(_ args: Arguments) {
         summary.joined(separator: "\n"),
         "## Per-pair decisions",
         "",
-        "| pair | tier | loudness dB | raw loudness dB | trim out/in dB "
+        "| pair | tier | loudness dB | raw loudness dB | trimmed loudness dB | ride dB "
+            + "| trim out/in dB "
             + "| timbre | tempo | key | vocals out/in | blocked at "
             + "| plan | style | stem | overlap | out point | render |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ] + rows).joined(separator: "\n") + "\n"
 
     let docURL = outDir.appendingPathComponent("decisions.md")

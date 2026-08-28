@@ -117,6 +117,37 @@ final class PlaybackEngine: @unchecked Sendable {
         /// which it never reads or writes.
         var trim: Float = 1
 
+        /// The last level a caller asked this deck's fader for, in 0–1 fader
+        /// terms — i.e. `setFaderLocked`'s argument, before `trim` and `ride`.
+        /// Remembered so a *gain* change can be re-applied without a caller:
+        /// the ride glide re-writes the fader between automation ticks, and
+        /// the only correct thing to re-write is whatever the last curve (or
+        /// transport call) asked for.
+        var faderRequest: Float = 1
+
+        /// Transition gain ride: the **second** time-varying multiplier on
+        /// every fader write, stacked on `trim` (`PlaybackEngine.rideDB` /
+        /// `TransitionPlanner.rideDB`). 1 = unity, and every path is then
+        /// bit-identical to the player before the ride existed.
+        ///
+        /// Unlike `trim` — a property of the material, fixed for as long as
+        /// the track plays — this is a property of the *hand-over*: it is set
+        /// on the incoming deck when its overlap begins (where the fader is at
+        /// 0, so introducing it is inaudible by construction), held for the
+        /// whole overlap, and then released back to unity at
+        /// `TransitionAutomation.rideReleaseDBPerSecond` while the deck is the
+        /// only thing playing.
+        var ride: Float = 1
+        /// The ride in dB, and where it is heading. Equal = settled.
+        var rideDB: Double = 0
+        var rideTargetDB: Double = 0
+        /// The ride the release started from, and how far into the release we
+        /// are — so the glide is `TransitionAutomation.rideDB`, the very
+        /// function the offline renderer steps, rather than an accumulator
+        /// that could drift from it.
+        var rideReleaseFromDB: Double = 0
+        var rideReleaseElapsed: TimeInterval = 0
+
         // Progressive-stream bookkeeping.
         var pendingStreamBuffers = 0
         var streamStalled = false
@@ -189,6 +220,8 @@ final class PlaybackEngine: @unchecked Sendable {
     private final class TransitionState {
         let plan: TransitionPlan
         let style: TransitionStyle
+        /// Gain ride for the incoming deck; see `PlannedTransition.rideDB`.
+        let rideDB: Double
         let from: Deck
         let to: Deck
         var phase: TransitionPhase = .waiting
@@ -209,9 +242,11 @@ final class PlaybackEngine: @unchecked Sendable {
         /// point); computed once, shared with the offline renderer.
         let geometry: TransitionAutomation.Geometry
 
-        init(plan: TransitionPlan, style: TransitionStyle, from: Deck, to: Deck) {
+        init(plan: TransitionPlan, style: TransitionStyle, rideDB: Double = 0,
+             from: Deck, to: Deck) {
             self.plan = plan
             self.style = style
+            self.rideDB = rideDB
             self.from = from
             self.to = to
             self.geometry = TransitionAutomation.Geometry(plan: plan)
@@ -233,6 +268,9 @@ final class PlaybackEngine: @unchecked Sendable {
 
     private var clockTimer: DispatchSourceTimer?
     private var faderFlushTimer: DispatchSourceTimer?
+    /// Deck-level gain glide: the transition ride's release. Independent of
+    /// the transition timer on purpose — the release outlives the transition.
+    private var rideTimer: DispatchSourceTimer?
     private var configObserver: NSObjectProtocol?
 
     // MARK: - Init
@@ -284,6 +322,7 @@ final class PlaybackEngine: @unchecked Sendable {
         transitionTimer?.cancel()
         clockTimer?.cancel()
         faderFlushTimer?.cancel()
+        rideTimer?.cancel()
         eventContinuation.finish()
     }
 
@@ -434,6 +473,10 @@ final class PlaybackEngine: @unchecked Sendable {
             // that the fader comes back up (see resetDeckLocked). Routed
             // through setFaderLocked so a seek's flush window still holds the
             // mute until the chain has drained.
+            // Re-aiming the playhead ends any hand-over the ride was unwinding
+            // from; settle it here, before the fader is written, so this deck
+            // comes back at one definite level. See `settleRideLocked`.
+            self.settleRideLocked(state)
             self.setFaderLocked(state, 1)
             self.ensureEngineRunningLocked()
             switch state.source {
@@ -477,6 +520,12 @@ final class PlaybackEngine: @unchecked Sendable {
                 tr.echoTailRinging = false
                 self.silenceDeckLocked(self.deckStates[tr.from]!)
             }
+            // A gain ride cannot glide while nothing renders, and resuming
+            // into a half-released one would just make the drift longer than
+            // it was designed to be. Settle it while the engine is silent —
+            // a ride still inside its overlap is at its target already, so a
+            // pause mid-crossfade moves nothing.
+            for state in self.deckStates.values { self.settleRideLocked(state) }
             self.isPaused = true
             self.engine.pause()
         }
@@ -499,6 +548,10 @@ final class PlaybackEngine: @unchecked Sendable {
     func seek(deck: Deck, to seconds: TimeInterval) {
         queue.async {
             let state = self.deckStates[deck]!
+            // The seek's flush window mutes this deck while the chain drains,
+            // so settling the ride now is inaudible — and the level it comes
+            // back at is the one the new position deserves.
+            self.settleRideLocked(state)
             switch state.source {
             case .none:
                 break
@@ -565,7 +618,7 @@ final class PlaybackEngine: @unchecked Sendable {
             // fired on the spot — see resolvePlanLocked.
             let resolved = self.resolvePlanLocked(planned, from: self.deckStates[from]!)
             self.transition = TransitionState(plan: resolved.plan, style: resolved.style,
-                                              from: from, to: to)
+                                              rideDB: resolved.rideDB, from: from, to: to)
             self.startTransitionTimerLocked(interval: self.slowTickInterval)
         }
     }
@@ -578,6 +631,10 @@ final class PlaybackEngine: @unchecked Sendable {
         var volume: Float
         /// The deck's loudness-compensation multiplier; 1 = no compensation.
         var trim: Float = 1
+        /// The transition gain ride currently on this deck, in dB, and the
+        /// value it is gliding towards (equal = settled). 0/0 = no ride.
+        var rideDB: Double = 0
+        var rideTargetDB: Double = 0
         var rate: Float
         var eqGlobalGain: Float = 0
         var lowGain: Float
@@ -599,9 +656,13 @@ final class PlaybackEngine: @unchecked Sendable {
 
         /// The pose of a deck that is carrying (or about to carry) a track:
         /// transparent chain, fader open.
-        /// "Fader fully open" means the deck's own trim, not literally 1 — a
-        /// compensated deck at full fade sits at its trim by construction.
-        var isNeutral: Bool { effectsAreNeutral && abs(volume - trim) < 0.001 }
+        /// "Fader fully open" means the deck's own gains, not literally 1 — a
+        /// compensated deck at full fade sits at its trim by construction, and
+        /// one still unwinding a hand-over's gain ride sits at trim × ride.
+        var isNeutral: Bool {
+            effectsAreNeutral
+                && abs(volume - trim * LoudnessCompensation.gain(fromDB: rideDB)) < 0.001
+        }
 
         /// The pose `resetDeckLocked` parks a spent deck in: transparent chain
         /// *and* silent, so nothing still draining out of the chain can be
@@ -615,6 +676,8 @@ final class PlaybackEngine: @unchecked Sendable {
             return DeckEffectSnapshot(
                 volume: state.player.volume,
                 trim: state.trim,
+                rideDB: state.rideDB,
+                rideTargetDB: state.rideTargetDB,
                 rate: state.timePitch.rate,
                 eqGlobalGain: state.eq.globalGain,
                 lowGain: state.band(.low).gain,
@@ -735,11 +798,13 @@ final class PlaybackEngine: @unchecked Sendable {
     /// cancel paths) deliberately bypass this and write 0 directly: a deck
     /// that is being taken out of service must go quiet *now*.
     ///
-    /// Every requested level is scaled by the deck's loudness-compensation
-    /// `trim` here, and only here — callers keep speaking in 0–1 fader terms
-    /// (`TransitionAutomation` included) and never see the gain.
+    /// Every requested level is scaled by the deck's two gain multipliers —
+    /// the loudness-compensation `trim` and the transition `ride` — here, and
+    /// only here. Callers keep speaking in 0–1 fader terms
+    /// (`TransitionAutomation` included) and never see either gain.
     private func setFaderLocked(_ state: DeckState, _ value: Float) {
-        let level = value * state.trim
+        state.faderRequest = value
+        let level = value * state.trim * state.ride
         if state.pendingFaderRestore != nil {
             state.pendingFaderRestore = level
         } else {
@@ -748,9 +813,115 @@ final class PlaybackEngine: @unchecked Sendable {
     }
 
     /// Close any open flush window and drop the fader to 0 immediately.
+    /// The *request* goes to 0 too: a deck taken out of service must not be
+    /// resurrected by the ride glide re-applying a stale level.
     private func hardSilenceFaderLocked(_ state: DeckState) {
         state.pendingFaderRestore = nil
+        state.faderRequest = 0
         state.player.volume = 0
+    }
+
+    // MARK: - Transition gain ride (locked)
+
+    /// Tick of the ride glide. Deliberately slow: at 0.3 dB/s a 20 Hz glide
+    /// moves 0.015 dB a step, which is three orders of magnitude under
+    /// audibility, and the release can run for 13 s — this is not something to
+    /// burn the 50 Hz ramp tick on.
+    private static let rideTick: TimeInterval = 0.05
+
+    /// Put the deck's ride at `db` **now**, with no glide, and re-write the
+    /// fader through it.
+    private func setRideLocked(_ state: DeckState, db: Double) {
+        state.rideDB = db
+        state.rideTargetDB = db
+        state.rideReleaseFromDB = db
+        state.rideReleaseElapsed = 0
+        state.ride = LoudnessCompensation.gain(fromDB: db)
+        setFaderLocked(state, state.faderRequest)
+    }
+
+    /// Clear the ride bookkeeping without touching the fader — for a deck
+    /// being taken out of service, where the fader is separately silenced (or,
+    /// for an echo tail, deliberately left exactly where the overlap left it).
+    /// Mirrors how `trim` is reset in `resetDeckLocked`.
+    private func clearRideStateLocked(_ state: DeckState) {
+        state.rideDB = 0
+        state.rideTargetDB = 0
+        state.rideReleaseFromDB = 0
+        state.rideReleaseElapsed = 0
+        state.ride = 1
+    }
+
+    /// Start letting go of the deck's ride: unity is the target, reached at
+    /// `TransitionAutomation.rideReleaseDBPerSecond`.
+    ///
+    /// This deliberately lives on the deck rather than in the transition's
+    /// settling phase. The release runs for up to 13 s — an order of magnitude
+    /// longer than a rate restore or an echo tail — and holding the transition
+    /// state machine open for it would delay every cleanup that keys off
+    /// `transition == nil`. By the time it finishes the hand-over is long over
+    /// and this deck simply *is* the current track.
+    private func releaseRideLocked(_ state: DeckState) {
+        guard abs(state.rideDB) > 0.0001 else {
+            setRideLocked(state, db: 0)
+            return
+        }
+        state.rideTargetDB = 0
+        state.rideReleaseFromDB = state.rideDB
+        state.rideReleaseElapsed = 0
+        startRideTimerLocked()
+    }
+
+    /// Settle a running ride glide to wherever it was heading, immediately.
+    ///
+    /// Called on pause, seek and any re-`play` — the three moments the user
+    /// interrupts the deck. Each is inaudible by construction, which is why a
+    /// jump of up to 4 dB is acceptable here: a paused engine renders nothing,
+    /// and a seek or re-play mutes the deck through `beginFaderFlushLocked`
+    /// while the chain drains and hands back the *new* level afterwards. What
+    /// would not be acceptable is the alternative — a glide left running under
+    /// a track the listener has just re-aimed, drifting its level for another
+    /// ten seconds for a hand-over that no longer exists.
+    ///
+    /// A ride still inside its overlap has target == current, so this is a
+    /// no-op there: pausing mid-crossfade must not move the level.
+    private func settleRideLocked(_ state: DeckState) {
+        guard abs(state.rideDB - state.rideTargetDB) > 0.0001 else { return }
+        setRideLocked(state, db: state.rideTargetDB)
+    }
+
+    private func startRideTimerLocked() {
+        guard rideTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.rideTick, repeating: Self.rideTick,
+                       leeway: .milliseconds(20))
+        timer.setEventHandler { [weak self] in self?.rideTickLocked() }
+        timer.resume()
+        rideTimer = timer
+    }
+
+    private func rideTickLocked() {
+        var anyGliding = false
+        for state in deckStates.values {
+            guard abs(state.rideDB - state.rideTargetDB) > 0.0001 else { continue }
+            // A sourceless deck is out of service (or ringing an echo tail
+            // whose level is already written into player.volume) — never write
+            // its fader. `resetDeckLocked` has already cleared the ride, so
+            // this is belt and braces.
+            if case .none = state.source { continue }
+            anyGliding = true
+            guard !isPaused else { continue }
+            state.rideReleaseElapsed += Self.rideTick
+            let db = TransitionAutomation.rideDB(
+                state.rideReleaseFromDB, secondsAfterOverlap: state.rideReleaseElapsed)
+            state.rideDB = db
+            state.ride = LoudnessCompensation.gain(fromDB: db)
+            setFaderLocked(state, state.faderRequest)
+        }
+        if !anyGliding {
+            rideTimer?.cancel()
+            rideTimer = nil
+        }
     }
 
     /// Open a flush window around a re-schedule of a *sounding* deck.
@@ -863,6 +1034,11 @@ final class PlaybackEngine: @unchecked Sendable {
         // tail is unaffected: its level is already written into player.volume,
         // and nothing calls setFaderLocked on a sourceless deck.)
         state.trim = 1
+        // Same story for the hand-over's gain ride: it belonged to a transition
+        // into material that is no longer here. Cleared without a fader write —
+        // the deck has just been silenced above (or, for an echo tail,
+        // deliberately left at the level the overlap ended on).
+        clearRideStateLocked(state)
         state.isPlaying = false
         state.startOffset = 0
         state.lastKnownPosition = 0
@@ -1085,9 +1261,15 @@ final class PlaybackEngine: @unchecked Sendable {
         let remaining = duration - livePositionLocked(state)
         let fade = min(overlapDurationLocked(planned.plan), Self.fallbackCrossfadeDuration)
         guard fade > 0, remaining >= fade + Self.fallbackCrossfadeHeadroom else {
+            // No overlap left to ride over; the ride goes with the plan.
             return .plain(.gapless)
         }
-        return .plain(.crossfade(duration: fade, outPoint: duration - fade, inPoint: 0))
+        // The gain ride survives the degradation: it is a property of the two
+        // tracks meeting, not of the geometry they meet with, and this is
+        // still the same seam — only shorter.
+        return PlannedTransition(
+            plan: .crossfade(duration: fade, outPoint: duration - fade, inPoint: 0),
+            style: .plain, rideDB: planned.rideDB)
     }
 
     /// A seek moved the outgoing deck's playhead, so the pending plan's out
@@ -1103,10 +1285,11 @@ final class PlaybackEngine: @unchecked Sendable {
             disarmGaplessLocked()
         }
         guard tr.phase == .waiting else { return }
-        let resolved = resolvePlanLocked(PlannedTransition(plan: tr.plan, style: tr.style),
-                                         from: deckStates[deck]!)
+        let resolved = resolvePlanLocked(
+            PlannedTransition(plan: tr.plan, style: tr.style, rideDB: tr.rideDB),
+            from: deckStates[deck]!)
         transition = TransitionState(plan: resolved.plan, style: resolved.style,
-                                     from: tr.from, to: tr.to)
+                                     rideDB: resolved.rideDB, from: tr.from, to: tr.to)
         startTransitionTimerLocked(interval: slowTickInterval)
     }
 
@@ -1260,6 +1443,11 @@ final class PlaybackEngine: @unchecked Sendable {
             to.band(.mid).gain = Self.midCutDB
             to.band(.high).gain = Self.highCutDB
         }
+        // The gain ride goes on here, at full value and with no ramp: the
+        // incoming fader is about to be written to 0, so there is nothing
+        // audible for the step to land on. From this instant every fader write
+        // for this deck — the whole overlap curve — is scaled by it.
+        setRideLocked(to, db: tr.rideDB)
         setFaderLocked(to, 0)
         to.isPlaying = true
         startNodeIfNeededLocked(to)
@@ -1385,6 +1573,11 @@ final class PlaybackEngine: @unchecked Sendable {
         let tailRinging = tr.echoThrown && tr.echoTailRinging
         resetDeckLocked(deckStates[tr.from]!, keepingEchoTail: tailRinging)
         setFaderLocked(to, 1)
+        // "Fader fully open" now means the deck's trim *and* its ride; start
+        // letting go of the latter. The release runs on the deck's own glide
+        // timer, so it does not hold the transition open — this block may well
+        // clear `transition` two lines below while the ride is still unwinding.
+        releaseRideLocked(to)
         to.band(.low).gain = 0
         to.band(.mid).gain = 0
         to.band(.high).gain = 0
@@ -1465,6 +1658,9 @@ final class PlaybackEngine: @unchecked Sendable {
                 // silencing it and resurrecting the outgoing tail.
                 resetDeckLocked(from)
                 setFaderLocked(to, 1)
+                // Same as a normal finish: this deck is the track now, so its
+                // ride is let go of gently rather than snapped away.
+                releaseRideLocked(to)
                 neutralizeEffectsLocked(to)
                 eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
                 return
@@ -1478,13 +1674,19 @@ final class PlaybackEngine: @unchecked Sendable {
             hardSilenceFaderLocked(to)
             to.player.stop()
             neutralizeEffectsLocked(to)
+            // The hand-over never happened, so neither did its ride. The deck
+            // is silent, so dropping it is inaudible; leaving it would colour
+            // whatever this deck is reused for next.
+            setRideLocked(to, db: 0)
             to.isPlaying = false
             setFaderLocked(from, 1)
             neutralizeEffectsLocked(from)
         case .settling:
             // The tail (if any) is cut short — a cancel means something else
             // needs these decks now. `to` is the deck now carrying the track,
-            // so it keeps its fader; `from` is spent.
+            // so it keeps its fader; `from` is spent. A ride release on `to`
+            // is left running: it belongs to the deck, not to this transition,
+            // and whatever happens to that deck next settles or clears it.
             neutralizeEffectsLocked(to)
             silenceDeckLocked(from)
         }

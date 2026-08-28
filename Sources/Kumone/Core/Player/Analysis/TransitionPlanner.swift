@@ -96,11 +96,20 @@ enum TransitionPlanner {
         var echoDelayMax: TimeInterval = 1.0
         /// Window (seconds of 1 s RMS) each side contributes to the loudness gap.
         var loudnessWindow: Int = 15
-        /// Whether the two thresholds above are measured **after** the
-        /// per-track playback trim (`LoudnessCompensation`) or on the raw
-        /// masters. Mirrors the product's setting so the planner judges the
-        /// hand-over the listener will actually hear; see `loudnessGapDB`.
+        /// Whether the two thresholds above are measured **after** the player's
+        /// gain compensation — the per-track playback trim
+        /// (`LoudnessCompensation`) *and* the transition gain ride (`rideDB`) —
+        /// or on the raw masters. Mirrors the product's one user-visible
+        /// switch, so the planner judges the hand-over the listener will
+        /// actually hear; see `loudnessGapDB`. Off also means the ride itself
+        /// is never applied: both gain stages are the same feature.
         var loudnessCompensation: Bool = true
+        /// How far the transition gain ride may hold the incoming deck off its
+        /// own level during a hand-over, in dB, either direction. 0 turns the
+        /// ride off and puts the loudness gate back on the trim-only residual.
+        /// See `rideDB` for why the ride is one-sided and where the cap comes
+        /// from.
+        var rideMaxDB: Double = 4
         /// Out-point search window for beat-matched plans: candidates must sit
         /// past `max(duration * tailWindowShare, outLimit - tailWindowSeconds)`.
         var tailWindowSeconds: TimeInterval = 60
@@ -277,7 +286,8 @@ enum TransitionPlanner {
             // runs over it unchanged (see `StemTechniqueLayer`).
             var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
             style.stemTechnique = matched.stem
-            return PlannedTransition(plan: .beatMatched(matched.plan), style: style)
+            return PlannedTransition(plan: .beatMatched(matched.plan), style: style,
+                                     rideDB: s.rideDB)
         }
         let cap: TimeInterval
         switch tier {
@@ -294,7 +304,11 @@ enum TransitionPlanner {
         var style = crossfadeStyle(tier: tier, outgoing: outgoing,
                                    plan: crossfade.plan, config: config)
         style.stemTechnique = crossfade.stem
-        return PlannedTransition(plan: crossfade.plan, style: style)
+        // The ride only makes sense over an overlap — it *is* the seconds the
+        // two decks share, held at a corrected level. A `.gapless` seam has no
+        // such window (and `.plain(.gapless)`, the AutoMix-off / iOS path, must
+        // stay bit-identical), so every early return above keeps ride 0.
+        return PlannedTransition(plan: crossfade.plan, style: style, rideDB: s.rideDB)
     }
 
     // MARK: - Decision ledger
@@ -506,17 +520,30 @@ enum TransitionPlanner {
     /// `audition` can print them (and how close each sits to its threshold)
     /// rather than re-deriving them and drifting from the real decision.
     struct Signals {
-        /// |dB| level gap at the hand-over **as it will be heard**: the raw
-        /// gap between the two masters, less whatever the per-track playback
-        /// trims already cancel. See `loudnessGapDB`.
+        /// |dB| level gap left at the hand-over **as it will be heard**, after
+        /// *both* gain stages: the whole-track playback trims and the
+        /// transition gain ride. This is the number the tier gate judges — see
+        /// the three-stage story on `loudnessGapDB`.
         let loudnessGapDB: Double
-        /// The same gap before compensation — what the gate used to measure,
-        /// kept so the console can show the move rather than just the result.
+        /// Stage two: the gap after the per-track trims but before the ride.
+        /// What the gate measured between the trim landing and the ride
+        /// landing, kept so the console can narrate the second of three moves.
+        let trimmedLoudnessGapDB: Double
+        /// Stage one: the gap before any compensation at all — what the gate
+        /// measured originally, kept so the console can show the whole move
+        /// rather than just the result.
         let rawLoudnessGapDB: Double
         /// The playback trim each deck will run at (dB, 0 when compensation is
         /// off or the loudness is unknown).
         let outgoingTrimDB: Double
         let incomingTrimDB: Double
+        /// **Signed** transition gain ride for the *incoming* deck, in dB:
+        /// held for the whole overlap and then released back to unity. Negative
+        /// = the incoming track enters hotter than the outgoing tail and is
+        /// held down; positive = it enters weak and is lifted. 0 when the ride
+        /// is off, when there is no overlap to ride over, or when there was no
+        /// gap left to close. See `rideDB`.
+        let rideDB: Double
         let timbreDistance: Double
         /// Folded (double/half-time) BPM difference as a ratio of the outgoing
         /// tempo; nil when either tempo is below the confidence gate.
@@ -539,13 +566,82 @@ enum TransitionPlanner {
             for: outgoing, enabled: config.loudnessCompensation)
         let inTrim = LoudnessCompensation.trimDB(
             for: incoming, enabled: config.loudnessCompensation)
+        // Stage two: what the two constant trims left behind, still signed
+        // (positive = the outgoing tail is the louder side).
+        let trimmed = raw + outTrim - inTrim
+        let ride = rideDB(forTrimmedGapDB: trimmed, incoming: incoming,
+                          incomingTrimDB: inTrim, config: config)
         return Signals(
-            loudnessGapDB: abs(raw + outTrim - inTrim),
+            loudnessGapDB: abs(trimmed - ride),
+            trimmedLoudnessGapDB: abs(trimmed),
             rawLoudnessGapDB: abs(raw),
             outgoingTrimDB: outTrim,
             incomingTrimDB: inTrim,
+            rideDB: ride,
             timbreDistance: timbreDistance(outgoing.melProfile, incoming.melProfile),
             tempoRatio: tempoRatio)
+    }
+
+    /// **Transition gain ride**: the temporary gain offset the *incoming* deck
+    /// is held at for the length of the hand-over, and then released from.
+    ///
+    /// ### Why a ride at all
+    ///
+    /// `LoudnessCompensation` aligns two *whole* masters. It cannot align two
+    /// *seconds* — a track that ends on a bare piano outro and one that opens
+    /// on a full band are 8 dB apart at the seam however well their integrated
+    /// loudness matches, and the corpus says this local difference, not the
+    /// mastering difference, is what the tier gate keeps demoting pairs for.
+    /// A human DJ's answer is not a different fade curve: it is the incoming
+    /// deck's trim knob, pulled down before the blend and pushed back up once
+    /// the new track owns the room. This is that gesture, automated.
+    ///
+    /// ### Why only the incoming deck
+    ///
+    /// The ride is deliberately **one-sided**. Splitting it — half down on the
+    /// incoming deck, half up on the outgoing one — is tempting and wrong:
+    ///
+    ///   - The outgoing deck is mid-song and *already audible at full level*
+    ///     when the overlap begins. Any ride on it is a step change in a
+    ///     signal the listener is currently hearing, which is precisely the
+    ///     artefact this feature exists to remove; making it inaudible would
+    ///     need its own pre-ramp, over seconds the plan does not automate.
+    ///   - The outgoing deck is never given its level back. It ends. So a ride
+    ///     on it permanently recolours a song's last seconds — an arrangement
+    ///     decision, not a compensation.
+    ///   - The incoming deck enters from a fader at 0, so *any* offset on it
+    ///     costs nothing to introduce, and it is released while it is the only
+    ///     thing playing, where a slow glide is inaudible.
+    ///
+    /// One-sided also closes exactly as much of the gap as two-sided would:
+    /// only the difference between the decks is audible.
+    ///
+    /// ### Sign and bounds
+    ///
+    /// `trimmedGapDB` is signed the way `rawLoudnessGapDB` is (positive = the
+    /// outgoing tail is louder), so adding it to the incoming deck is what
+    /// closes the gap. It is clipped to `±rideMaxDB` — beyond about 4 dB the
+    /// ride stops being a level match and starts being a mix — and a *boost*
+    /// is additionally held to whatever headroom the incoming track's own peak
+    /// leaves after its trim, the same clip guard `LoudnessCompensation` runs.
+    /// Whatever the clips refuse is exactly what the tier gate still sees.
+    ///
+    /// Zero — and so bit-identical to the pre-ride player — when compensation
+    /// is off (this is the same gain-compensation family the user's one switch
+    /// governs), when `rideMaxDB` is 0, or when the gap is already closed.
+    static func rideDB(
+        forTrimmedGapDB trimmedGapDB: Double, incoming: TrackAnalysis?,
+        incomingTrimDB: Double, config: Config
+    ) -> Double {
+        guard config.loudnessCompensation, config.rideMaxDB > 0 else { return 0 }
+        guard trimmedGapDB.isFinite else { return 0 }
+        if trimmedGapDB < 0 {
+            // Hold the incoming deck down; a cut is always safe.
+            return max(trimmedGapDB, -config.rideMaxDB)
+        }
+        let headroom = LoudnessCompensation.boostHeadroomDB(
+            for: incoming, afterTrimDB: incomingTrimDB)
+        return min(trimmedGapDB, config.rideMaxDB, headroom)
     }
 
     static func compatibility(
@@ -577,14 +673,21 @@ enum TransitionPlanner {
     /// which is the right thing to gate a hand-over on — while
     /// `referenceLoudness` is a *whole-track* mastering figure, which is the
     /// right thing to derive a constant playback trim from. `signals` combines
-    /// them: what the listener hears at the hand-over is this local gap shifted
-    /// by the difference of the two decks' trims, so the gate is left measuring
-    /// only the part the compensation could not absorb (a trim clipped by the
-    /// +3 dB boost cap or by the peak guard, or a track with no loudness
-    /// reading at all). Two songs whose masters differ by 6 dB but whose
-    /// hand-over windows are equally loud have always read 0 dB here and still
-    /// do; two songs whose 6 dB gap the trims cancel now also read ~0, instead
-    /// of being demoted for a difference the player itself removes.
+    /// them in **three stages**, and the tier gate only ever judges the last:
+    ///
+    ///   1. `rawLoudnessGapDB` — this number, the bare local difference.
+    ///   2. `trimmedLoudnessGapDB` — after the two decks' whole-track trims.
+    ///      Two songs whose masters differ by 6 dB but whose hand-over windows
+    ///      are equally loud have always read 0 dB at stage 1 and still do; two
+    ///      songs whose 6 dB gap the trims cancel now also read ~0 here,
+    ///      instead of being demoted for a difference the player removes.
+    ///   3. `loudnessGapDB` — after the transition gain ride (`rideDB`) holds
+    ///      the incoming deck off its own level for the length of the overlap.
+    ///      This is what the listener hears at the seam, so this is what the
+    ///      gate measures: only the part *neither* gain stage could absorb (a
+    ///      trim clipped by the +3 dB boost cap or the peak guard, a ride
+    ///      clipped by `rideMaxDB` or by the same peak guard, or a track with
+    ///      no loudness reading at all).
     private static func rawLoudnessGapDB(
         outgoing: TrackAnalysis, incoming: TrackAnalysis, config: Config
     ) -> Double {
