@@ -61,12 +61,24 @@ enum TransitionPlanner {
         /// fixed lead is one number to reason about at the seam.
         var rampLeadSeconds: TimeInterval = 12
         /// Seconds over which the incoming deck is let back to 1.0 once it is
-        /// the only thing audible. The same gesture as `rideDB`'s release, for
-        /// the same reason — nobody should notice it happening — and sized
-        /// like it: 6 % over 8 s is 0.75 %/s, a touch brisker than the glide in
-        /// because there is no second deck left to beat against, so a small
-        /// residual drift has nothing to drift *relative to*.
-        var rampReleaseSeconds: TimeInterval = 8
+        /// the only thing audible.
+        ///
+        /// **Not sized like the gain ride, and the difference matters.** A ride
+        /// is let go of over ~13 s because gain is transparent: the only thing
+        /// to hide is the *movement*, so slower is strictly better. A rate is
+        /// not transparent. Every second a deck spends off unity is a second of
+        /// phase-vocoder artifact — the watery, phasey colour of a time-pitch
+        /// unit doing work — and that cost is roughly constant in the size of
+        /// the bend, so stretching the release does not make it subtler, it
+        /// makes it *last longer*. (Shipping 8 s here on the ride analogy is
+        /// what a listener reported as the music being stuck underwater.)
+        ///
+        /// So the trade runs the other way from the lead: get out of the
+        /// processing quickly, and spend just enough time to keep the exit a
+        /// glide rather than a step. 3 s is about two bars at 120 BPM — long
+        /// enough that 6 % unwinds as a settle instead of a click, short enough
+        /// that the artifact is gone before the new track's first phrase is.
+        var rampReleaseSeconds: TimeInterval = 3
         /// The beat-match caps that apply **instead** of `maxBPMDeltaRatio` /
         /// `maxRateDeviation` while `tempoRampEnabled` is on.
         ///

@@ -121,7 +121,9 @@ extension TransitionPlanner.Config {
                   + "默认 12 秒 = 6% 的变速按每秒 0.5% 的可听阈算出来的。",
               2, 30, 0.5, 1, \.rampLeadSeconds),
         field("rampReleaseSeconds", "beatmatch",
-              "叠加结束、只剩入曲在响之后，用多少秒把它的速度放回原速。跟音量 ride 的收手是同一种动作。",
+              "叠加结束、只剩入曲在响之后，用多少秒把它的速度放回原速。注意方向跟 rampLeadSeconds 相反："
+                  + "变速期间一直在过变调器，会有“水声”，所以这里是越短越干净，只要别短到变成一个台阶。"
+                  + "调大 = 速度回落更平缓，但水声拖得更久。",
               1, 20, 0.5, 1, \.rampReleaseSeconds),
         field("rampMaxBPMDeltaRatio", "beatmatch",
               "开了 tempoRampEnabled 时生效的速度差上限（替代 maxBPMDeltaRatio）。"

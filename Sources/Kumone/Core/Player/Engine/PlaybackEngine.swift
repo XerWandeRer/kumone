@@ -319,7 +319,29 @@ final class PlaybackEngine: @unchecked Sendable {
         var swapOffset: TimeInterval { geometry.swapOffset }
     }
 
-    private var transition: TransitionState?
+    /// The pending or running hand-over.
+    ///
+    /// Written through a setter, not stored bare, for one reason: **a deck the
+    /// tempo glide has bent must never outlive the plan that bent it.** A
+    /// time-pitch unit off unity is not a subtle colour — it is the phasey,
+    /// watery artifact a listener calls "underwater", and unlike a stuck fader
+    /// or a ducked EQ band nothing in the system ever resolves it on its own.
+    /// The music just stays like that until the track ends.
+    ///
+    /// There are a dozen places that drop or swap a transition, and one of them
+    /// (`beginOverlapLocked`'s contract-violation exit) shipped without the
+    /// un-bend and stranded the outgoing deck permanently. Rather than add the
+    /// call there and wait for the next one, the invariant is enforced where it
+    /// cannot be forgotten: losing the plan *is* handing the rate back.
+    private var transition: TransitionState? {
+        get { storedTransition }
+        set {
+            if let old = storedTransition, old !== newValue { endTempoRampLocked(old) }
+            storedTransition = newValue
+        }
+    }
+
+    private var storedTransition: TransitionState?
     private var transitionTimer: DispatchSourceTimer?
     /// Fast tick for ramps; the slow tick carries the (possibly minutes-long)
     /// wait for the out point without burning 50 wakeups a second.
@@ -844,10 +866,9 @@ final class PlaybackEngine: @unchecked Sendable {
     func replaceTransitionPlan(_ planned: PlannedTransition) {
         queue.async {
             guard let tr = self.transition, tr.phase == .waiting else { return }
-            // The new plan carries its own glide (or none); the old one's is
-            // handed back rather than inherited by a state that was not built
-            // for it.
-            self.endTempoRampLocked(tr)
+            // The new plan carries its own glide (or none); installing it hands
+            // the old one's back rather than letting a state that was not built
+            // for it inherit a bent deck.
             let resolved = self.resolvePlanLocked(planned, from: self.deckStates[tr.from]!)
             let state = TransitionState(plan: resolved.plan, style: resolved.style,
                                         from: tr.from, to: tr.to)
@@ -1443,12 +1464,12 @@ final class PlaybackEngine: @unchecked Sendable {
             disarmSegmentLocked()
         }
         guard tr.phase == .waiting else { return }
-        // The glide is a function of where the playhead is; the playhead just
-        // moved. Hand the rate back before re-resolving — if the new position
-        // is still inside the ramp window the fresh state re-enters the glide
-        // from there on its next tick, and if it is not, the deck is simply
-        // back at unity where it belongs.
-        endTempoRampLocked(tr)
+        // The glide is a function of where the playhead is, and the playhead
+        // just moved — so the old curve is void. Installing the fresh state
+        // below hands the rate back; if the new position is still inside the
+        // ramp window the fresh state re-enters the glide from there on its
+        // next tick, and if it is not, the deck stays at unity where it
+        // belongs.
         let resolved = resolvePlanLocked(
             PlannedTransition(plan: tr.plan, style: tr.style, rideDB: tr.rideDB),
             from: deckStates[deck]!)
@@ -1593,10 +1614,12 @@ final class PlaybackEngine: @unchecked Sendable {
     /// Put the outgoing deck back at unity if the glide had started bending it.
     ///
     /// A `.waiting` transition touches exactly one parameter of one deck, so
-    /// this is the whole of "undo a pending hand-over". Every path that drops,
-    /// re-resolves or cancels a waiting plan calls it; `beginOverlapLocked`
-    /// does not, because there the overlap automation takes the rate over on
-    /// its very first tick.
+    /// this is the whole of "undo a pending hand-over". **Do not call it from
+    /// the teardown paths** — the `transition` setter does, for every one of
+    /// them at once, which is the only way this stays true as paths are added.
+    /// `beginOverlapLocked` is the sole other caller, and it clears the flag
+    /// rather than the rate: there the overlap automation takes the rate over
+    /// on its very first tick.
     private func endTempoRampLocked(_ tr: TransitionState) {
         guard tr.rampActive else { return }
         tr.rampActive = false
@@ -1936,6 +1959,12 @@ final class PlaybackEngine: @unchecked Sendable {
         }
         setFaderLocked(to, 1)
         releaseRideLocked(to)
+        // The segment rendered its own rate release, so the deck picking the
+        // track up at the tail is playing unbent audio and must be at unity to
+        // match. It is the only completion path that never otherwise touches
+        // the incoming chain, and "the deck was already neutral" is an
+        // assumption about every caller rather than something stated here.
+        neutralizeEffectsLocked(to)
         parkSegmentLocked()
         if from.isPlaying { retireOutgoingForSegmentLocked(from) }
         resetDeckLocked(from)
@@ -2182,9 +2211,8 @@ final class PlaybackEngine: @unchecked Sendable {
                 finishOverlapLocked(tr)
             } else {
                 // The out point was never reached (plan beyond the file end):
-                // behave like a plain natural finish. The deck is spent, but it
-                // is reused, so the glide comes off it here too.
-                endTempoRampLocked(tr)
+                // behave like a plain natural finish. The deck is spent but it
+                // is reused, and dropping the plan un-bends it.
                 transition = nil
                 stopTransitionTimerLocked()
                 from.isPlaying = false
@@ -2201,15 +2229,13 @@ final class PlaybackEngine: @unchecked Sendable {
         let to = deckStates[tr.to]!
         switch tr.phase {
         case .waiting:
-            // Nothing audible has changed decks, but the tempo glide may
-            // already have the outgoing deck off unity: hand it back.
-            endTempoRampLocked(tr)
+            // Nothing audible has changed decks. Any tempo glide went back to
+            // unity with the `transition = nil` above.
+            break
         case .segmentArmed:
             // Nothing has been handed over yet; take the segment back off the
-            // clock and leave the outgoing deck exactly as it is — bar the
-            // tempo glide, which is this transition's doing and goes with it.
+            // clock and leave the outgoing deck exactly as it is.
             parkSegmentLocked()
-            endTempoRampLocked(tr)
         case .segmentPlaying:
             abortSegmentLocked(tr)
         case .armed, .overlapping:

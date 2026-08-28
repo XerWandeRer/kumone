@@ -143,8 +143,12 @@ import Foundation
             start: 0, end: config.rampLeadSeconds,
             target: Float(1 + config.rampMaxRateDeviation))
         #expect(ramp.slopePerSecond <= 0.005 + 1e-9)
-        // And the release is the same gesture at the same order of magnitude.
-        #expect(config.rampMaxRateDeviation / config.rampReleaseSeconds <= 0.01)
+        // The release is deliberately *not* held to that bound. Time spent off
+        // unity is time spent in the phase vocoder, so the release optimises
+        // for getting out fast; it only has to stay slow enough to be a settle
+        // rather than a step, and short enough not to outstay the seam.
+        #expect(config.rampReleaseSeconds <= 4)
+        #expect(config.rampReleaseSeconds >= 1)
     }
 
     /// The load-bearing piece of the beat-phase argument: how long the deck

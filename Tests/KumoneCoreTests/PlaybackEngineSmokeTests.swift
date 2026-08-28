@@ -1680,4 +1680,141 @@ struct PlaybackEngineSmokeTests {
         #expect(abs(afterCancel - 1) < 0.001,
                 "a cancelled hand-over must not leave the deck detuned (\(afterCancel))")
     }
+
+    /// **A bent deck must always have something scheduled to un-bend it.**
+    ///
+    /// A time-pitch unit off unity is not a subtle colour: it is the phasey,
+    /// watery artifact a listener describes as the music being underwater, and
+    /// unlike a stuck fader or a ducked EQ band it never resolves on its own.
+    /// So the rule is stronger than "the happy path restores it" — *every*
+    /// teardown order has to, in any order, at any moment, including the ones
+    /// that tear the transition down while its release glide is still running.
+    ///
+    /// Each case interrupts the hand-over somewhere different and then asks the
+    /// same question of whichever deck is left carrying the music.
+    @Test func everyTeardownOrderHandsTheRateBack() throws {
+        guard audioOutputAvailable else { return }
+        enum Interruption: String {
+            /// The undisturbed path: just wait the release out.
+            case none
+            /// What `PlayerService` really does — `.transitionCompleted`
+            /// arrives, the next hand-over is armed, and the release for the
+            /// last one is still running.
+            case armNextImmediately
+            /// The prefetcher loads the next track onto the spent deck while
+            /// the release runs.
+            case loadOntoSpentDeck
+            /// The user drags the playhead moments after the seam.
+            case seekAfterSeam
+            /// …or pauses in the middle of the release.
+            case pauseThenResume
+            /// The transition is dropped outright mid-release.
+            case cancelMidRelease
+        }
+        // A long release and a big bend, so a deck left bent is unmistakable.
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.95, incomingRate: 1.06,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 6))
+
+        for interruption in [Interruption.none, .armNextImmediately, .loadOntoSpentDeck,
+                             .seekAfterSeam, .pauseThenResume, .cancelMidRelease] {
+            let result = withWatchdog("rateHandBack-\(interruption.rawValue)", timeout: 60) {
+                () -> PlaybackEngine.DeckEffectSnapshot? in
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                      (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil
+                else { return nil }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: 2.6)
+                engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+                _ = log.wait(timeout: 20) {
+                    if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                    return false
+                }
+                // Deck B is the music now, and is bent at 1.06 with a 6 s
+                // release running. Interrupt it a second in.
+                Thread.sleep(forTimeInterval: 1.0)
+                switch interruption {
+                case .none:
+                    break
+                case .armNextImmediately:
+                    engine.scheduleTransition(
+                        .plain(.crossfade(duration: 2, outPoint: 4.5, inPoint: 0)),
+                        from: .b, to: .a)
+                case .loadOntoSpentDeck:
+                    _ = try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)
+                case .seekAfterSeam:
+                    engine.seek(deck: .b, to: 0.5)
+                case .pauseThenResume:
+                    engine.pause()
+                    Thread.sleep(forTimeInterval: 0.8)
+                    engine.resume()
+                case .cancelMidRelease:
+                    engine.cancelScheduledTransition()
+                }
+                // Well past the 6 s release, whatever happened to it.
+                let deadline = Date().addingTimeInterval(9)
+                while Date() < deadline {
+                    if abs(engine.effectSnapshot(of: .b).rate - 1) < 0.001 { break }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+                return engine.effectSnapshot(of: .b)
+            }
+            guard let snapshot = result ?? nil else { continue }
+            let detuned = "\(interruption.rawValue): the deck carrying the music is still "
+                + "detuned — it will sound underwater until the track ends (\(snapshot))"
+            let coloured = "\(interruption.rawValue): the live deck's chain must be "
+                + "transparent once the hand-over is done with it (\(snapshot))"
+            #expect(abs(snapshot.rate - 1) < 0.001, "\(detuned)")
+            #expect(snapshot.effectsAreNeutral, "\(coloured)")
+        }
+    }
+
+    /// The contract-violation exit from `beginOverlapLocked`: the incoming deck
+    /// turns out not to be loaded, so the plan is dropped at the out point.
+    ///
+    /// The comment above that exit already tells this story once — a dropped
+    /// plan used to strand the *incoming* deck at −24 dB because nothing but
+    /// the ramps that never ran would have released it. The tempo glide put the
+    /// *outgoing* deck in exactly the same position, and this pins it: the deck
+    /// still playing the song must come back to unity.
+    @Test func aDroppedPlanUnbendsTheDeckItWasAlreadyGliding() throws {
+        guard audioOutputAvailable else { return }
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.90, incomingRate: 1.05,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 2))
+        struct Outcome {
+            var midRamp: Float?
+            var afterOutPoint: Float?
+        }
+        let result = withWatchdog("droppedPlanUnbends", timeout: 45) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            defer { engine.stopAll() }
+            // Deck B is deliberately never loaded: the plan cannot be honoured.
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil
+            else { return o }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 2.6)
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 1.2)
+            o.midRamp = engine.effectSnapshot(of: .a).rate
+            // Play past the out point, where the plan is dropped.
+            _ = pollPosition(engine, deck: .a, past: 5.6, timeout: 8)
+            Thread.sleep(forTimeInterval: 0.5)
+            o.afterOutPoint = engine.effectSnapshot(of: .a).rate
+            return o
+        }
+        guard let o = result, let mid = o.midRamp, let after = o.afterOutPoint else { return }
+        #expect(mid < 0.999, "the glide must have been running (\(mid))")
+        let stranded = "a plan dropped at the out point must un-bend the deck that is "
+            + "still playing — nothing else ever will (\(after))"
+        #expect(abs(after - 1) < 0.001, "\(stranded)")
+    }
 }
