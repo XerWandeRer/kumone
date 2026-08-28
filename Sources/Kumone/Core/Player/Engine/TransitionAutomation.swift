@@ -28,6 +28,10 @@ enum TransitionAutomation {
     static let bassCutDB: Float = -24
     /// Staged hand-over: how far the mid / high bands duck at full cut.
     static let midCutDB: Float = -18
+    /// Live stand-in for a stem-level vocal duck until S3's pre-render path
+    /// exists: how far the outgoing mid band drops when the plan carries a
+    /// stem technique.
+    static let stemApproxDuckDB: Float = -7
     static let highCutDB: Float = -24
     /// `.filterSweep` end points; the sweep is logarithmic between them.
     static let sweepStartHz: Float = 20
@@ -208,6 +212,19 @@ enum TransitionAutomation {
             }
 
             applyEQHandover(&f, plan: plan, style: style, geometry: geometry, elapsed: t)
+
+            // Live approximation of the vocal-facing stem techniques: the
+            // engine has no stem playback path yet (that is S3's pre-render
+            // job), so a plan that asked for one gets a mid-band duck on the
+            // outgoing deck — the 900 Hz parametric band carries most vocal
+            // presence. Crude next to a real separated duck, but audibly the
+            // right direction, and it only engages when the planner explicitly
+            // chose a stem technique.
+            if style.stemTechnique != nil {
+                let edge = Float(min(1, t / 0.5))
+                f.outgoing.midGain = min(f.outgoing.midGain,
+                                         Self.stemApproxDuckDB * edge)
+            }
 
             f.midpointReached = progress >= 0.5
             if case .beatMatched(let p) = plan {
