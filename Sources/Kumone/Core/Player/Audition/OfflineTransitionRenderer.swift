@@ -101,6 +101,13 @@ enum OfflineTransitionRenderer {
         /// read), and how much outgoing audio it was asked for.
         var stemSeconds: Double? = nil
         var stemSeparatedSeconds: TimeInterval? = nil
+        /// Source seconds of the *incoming* track that were separated. Only a
+        /// `.custom` envelope with a live incoming lane pays for this second
+        /// pass; nil means the render split one deck, as every technique
+        /// before envelopes did.
+        var stemIncomingSeparatedSeconds: TimeInterval? = nil
+        /// Which decks were split ("出曲" / "入曲").
+        var stemSeparatedSides: [String] = []
         /// Vocal energy in the separated window, relative to the mixture.
         /// Near zero means an instrumental outro — the technique ran and had
         /// nothing to work on.
@@ -273,17 +280,40 @@ enum OfflineTransitionRenderer {
             // automation below plays over stems without knowing it.
             if let technique = planned.style.stemTechnique {
                 var outgoingRate = 1.0
-                if case .beatMatched(let p) = planned.plan { outgoingRate = Double(p.outgoingRate) }
+                var incomingRate = 1.0
+                if case .beatMatched(let p) = planned.plan {
+                    outgoingRate = Double(p.outgoingRate)
+                    incomingRate = Double(p.incomingRate)
+                }
                 do {
                     guard let provider = options.vocalStemProvider else {
                         throw StemTechniqueLayer.StemError.noProvider
                     }
-                    stemApplied = try StemTechniqueLayer.apply(
-                        technique, to: outBuffer,
-                        source: outgoingURL, windowStart: outStart,
-                        overlapStartFrame: Int((preRoll * sampleRate).rounded()),
-                        plan: planned.plan, style: planned.style, geometry: geometry,
-                        outgoingRate: outgoingRate, provider: provider)
+                    if case .custom(let envelope) = technique {
+                        // The incoming buffer is loaded *at* its in point and
+                        // starts playing when the overlap does, so its overlap
+                        // begins at frame zero — unlike the outgoing one, which
+                        // carries the render's pre-roll first.
+                        stemApplied = try StemTechniqueLayer.apply(
+                            envelope: envelope,
+                            outgoing: StemTechniqueLayer.Side(
+                                buffer: outBuffer, source: outgoingURL,
+                                windowStart: outStart,
+                                overlapStartFrame: Int((preRoll * sampleRate).rounded()),
+                                rate: outgoingRate),
+                            incoming: StemTechniqueLayer.Side(
+                                buffer: inBuffer, source: incomingURL,
+                                windowStart: inPoint, overlapStartFrame: 0,
+                                rate: incomingRate),
+                            geometry: geometry, provider: provider)
+                    } else {
+                        stemApplied = try StemTechniqueLayer.apply(
+                            technique, to: outBuffer,
+                            source: outgoingURL, windowStart: outStart,
+                            overlapStartFrame: Int((preRoll * sampleRate).rounded()),
+                            plan: planned.plan, style: planned.style, geometry: geometry,
+                            outgoingRate: outgoingRate, provider: provider)
+                    }
                 } catch {
                     stemFallback = (error as? LocalizedError)?.errorDescription
                         ?? error.localizedDescription
@@ -431,6 +461,8 @@ enum OfflineTransitionRenderer {
                       stemTechnique: stemApplied?.technique.label,
                       stemSeconds: stemApplied?.seconds,
                       stemSeparatedSeconds: stemApplied?.separatedSeconds,
+                      stemIncomingSeparatedSeconds: stemApplied?.incomingSeparatedSeconds,
+                      stemSeparatedSides: stemApplied?.separatedSides ?? [],
                       stemVocalEnergyRatio: stemApplied?.vocalEnergyRatio,
                       stemCacheHit: stemApplied?.cacheHit ?? false,
                       stemFallbackReason: stemFallback)

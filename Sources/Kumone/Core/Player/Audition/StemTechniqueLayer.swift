@@ -59,8 +59,10 @@ enum StemTechniqueLayer {
 
     struct Applied: Sendable {
         let technique: StemTechnique
-        /// Wall-clock seconds the provider took (separation, or a cache read).
+        /// Wall-clock seconds the provider took (separation, or a cache read),
+        /// summed over every side that was separated.
         let seconds: Double
+        /// Every side that was consulted came back from the provider's cache.
         let cacheHit: Bool
         /// Source seconds of the outgoing track that were separated.
         let separatedSeconds: TimeInterval
@@ -70,12 +72,18 @@ enum StemTechniqueLayer {
         /// however correctly it ran. Worth saying out loud rather than
         /// leaving the listener to wonder why nothing changed.
         let vocalEnergyRatio: Double
+        /// Source seconds of the *incoming* track that were separated — only a
+        /// `.custom` envelope with a live incoming lane ever pays for this.
+        var incomingSeparatedSeconds: TimeInterval? = nil
+        /// Which decks were split, for the console's cost line.
+        var separatedSides: [String] = ["出曲"]
     }
 
     enum StemError: LocalizedError {
         case noProvider
         case noOverlap
         case emptyWindow
+        case uncompiledExchange
         case shapeMismatch(expectedChannels: Int, expectedFrames: Int,
                            gotChannels: Int, gotFrames: Int)
 
@@ -87,10 +95,28 @@ enum StemTechniqueLayer {
                 return "a stem technique needs an overlap; this plan has none"
             case .emptyWindow:
                 return "the overlap window has no audio to separate"
+            case .uncompiledExchange:
+                return "vocalExchange 是一个模板标记，要先由 Audition.decide 读歌词编译成"
+                    + " stemEnvelope 才能渲染"
             case .shapeMismatch(let ec, let ef, let gc, let gf):
                 return "stem provider returned \(gc)×\(gf) samples, expected \(ec)×\(ef)"
             }
         }
+    }
+
+    /// One deck's window, as the envelope path needs to see it.
+    ///
+    /// `overlapStartFrame` differs between the two by construction: the
+    /// outgoing buffer carries the render's pre-roll ahead of the hand-over,
+    /// while the incoming one is loaded *at* its in point and starts playing
+    /// when the overlap does.
+    struct Side {
+        let buffer: AVAudioPCMBuffer
+        let source: URL
+        let windowStart: TimeInterval
+        let overlapStartFrame: Int
+        /// Playback rate this deck runs at during the overlap.
+        let rate: Double
     }
 
     /// S1's `highpass(x, 100.0)` on the acapella: keeps the floated vocal out
@@ -126,16 +152,131 @@ enum StemTechniqueLayer {
                       provider: VocalStemProvider) throws -> Applied {
         let overlap = geometry.overlapDuration
         guard overlap > 0 else { throw StemError.noOverlap }
-        guard let data = buffer.floatChannelData else { throw StemError.emptyWindow }
-
+        switch technique {
+        case .vocalExchange: throw StemError.uncompiledExchange
+        case .custom: throw StemError.uncompiledExchange
+        case .acapellaOver, .instrumentalOut, .vocalDuck: break
+        }
+        let side = Side(buffer: buffer, source: source, windowStart: windowStart,
+                        overlapStartFrame: overlapStartFrame, rate: outgoingRate)
+        let split = try separate(side, overlap: overlap, provider: provider)
         let sampleRate = buffer.format.sampleRate
         let channelCount = Int(buffer.format.channelCount)
-        let rate = max(0.5, min(2, outgoingRate))
-        let start = max(0, min(Int(buffer.frameLength), overlapStartFrame))
+        let data = buffer.floatChannelData!
+
+        let gains = envelopes(technique, frames: split.count, sampleRate: sampleRate,
+                              rate: split.rate,
+                              plan: plan, style: style, geometry: geometry)
+
+        for channel in 0..<channelCount {
+            var vocal = split.vocal[channel]
+            if case .acapellaOver = technique {
+                vocal = zeroPhaseHighPass(vocal, cutoff: acapellaHighPassHz,
+                                          sampleRate: sampleRate)
+            }
+            let pointer = data[channel] + split.start
+            for i in 0..<split.count {
+                // accompaniment = mixture − vocals, by construction.
+                let accompaniment = pointer[i] - split.vocal[channel][i]
+                pointer[i] = accompaniment * gains.accompaniment[i] + vocal[i] * gains.vocal[i]
+            }
+        }
+
+        return Applied(technique: technique, seconds: split.seconds, cacheHit: split.cached,
+                       separatedSeconds: Double(split.count) / sampleRate,
+                       vocalEnergyRatio: split.vocalEnergyRatio)
+    }
+
+    // MARK: - Envelope entry point
+
+    /// Apply a four-lane `StemEnvelope` across both decks' overlap windows.
+    ///
+    /// This is the general form the one-shot techniques above are special cases
+    /// of, and the only path that ever splits the *incoming* track. A side
+    /// whose two lanes are both pass-through is never separated at all — which
+    /// is what keeps a one-sided orchestration as cheap as it always was
+    /// (a separation pass is ~15 s of wall clock per side on an M4).
+    static func apply(envelope: StemEnvelope,
+                      outgoing: Side, incoming: Side,
+                      geometry: TransitionAutomation.Geometry,
+                      provider: VocalStemProvider) throws -> Applied {
+        let overlap = geometry.overlapDuration
+        guard overlap > 0 else { throw StemError.noOverlap }
+        try envelope.validate(overlap: overlap)
+
+        var seconds = 0.0
+        var cacheHits: [Bool] = []
+        var sides: [String] = []
+        var outgoingSeparated: TimeInterval = 0
+        var incomingSeparated: TimeInterval?
+        var ratio = 0.0
+
+        for (side, label, vocalLane, bedLane) in [
+            (outgoing, "出曲", StemEnvelope.Lane.outgoingVocal, StemEnvelope.Lane.outgoingBed),
+            (incoming, "入曲", StemEnvelope.Lane.incomingVocal, StemEnvelope.Lane.incomingBed),
+        ] {
+            guard !envelope.isPassThrough(vocalLane) || !envelope.isPassThrough(bedLane)
+            else { continue }
+            let split = try separate(side, overlap: overlap, provider: provider)
+            let sampleRate = side.buffer.format.sampleRate
+            let channelCount = Int(side.buffer.format.channelCount)
+            let data = side.buffer.floatChannelData!
+            let gains = laneGains(envelope, vocal: vocalLane, bed: bedLane,
+                                  frames: split.count, sampleRate: sampleRate,
+                                  rate: split.rate, overlap: overlap)
+            for channel in 0..<channelCount {
+                let pointer = data[channel] + split.start
+                let vocal = split.vocal[channel]
+                for i in 0..<split.count {
+                    let bed = pointer[i] - vocal[i]
+                    pointer[i] = bed * gains.bed[i] + vocal[i] * gains.vocal[i]
+                }
+            }
+            seconds += split.seconds
+            cacheHits.append(split.cached)
+            sides.append(label)
+            let separated = Double(split.count) / sampleRate
+            if label == "出曲" {
+                outgoingSeparated = separated
+                ratio = split.vocalEnergyRatio
+            } else {
+                incomingSeparated = separated
+                if sides.count == 1 { ratio = split.vocalEnergyRatio }
+            }
+        }
+
+        return Applied(technique: .custom(envelope), seconds: seconds,
+                       cacheHit: !cacheHits.isEmpty && cacheHits.allSatisfy { $0 },
+                       separatedSeconds: outgoingSeparated,
+                       vocalEnergyRatio: ratio,
+                       incomingSeparatedSeconds: incomingSeparated,
+                       separatedSides: sides)
+    }
+
+    // MARK: - Separation
+
+    /// One side's overlap window, split into mixture and vocal.
+    private struct Separated {
+        let vocal: [[Float]]
+        let start: Int
+        let count: Int
+        let rate: Double
+        let seconds: Double
+        let cached: Bool
+        let vocalEnergyRatio: Double
+    }
+
+    private static func separate(_ side: Side, overlap: TimeInterval,
+                                 provider: VocalStemProvider) throws -> Separated {
+        guard let data = side.buffer.floatChannelData else { throw StemError.emptyWindow }
+        let sampleRate = side.buffer.format.sampleRate
+        let channelCount = Int(side.buffer.format.channelCount)
+        let rate = max(0.5, min(2, side.rate))
+        let start = max(0, min(Int(side.buffer.frameLength), side.overlapStartFrame))
         // The overlap consumes `overlap × rate` source seconds; anything the
         // buffer is short by simply is not separated (it is past the file end).
         let wanted = Int((overlap * rate * sampleRate).rounded())
-        let count = min(wanted, Int(buffer.frameLength) - start)
+        let count = min(wanted, Int(side.buffer.frameLength) - start)
         guard count > 0 else { throw StemError.emptyWindow }
 
         let window = (0..<channelCount).map { channel in
@@ -144,7 +285,7 @@ enum StemTechniqueLayer {
 
         let began = Date()
         let stem = try provider(VocalStemRequest(
-            source: source, start: windowStart + Double(start) / sampleRate,
+            source: side.source, start: side.windowStart + Double(start) / sampleRate,
             duration: Double(count) / sampleRate,
             sampleRate: sampleRate, samples: window))
         let seconds = Date().timeIntervalSince(began)
@@ -168,26 +309,41 @@ enum StemTechniqueLayer {
         let mixtureRMS = rootMeanSquare(window)
         let ratio = mixtureRMS > 0 ? rootMeanSquare(stem.channels) / mixtureRMS : 0
 
-        let gains = envelopes(technique, frames: count, sampleRate: sampleRate, rate: rate,
-                              plan: plan, style: style, geometry: geometry)
+        return Separated(vocal: stem.channels, start: start, count: count, rate: rate,
+                         seconds: seconds, cached: stem.cached, vocalEnergyRatio: ratio)
+    }
 
-        for channel in 0..<channelCount {
-            var vocal = stem.channels[channel]
-            if case .acapellaOver = technique {
-                vocal = zeroPhaseHighPass(vocal, cutoff: acapellaHighPassHz,
-                                          sampleRate: sampleRate)
-            }
-            let pointer = data[channel] + start
-            for i in 0..<count {
-                // accompaniment = mixture − vocals, by construction.
-                let accompaniment = pointer[i] - stem.channels[channel][i]
-                pointer[i] = accompaniment * gains.accompaniment[i] + vocal[i] * gains.vocal[i]
-            }
+    /// Per-sample gains for one side's two lanes, evaluated on the automation's
+    /// own 50 Hz control grid and interpolated — the same shape (and the same
+    /// cost) as `envelopes` above.
+    static func laneGains(_ envelope: StemEnvelope,
+                          vocal vocalLane: StemEnvelope.Lane,
+                          bed bedLane: StemEnvelope.Lane,
+                          frames: Int, sampleRate: Double, rate: Double,
+                          overlap: TimeInterval) -> (vocal: [Float], bed: [Float]) {
+        let controlHz = 50.0
+        let elapsedPerFrame = 1 / (sampleRate * rate)
+        let points = max(2, Int((overlap * controlHz).rounded()) + 2)
+        var controlVocal = [Float](repeating: 1, count: points)
+        var controlBed = [Float](repeating: 1, count: points)
+        for k in 0..<points {
+            let elapsed = min(overlap, Double(k) / controlHz)
+            controlVocal[k] = envelope.gain(vocalLane, at: elapsed)
+            controlBed[k] = envelope.gain(bedLane, at: elapsed)
         }
 
-        return Applied(technique: technique, seconds: seconds, cacheHit: stem.cached,
-                       separatedSeconds: Double(count) / sampleRate,
-                       vocalEnergyRatio: ratio)
+        var vocal = [Float](repeating: 1, count: frames)
+        var bed = [Float](repeating: 1, count: frames)
+        for i in 0..<frames {
+            let position = Double(i) * elapsedPerFrame * controlHz
+            let lower = min(points - 1, Int(position))
+            let upper = min(points - 1, lower + 1)
+            let fraction = Float(position - Double(lower))
+            vocal[i] = controlVocal[lower]
+                + (controlVocal[upper] - controlVocal[lower]) * fraction
+            bed[i] = controlBed[lower] + (controlBed[upper] - controlBed[lower]) * fraction
+        }
+        return (vocal, bed)
     }
 
     // MARK: - Gain curves
@@ -244,6 +400,14 @@ enum StemTechniqueLayer {
                     plan: plan, style: style, elapsed: elapsed, geometry: geometry).outgoing.fader
                 let compensation = min(acapellaGainCeiling, 1 / max(fader, 1e-3))
                 controlVocal[k] = hold * compensation
+
+            case .vocalExchange, .custom:
+                // Not gestures: `.vocalExchange` is a marker `Audition.decide`
+                // compiles away, and `.custom` runs through `laneGains`. The
+                // `apply` above refuses both before reaching here; leaving the
+                // lanes at unity keeps this switch total without inventing a
+                // curve nobody asked for.
+                break
             }
         }
 

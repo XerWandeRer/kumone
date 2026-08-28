@@ -760,7 +760,7 @@ import Foundation
     /// The headline rule: the vocal clash that used to cut a crossfade to
     /// `vocalClashFadeCap` becomes a technique instead, and the overlap the
     /// energy shapes earned is kept.
-    @Test func vocalClashUpgradesToADuckAndKeepsTheLongOverlap() {
+    @Test func vocalClashUpgradesToAnExchangeAndKeepsTheLongOverlap() {
         let (outgoing, incoming) = clashingVocalPair()
         guard case .crossfade(let capped, _, _) = TransitionPlanner
                 .plan(outgoing: outgoing, incoming: incoming).plan else {
@@ -777,8 +777,7 @@ import Foundation
         }
         #expect(full == 18)                       // the uncapped, energy-derived length
         #expect(outPoint == 150)                  // a phrase boundary that is being sung
-        #expect(ducked.style.stemTechnique
-                == .vocalDuck(depthDB: -Float(TransitionPlanner.Config.standard.stemDuckDepthDB)))
+        #expect(ducked.style.stemTechnique == .vocalExchange)
         // Composition: the technique layers under the style, it does not replace it.
         #expect(ducked.style.outroEffect == .fade)
         #expect(ducked.style.stagedEQ)
@@ -786,7 +785,9 @@ import Foundation
 
     /// Same rule on the beat-matched path: the 8-bar upgrade the vocal gate
     /// refused is granted, because the clash is now handled rather than avoided.
-    @Test func duckRestoresTheLongBeatMatchedOverlap() {
+    /// The planner names the *template*; compiling it into curves is
+    /// `Audition.decide`'s job, and needs lyrics the planner cannot see.
+    @Test func exchangeRestoresTheLongBeatMatchedOverlap() {
         let outgoing = makeAnalysis(
             bpm: 120, vocalActivity: vocalEnvelope(duration: 200, hot: 140..<200))
         let incoming = makeAnalysis(
@@ -806,8 +807,7 @@ import Foundation
         }
         #expect(long.overlapBars == 8)
         #expect(long.outPoint == 150)
-        #expect(ducked.style.stemTechnique
-                == .vocalDuck(depthDB: -Float(TransitionPlanner.Config.standard.stemDuckDepthDB)))
+        #expect(ducked.style.stemTechnique == .vocalExchange)
         #expect(ducked.style.stagedEQ)            // still the staged hand-over underneath
     }
 

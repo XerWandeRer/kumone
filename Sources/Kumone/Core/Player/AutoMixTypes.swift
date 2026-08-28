@@ -130,12 +130,269 @@ enum StemTechnique: Sendable, Equatable {
     /// vocals stop fighting. S1's blind test liked −9 dB.
     case vocalDuck(depthDB: Float)
 
+    /// **A request for the standard vocal hand-off, not a curve.**
+    ///
+    /// The planner can name this — it is a rule about two vocal-active windows —
+    /// but it cannot *build* it: where the hand-over lands depends on where the
+    /// outgoing singer finishes a line, and the planner is a pure function of
+    /// two `TrackAnalysis` values with no idea what the words are. So this case
+    /// is a marker that `Audition.decide` compiles into `.custom` once it can
+    /// read the `.lrc` sidecar (`Audition.VocalExchange`), degrading to
+    /// `.vocalDuck` — and saying so — when there is nothing to aim at.
+    case vocalExchange
+    /// A finished four-lane orchestration: an explicit gain curve per lane
+    /// across the overlap. Everything above is a one-shot gesture; this is the
+    /// general form, and what `vocalExchange` (and an AI's `stemEnvelope`)
+    /// compile down to.
+    case custom(StemEnvelope)
+
     /// Short name for reports and filenames.
+    ///
+    /// `.custom` carries a digest of its own curves, because the console names
+    /// render files after this string: two different orchestrations of the same
+    /// pair have to be two different files.
     var label: String {
         switch self {
         case .acapellaOver: return "acapellaOver"
         case .instrumentalOut: return "instrumentalOut"
         case .vocalDuck(let depth): return String(format: "vocalDuck(%.1fdB)", depth)
+        case .vocalExchange: return "vocalExchange"
+        case .custom(let envelope): return "custom(\(envelope.signature))"
+        }
+    }
+
+    /// Whether this technique needs a stem split of the *incoming* track too.
+    /// Only `.custom` ever can: every older gesture rewrites the outgoing deck
+    /// alone, which is why the renderer used to separate one side.
+    var needsIncomingStems: Bool {
+        guard case .custom(let envelope) = self else { return false }
+        return !envelope.isPassThrough(.incomingVocal) || !envelope.isPassThrough(.incomingBed)
+    }
+
+    var needsOutgoingStems: Bool {
+        guard case .custom(let envelope) = self else { return true }
+        return !envelope.isPassThrough(.outgoingVocal) || !envelope.isPassThrough(.outgoingBed)
+    }
+}
+
+/// A four-lane gain orchestration across one overlap.
+///
+/// The older `StemTechnique` cases are single gestures: hold the outgoing vocal
+/// 9 dB down, wipe it, float it. A long hand-over between two songs that are
+/// both singing needs more than a gesture — it needs *scheduling*, so that at
+/// every instant exactly one vocal is in front and the two accompaniments form
+/// one continuous bed. That is four independent curves, and this is them.
+///
+/// **Semantics.** Each lane is a breakpoint list `(t, gainDB)` with `t` measured
+/// in seconds from the start of the overlap. Between breakpoints the gain is
+/// linear *in dB*; outside the first/last breakpoint it is clamped to that
+/// endpoint's value. An **empty lane is pass-through (0 dB)**, not silence.
+///
+/// The gains are applied where `StemTechniqueLayer` already works: on the two
+/// decks' *source buffers*, before a sample is pulled through the graph. So an
+/// envelope stacks **on top of** the fader, EQ hand-over and outro effect the
+/// automation is already writing — a lane at 0 dB is not "unity at the mixer",
+/// it is "whatever the crossfade was going to do here, unchanged". A curve that
+/// wants a lane to hold a constant *audible* level across a fade has to bake
+/// the inverse of that fade into itself; `Audition.VocalExchange` does exactly
+/// that, at compile time, where the fader law is known.
+public struct StemEnvelope: Sendable, Codable, Equatable {
+
+    public struct Breakpoint: Sendable, Codable, Equatable {
+        /// Seconds from the start of the overlap.
+        public var t: TimeInterval
+        public var gainDB: Float
+
+        public init(t: TimeInterval, gainDB: Float) {
+            self.t = t
+            self.gainDB = gainDB
+        }
+    }
+
+    public enum Lane: String, Sendable, Codable, CaseIterable {
+        case outgoingVocal, outgoingBed, incomingVocal, incomingBed
+
+        /// The short spelling the AI reply and the console use.
+        public var jsonKey: String {
+            switch self {
+            case .outgoingVocal: return "outVocal"
+            case .outgoingBed: return "outBed"
+            case .incomingVocal: return "inVocal"
+            case .incomingBed: return "inBed"
+            }
+        }
+
+        public var chineseLabel: String {
+            switch self {
+            case .outgoingVocal: return "出曲人声"
+            case .outgoingBed: return "出曲伴奏"
+            case .incomingVocal: return "入曲人声"
+            case .incomingBed: return "入曲伴奏"
+            }
+        }
+
+        public static func named(_ key: String) -> Lane? {
+            allCases.first { $0.jsonKey == key || $0.rawValue == key }
+        }
+    }
+
+    public var outgoingVocal: [Breakpoint]
+    public var outgoingBed: [Breakpoint]
+    public var incomingVocal: [Breakpoint]
+    public var incomingBed: [Breakpoint]
+
+    public init(outgoingVocal: [Breakpoint] = [], outgoingBed: [Breakpoint] = [],
+                incomingVocal: [Breakpoint] = [], incomingBed: [Breakpoint] = []) {
+        self.outgoingVocal = outgoingVocal
+        self.outgoingBed = outgoingBed
+        self.incomingVocal = incomingVocal
+        self.incomingBed = incomingBed
+    }
+
+    public subscript(lane: Lane) -> [Breakpoint] {
+        get {
+            switch lane {
+            case .outgoingVocal: return outgoingVocal
+            case .outgoingBed: return outgoingBed
+            case .incomingVocal: return incomingVocal
+            case .incomingBed: return incomingBed
+            }
+        }
+        set {
+            switch lane {
+            case .outgoingVocal: outgoingVocal = newValue
+            case .outgoingBed: outgoingBed = newValue
+            case .incomingVocal: incomingVocal = newValue
+            case .incomingBed: incomingBed = newValue
+            }
+        }
+    }
+
+    // MARK: - Limits
+
+    /// −60 dB is inaudible under any bed; +6 dB is `StemTechniqueLayer`'s own
+    /// acapella ceiling, and the most a lane may be lifted to fight a fade.
+    public static let minGainDB: Float = -60
+    public static let maxGainDB: Float = 6
+    /// A curve, not a sample-accurate automation track. Sixteen points is more
+    /// than the templates need and few enough that a hand-written one stays
+    /// readable in a JSON reply.
+    public static let maxBreakpoints = 16
+
+    // MARK: - Reading
+
+    /// A lane with nothing in it, or nothing but 0 dB, changes no audio — so
+    /// the renderer can skip separating that whole side.
+    public func isPassThrough(_ lane: Lane) -> Bool {
+        self[lane].allSatisfy { $0.gainDB == 0 }
+    }
+
+    public var isPassThrough: Bool { Lane.allCases.allSatisfy(isPassThrough) }
+
+    /// Gain in dB at `t`, linearly interpolated, clamped to the endpoints
+    /// outside the breakpoint range. 0 dB for an empty lane.
+    public func gainDB(_ lane: Lane, at t: TimeInterval) -> Float {
+        let points = self[lane]
+        guard let first = points.first, let last = points.last else { return 0 }
+        if t <= first.t { return first.gainDB }
+        if t >= last.t { return last.gainDB }
+        for i in 1..<points.count where points[i].t >= t {
+            let a = points[i - 1], b = points[i]
+            let span = b.t - a.t
+            guard span > 1e-9 else { return b.gainDB }
+            let u = Float((t - a.t) / span)
+            return a.gainDB + (b.gainDB - a.gainDB) * u
+        }
+        return last.gainDB
+    }
+
+    /// The same value as a linear amplitude multiplier.
+    public func gain(_ lane: Lane, at t: TimeInterval) -> Float {
+        let db = gainDB(lane, at: t)
+        return db == 0 ? 1 : pow(10, db / 20)
+    }
+
+    /// A short stable digest of every breakpoint, for render filenames and
+    /// report labels. Deliberately not `Hashable`'s seeded hash: that changes
+    /// per process, and a render cache keyed on it would never hit twice.
+    public var signature: String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for lane in Lane.allCases {
+            for point in self[lane] {
+                for value in [point.t, Double(point.gainDB)] {
+                    var bits = UInt64(bitPattern: Int64((value * 1000).rounded()))
+                    for _ in 0..<8 {
+                        hash = (hash ^ (bits & 0xff)) &* 0x100_0000_01b3
+                        bits >>= 8
+                    }
+                }
+            }
+            hash = (hash ^ 0xff) &* 0x100_0000_01b3
+        }
+        return String(format: "%08x", UInt32(truncatingIfNeeded: hash))
+    }
+
+    // MARK: - Validation
+
+    public enum ValidationFailure: LocalizedError, Equatable {
+        case tooManyBreakpoints(lane: String, count: Int)
+        case timeOutOfRange(lane: String, t: TimeInterval, overlap: TimeInterval)
+        case timeNotMonotonic(lane: String, previous: TimeInterval, t: TimeInterval)
+        case gainOutOfRange(lane: String, gainDB: Float)
+        case notFinite(lane: String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .tooManyBreakpoints(let lane, let count):
+                return "stemEnvelope.\(lane) 有 \(count) 个点，超过 "
+                    + "\(StemEnvelope.maxBreakpoints) 个的上限。"
+            case .timeOutOfRange(let lane, let t, let overlap):
+                return String(format: "stemEnvelope.%@ 里的时间 %.2f 秒不在 0–%.2f 秒"
+                              + "（这次叠加的长度）之内。", lane, t, overlap)
+            case .timeNotMonotonic(let lane, let previous, let t):
+                return String(format: "stemEnvelope.%@ 的时间必须递增：%.2f 之后又出现了 %.2f。",
+                              lane, previous, t)
+            case .gainOutOfRange(let lane, let gainDB):
+                return String(format: "stemEnvelope.%@ 里的增益 %.1f dB 超出 %.0f–%.0f dB 的范围。",
+                              lane, gainDB, StemEnvelope.minGainDB, StemEnvelope.maxGainDB)
+            case .notFinite(let lane):
+                return "stemEnvelope.\(lane) 里有不是有限数字的取值。"
+            }
+        }
+    }
+
+    /// Check one lane against the contract: monotonic times inside
+    /// `[0, overlap]`, gains inside `[minGainDB, maxGainDB]`, at most
+    /// `maxBreakpoints` of them.
+    public static func validate(_ points: [Breakpoint], lane: String,
+                                overlap: TimeInterval) throws {
+        guard points.count <= maxBreakpoints else {
+            throw ValidationFailure.tooManyBreakpoints(lane: lane, count: points.count)
+        }
+        var previous: TimeInterval?
+        for point in points {
+            guard point.t.isFinite, point.gainDB.isFinite else {
+                throw ValidationFailure.notFinite(lane: lane)
+            }
+            // A hair of slack so a curve generated at the overlap's exact end
+            // is not rejected by a rounding error in the caller's arithmetic.
+            guard point.t >= -1e-6, point.t <= overlap + 1e-6 else {
+                throw ValidationFailure.timeOutOfRange(lane: lane, t: point.t, overlap: overlap)
+            }
+            guard point.gainDB >= minGainDB - 1e-4, point.gainDB <= maxGainDB + 1e-4 else {
+                throw ValidationFailure.gainOutOfRange(lane: lane, gainDB: point.gainDB)
+            }
+            if let previous, point.t < previous - 1e-6 {
+                throw ValidationFailure.timeNotMonotonic(lane: lane, previous: previous, t: point.t)
+            }
+            previous = point.t
+        }
+    }
+
+    /// The same check across all four lanes.
+    public func validate(overlap: TimeInterval) throws {
+        for lane in Lane.allCases {
+            try Self.validate(self[lane], lane: lane.jsonKey, overlap: overlap)
         }
     }
 }

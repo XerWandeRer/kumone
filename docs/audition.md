@@ -128,6 +128,7 @@ swift run audition render a.flac b.flac --stem duck          -o /tmp/duck.wav
 swift run audition render a.flac b.flac --stem duck:6        -o /tmp/duck6.wav
 swift run audition render a.flac b.flac --stem instrumental  -o /tmp/inst.wav
 swift run audition render a.flac b.flac --stem acapella      -o /tmp/acap.wav
+swift run audition render a.flac b.flac --stem exchange      -o /tmp/exch.wav
 ```
 
 - `duck[:N]` — the outgoing vocal held N dB down (default 9) for the whole
@@ -136,6 +137,69 @@ swift run audition render a.flac b.flac --stem acapella      -o /tmp/acap.wav
   so the outgoing track leaves as an instrumental.
 - `acapella` — the outgoing accompaniment drops out by 28 %, and its
   high-passed vocal floats over the incoming full mix until 96 %.
+- `exchange` — the orchestrated vocal hand-off; see §6b. Unlike the other
+  three it splits **both** decks, so it pays for two separation passes.
+
+### 6b. Orchestrate the hand-over — `vocalExchange` and `stemEnvelope`
+
+The three techniques above are one-shot gestures: one gain move, held for the
+whole window. Over a 12–16 s overlap between two songs that are both singing,
+a gesture is not enough — a flat duck *survives* two vocals rather than
+resolving them, and the result still sounds like two players running at once.
+What that wants is scheduling: four independent gain curves across the overlap
+(outgoing vocal, outgoing bed, incoming vocal, incoming bed) arranged so that at
+every instant there is **one vocal in front and one continuous bed** under it.
+
+`StemEnvelope` is that contract — per lane, a list of `(t, gainDB)` breakpoints
+in overlap-relative seconds, linear in dB between them, clamped to the endpoints
+outside, at most 16 per lane, gains in −60…+6 dB. **An empty lane is 0 dB
+pass-through, not silence**, and a side whose two lanes are both pass-through is
+never separated at all. The gains land where `StemTechniqueLayer` already works,
+on the decks' source buffers, so they stack *on top of* the fader/EQ automation:
+0 dB means "whatever the crossfade was going to do here, unchanged".
+
+`vocalExchange` is the template that writes one. The planner can *ask* for it —
+it is a rule about two vocal-activity contours — but it cannot build it, because
+where the hand-over goes is a question about a sung phrase. So the planner emits
+a marker and `Audition.decide` compiles it (`Audition.VocalExchange`) against the
+outgoing track's `.lrc`: the lyric line-end nearest the middle of the overlap,
+clamped into `stemExchangeHandoverMin…Max` (0.30–0.85 of the overlap). No usable
+line-end in the window → the quietest second of the outgoing vocal contour.
+Neither → it degrades to `vocalDuck` and says so, in the CLI, the console's
+derivation chain and the report JSON.
+
+The compiled shape, with `h` the hand-over: the outgoing bed steps back
+(−3 dB at 0.4 h, −8 dB at h) and only collapses once the vocal has gone
+(−30 dB at h + 0.8 s); the outgoing vocal holds its line to `h` and retires over
+0.8 s; the incoming bed comes in at its own level and is pushed +3 dB while it
+is the only bed holding the middle up, released as the new vocal lands; the
+incoming vocal is at −40 dB until `h` and at full level a second later. Both
+vocal lanes carry the **inverse of the fader they ride on** (capped at +6 dB),
+baked in at compile time where the fade law is known — that is what lets the
+outgoing singer finish the line at a constant *audible* level instead of
+receding through the crossfade.
+
+Measured on 恋愛サーキュレーション → 春を告げる (16 s overlap, hand-over at
++7.93 s on 「あなたが笑っている」), projecting each render onto the cached stems:
+the outgoing vocal drops 32 dB across the hand-over versus 10 dB for the plain
+crossfade of the same seam, and the incoming vocal sits at the measurement floor
+before it. The cost is a thinner middle — the worst 1 s window is ~12 dB under
+the ends against ~7 dB for the crossfade — which is the trade the technique
+makes: one voice over one bed instead of two whole songs at once.
+
+A hand-written envelope goes in the same slot, from the console's AI loop:
+
+```json
+{"stemEnvelope": {"outVocal": [[0, 0], [9, 0], [9.8, -60]],
+                  "outBed":   [[0, 0], [3.6, -3], [9, -8], [9.8, -30], [12, -40]],
+                  "inVocal":  [[0, -40], [8.4, -40], [9, -30], [10, 0]],
+                  "inBed":    [[0, 0], [4.5, 3], [9, 3], [10, 0]]}}
+```
+
+`"stem"` and `"stemEnvelope"` are mutually exclusive — the first picks a
+ready-made technique, the second writes the curves — and giving both is
+rejected. The console draws whichever one is in play as a four-lane plot with
+the hand-over marked; there is deliberately no drag editor.
 
 The recipes are S1's, translated (`Scripts/stems-prototype/separate_and_mix.py`
 → `StemTechniqueLayer`). Costs on an M4: the first render of a window pays for
@@ -160,10 +224,12 @@ planner's thresholds land, and a model pass per pair would cost minutes.
 planner a separator is available (`StemAvailability.ready`), and lets it choose
 a technique itself under the rules in `TransitionPlanner`'s "Stem layer":
 
-- **vocalDuck** — the outgoing window is vocal-active (`stemVocalActiveRatio`)
+- **vocalExchange** — the outgoing window is vocal-active (`stemVocalActiveRatio`)
   and so is the incoming opening. Without stems this is the clash the planner
   punishes by cutting the crossfade to `vocalClashFadeCap` and refusing the
   8/16-bar beat-matched upgrades; with them the punishment becomes a technique.
+  The planner names the template; `decide` compiles it against the lyrics and
+  falls back to **vocalDuck** (`stemDuckDepthDB`) when it cannot aim (§6b).
 - **acapellaOver** — vocal-active outgoing over an instrumental-leaning opening
   (`stemAcapellaIncomingVocalMax`), at `tier == .compatible` only.
 - **instrumentalOut** is never chosen automatically (it never won a pair in
@@ -179,7 +245,7 @@ swift run audition batch <corpusDir>   --stems on        # adds a "stem" column
 ```
 
 `--stems off` is the default and the product path: with it the planner is
-field-for-field the pre-stem planner and the four `stem` knobs are never read.
+field-for-field the pre-stem planner and the six `stem` knobs are never read.
 The console has the same switch (default on) and narrates the rule in its
 derivation chain.
 
@@ -198,7 +264,7 @@ these thresholds.
 ```
 audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
 audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged]
-                                [--stem acapella|instrumental|duck[:9]]
+                                [--stem acapella|instrumental|duck[:9]|exchange]
                                 [--stems on|off]
                                 [--fade N] [--pre N] [--post N] [--set ...]
 audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
@@ -290,6 +356,13 @@ The page (single file, mobile-friendly, follows the system light/dark theme):
   explanation; a live diff against `standard`; named presets saved as JSON
   under `<state>/configs/`. Below them, the stem dropdown (with a duck-depth
   slider) — it shapes the render only, never the batch sweep.
+- **这次交接的四条增益曲线** — whenever the hand-over carries a `StemEnvelope`
+  (compiled from `vocalExchange`, or pasted as `stemEnvelope`), the four lanes
+  are drawn as one plot in the timeline's own style, with the hand-over marked
+  and the lyric it landed on named underneath. Read-only: curves come from the
+  template or from the AI, and a drag editor would be a fourth way to say the
+  same thing. A hand-written envelope belongs to one seam, so switching pairs
+  drops it, and a "清除" button next to the plot puts the picker back in charge.
 - **批量** — all 15 adjacent pairs under the current config, with every cell
   that differs from `standard` marked `新值 ← 旧值` and the row highlighted.
 - **让 AI 帮你调** — "复制给 AI" packs the whole page into plain text: a system
@@ -297,7 +370,12 @@ The page (single file, mobile-friendly, follows the system light/dark theme):
   value, the five signals), the current context (both analyses, the signals
   against their thresholds, the derivation chain, the diff from `standard`, the
   corpus distribution if the batch has been run), and the reply format — a
-  fenced JSON block `{"config": {…}, "styleOverride"?, "stem"?, "rationale"}`.
+  fenced JSON block `{"config": {…}, "planOverride"?, "styleOverride"?,
+  "stem"?, "stemEnvelope"?, "rationale"}`. The prompt explains the four lanes,
+  their units and the fact that they stack on top of the fader, and tells the
+  model to write `"stem": "exchange"` for the standard hand-off and reach for
+  `"stemEnvelope"` only when it wants a shape of its own; the two are mutually
+  exclusive and giving both is rejected on both sides.
   Paste the model's answer back and the page pulls the first JSON object out of
   it (prose around it is fine), validates every name against the field list,
   clamps every value into its range, shows the resulting diff plus the model's

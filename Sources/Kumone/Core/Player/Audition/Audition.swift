@@ -58,21 +58,28 @@ public enum Audition {
         case acapella
         case instrumental
         case duck(depthDB: Float)
+        /// The orchestrated vocal hand-off template; `decide` compiles it
+        /// against the outgoing track's lyrics like the planner's own.
+        case exchange
+        /// A finished four-lane orchestration — what an AI's `stemEnvelope`
+        /// arrives as. There is no name for it: it *is* its curves.
+        case custom(StemEnvelope)
 
         /// S1's blind-test depth.
         public static let defaultDuckDepthDB: Float = -9
         /// The names the CLI and the console offer, without the `duck:N` tail.
-        public static let names = ["acapella", "instrumental", "duck"]
+        public static let names = ["acapella", "instrumental", "duck", "exchange"]
 
-        /// `acapella` / `instrumental` / `duck` / `duck:9` / `duck:-9`.
-        /// The depth is read as an attenuation either way — `duck:9` and
-        /// `duck:-9` both mean 9 dB down, because nobody means +9.
+        /// `acapella` / `instrumental` / `duck` / `duck:9` / `duck:-9` /
+        /// `exchange`. The duck depth is read as an attenuation either way —
+        /// `duck:9` and `duck:-9` both mean 9 dB down, because nobody means +9.
         public static func parse(_ raw: String) -> StemOverride? {
             let parts = raw.split(separator: ":", maxSplits: 1)
             guard let head = parts.first else { return nil }
             switch head {
             case "acapella", "acapellaOver": return .acapella
             case "instrumental", "instrumentalOut": return .instrumental
+            case "exchange", "vocalExchange": return .exchange
             case "duck", "vocalDuck":
                 guard parts.count == 2 else { return .duck(depthDB: defaultDuckDepthDB) }
                 guard let value = Float(parts[1]) else { return nil }
@@ -86,6 +93,8 @@ public enum Audition {
             case .acapella: return .acapellaOver
             case .instrumental: return .instrumentalOut
             case .duck(let depth): return .vocalDuck(depthDB: depth)
+            case .exchange: return .vocalExchange
+            case .custom(let envelope): return .custom(envelope)
             }
         }
     }
@@ -244,6 +253,102 @@ public enum Audition {
         }
     }
 
+    // MARK: - Hand-written envelopes
+
+    /// Reading a four-lane orchestration out of a JSON reply.
+    ///
+    /// `{"outVocal": [[0, 0], [9, 0], [9.8, -40]], "inBed": [[0, -6], [8, 0]]}`
+    /// — seconds and dB, lanes optional, an omitted lane meaning 0 dB
+    /// pass-through. This is the same contract `StemEnvelope` documents; the
+    /// only thing living here is the *spelling*, because the spelling is a
+    /// console/AI concern and `StemEnvelope` is a playback one.
+    public enum StemEnvelopeInput {
+
+        public enum Failure: LocalizedError, Equatable {
+            case notAnObject(given: String)
+            case laneNotAnArray(lane: String)
+            case pointNotAPair(lane: String, given: String)
+            case notANumber(lane: String, given: String)
+            case unknownLane(String)
+            case conflictsWithStem
+
+            public var errorDescription: String? {
+                switch self {
+                case .notAnObject(let given):
+                    return "stemEnvelope 要是一个对象，比如 "
+                        + #"{"outVocal": [[0, 0], [9, 0]]}，收到的是：\#(given)"#
+                case .laneNotAnArray(let lane):
+                    return "stemEnvelope.\(lane) 要是一个数组，每项是 [秒, dB]。"
+                case .pointNotAPair(let lane, let given):
+                    return "stemEnvelope.\(lane) 里的每一项都要写成 [秒, dB] 两个数字，"
+                        + "收到的是：\(given)"
+                case .notANumber(let lane, let given):
+                    return "stemEnvelope.\(lane) 里有不是数字的取值：\(given)"
+                case .unknownLane(let name):
+                    return "stemEnvelope 里没有 \(name) 这条轨。只有 outVocal / outBed /"
+                        + " inVocal / inBed 四条。"
+                case .conflictsWithStem:
+                    return "\"stem\" 和 \"stemEnvelope\" 只能给一个："
+                        + "前者是选一个现成手法，后者是自己写四条增益曲线。"
+                        + "想要标准的人声交接就写 \"stem\": \"exchange\"。"
+                }
+            }
+        }
+
+        /// Structure, lane names, gain range and monotonicity. The *time*
+        /// bound needs the overlap, which is only final after any
+        /// `planOverride` has been applied, so `decide` checks that separately
+        /// against the geometry it ends up with.
+        /// `String(describing:)` pretty-prints a JSON array across five lines,
+        /// which is not what a one-line error message wants to quote back.
+        static func describe(_ value: Any) -> String {
+            if let data = try? JSONSerialization.data(withJSONObject: value,
+                                                      options: [.fragmentsAllowed]),
+               let text = String(data: data, encoding: .utf8) {
+                return text
+            }
+            return String(describing: value)
+                .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+
+        public static func parse(_ raw: Any) throws -> StemEnvelope {
+            guard let object = raw as? [String: Any] else {
+                throw Failure.notAnObject(given: describe(raw))
+            }
+            var envelope = StemEnvelope()
+            for (key, value) in object {
+                if value is NSNull { continue }
+                guard let lane = StemEnvelope.Lane.named(key) else {
+                    throw Failure.unknownLane(key)
+                }
+                guard let rows = value as? [Any] else {
+                    throw Failure.laneNotAnArray(lane: key)
+                }
+                var points: [StemEnvelope.Breakpoint] = []
+                for row in rows {
+                    guard let pair = row as? [Any], pair.count == 2 else {
+                        throw Failure.pointNotAPair(lane: key, given: describe(row))
+                    }
+                    var numbers: [Double] = []
+                    for item in pair {
+                        guard let n = (item as? NSNumber)?.doubleValue, n.isFinite else {
+                            throw Failure.notANumber(lane: key, given: describe(item))
+                        }
+                        numbers.append(n)
+                    }
+                    points.append(StemEnvelope.Breakpoint(t: numbers[0],
+                                                          gainDB: Float(numbers[1])))
+                }
+                // `.infinity` here means "do not judge the times yet"; every
+                // other rule (count, order, dB range) is judged now, where the
+                // message can still name the field the author typed.
+                try StemEnvelope.validate(points, lane: key, overlap: .infinity)
+                envelope[lane] = points
+            }
+            return envelope
+        }
+    }
+
     // MARK: - Decision
 
     /// A planned transition plus the numbers that produced it.
@@ -321,6 +426,15 @@ public enum Audition {
         /// Nil when stems were not offered.
         public let stemBaselineOutPoint: TimeInterval?
         public let stemBaselineOverlap: TimeInterval?
+        /// How a `.vocalExchange` (planner's or `--stem exchange`'s) compiled:
+        /// where the vocal changes hands, on which lyric line, and — when it
+        /// could not — why it degraded to a duck. Nil when no exchange was
+        /// asked for.
+        public let stemExchange: ExchangeCompilation?
+        /// The four-lane curves this render will actually play, whether they
+        /// came from the exchange template or straight from a hand-written
+        /// `stemEnvelope`. Nil for the three one-shot gestures and for no stem.
+        public let stemEnvelope: StemEnvelope?
 
         /// "timbre 0.31 vs clash line 0.30" — signals sitting close enough to a
         /// threshold that nudging the constant would flip this pair.
@@ -429,6 +543,30 @@ public enum Audition {
             appliedPlanOverride = planOverride
         }
 
+        // --- Compile `.vocalExchange` last, once the geometry is final: the
+        // template is written in overlap-relative seconds and reads the fade
+        // law it will sit on top of, so a plan override that moved the seam or
+        // stretched the window has to be visible to it.
+        var exchange: ExchangeCompilation?
+        if planned.style.stemTechnique == .vocalExchange {
+            let compiled = VocalExchange.compile(outgoingURL: outgoingURL, outgoing: out,
+                                                 planned: planned, config: config)
+            var style = planned.style
+            style.stemTechnique = compiled.technique
+            planned = PlannedTransition(plan: planned.plan, style: style,
+                                        rideDB: planned.rideDB)
+            exchange = compiled.compilation
+        }
+        var envelope: StemEnvelope?
+        if case .custom(let compiled) = planned.style.stemTechnique {
+            // A hand-written envelope is only checked against the overlap here,
+            // because *here* is the first point at which the overlap is final:
+            // `--fade`, a style override and a `planOverride` can all move it.
+            try compiled.validate(
+                overlap: TransitionAutomation.Geometry(plan: planned.plan).overlapDuration)
+            envelope = compiled
+        }
+
         let geometry = TransitionAutomation.Geometry(plan: planned.plan)
         let outPoint = planned.plan.outPoint
         let inPoint: TimeInterval?
@@ -492,6 +630,8 @@ public enum Audition {
             plannedStemTechnique: plannedStem?.label,
             stemBaselineOutPoint: baselineOutPoint,
             stemBaselineOverlap: baselineOverlap,
+            stemExchange: exchange,
+            stemEnvelope: envelope,
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
                                    outVocal: outVocal, inVocal: inVocal, config: config),
             planTrace: planTrace,
@@ -517,6 +657,12 @@ public enum Audition {
         public let stemTechnique: String?
         public let stemSeconds: Double?
         public let stemSeparatedSeconds: TimeInterval?
+        /// Non-nil only when the render also split the *incoming* deck — a
+        /// four-lane envelope with a live incoming lane. That is a second
+        /// separation pass, and it costs a second ~15 s on a cold window.
+        public let stemIncomingSeparatedSeconds: TimeInterval?
+        /// Which decks were split, in the order they were.
+        public let stemSeparatedSides: [String]
         /// Vocal energy in the separated window over the mixture's. Near zero
         /// means the outgoing window is instrumental, so the technique had
         /// nothing to act on however correctly it ran.
@@ -570,6 +716,8 @@ public enum Audition {
                              stemTechnique: result.stemTechnique,
                              stemSeconds: result.stemSeconds,
                              stemSeparatedSeconds: result.stemSeparatedSeconds,
+                             stemIncomingSeparatedSeconds: result.stemIncomingSeparatedSeconds,
+                             stemSeparatedSides: result.stemSeparatedSides,
                              stemVocalEnergyRatio: result.stemVocalEnergyRatio,
                              stemCacheHit: result.stemCacheHit,
                              stemFallbackReason: result.stemFallbackReason,

@@ -141,6 +141,10 @@ final class Console: @unchecked Sendable {
             let decision = try decide(outgoing: a, incoming: b, body: body)
             return .json(try withLyrics(Audition.reportJSON(decision),
                                         outgoing: expand(a), incoming: expand(b)))
+        } catch let failure as Audition.StemEnvelopeInput.Failure {
+            return .error(failure.errorDescription ?? "stemEnvelope 不合法", status: 400)
+        } catch let failure as StemEnvelope.ValidationFailure {
+            return .error(failure.errorDescription ?? "stemEnvelope 不合法", status: 400)
         } catch let failure as Audition.PlanOverride.Failure {
             // A rejected hand-written plan is a user mistake, not a server
             // fault, and the page shows the message verbatim.
@@ -181,7 +185,17 @@ final class Console: @unchecked Sendable {
         }
         let fade = (body["fade"] as? NSNumber)?.doubleValue
         var stem: Audition.StemOverride?
-        if let raw = body["stem"] as? String, !raw.isEmpty, raw != "none" {
+        let namedStem = (body["stem"] as? String).flatMap {
+            $0.isEmpty || $0 == "none" ? nil : $0
+        }
+        let rawEnvelope = body["stemEnvelope"].flatMap { $0 is NSNull ? nil : $0 }
+        // Two ways of saying the same thing, meaning different things: one
+        // picks a ready-made technique, the other writes the curves by hand.
+        // Taking both would silently drop one of them.
+        if namedStem != nil, rawEnvelope != nil {
+            throw Audition.StemEnvelopeInput.Failure.conflictsWithStem
+        }
+        if let raw = namedStem {
             // The page sends the duck depth as its own slider value, so
             // "duck" + duckDB rejoin into the CLI's own `duck:N` spelling.
             var spec = raw
@@ -189,6 +203,8 @@ final class Console: @unchecked Sendable {
                 spec = "duck:\(depth)"
             }
             stem = Audition.StemOverride.parse(spec)
+        } else if let rawEnvelope {
+            stem = .custom(try Audition.StemEnvelopeInput.parse(rawEnvelope))
         }
         // The page's "stems 可用" switch. Absent (the baseline batch run, and
         // any older client) means off, which is the product default.
@@ -235,6 +251,9 @@ final class Console: @unchecked Sendable {
         // thresholds land, and a stem pass per pair would cost minutes.
         var body = body
         body["stem"] = nil
+        // A hand-written envelope is written against one pair's overlap; on any
+        // other pair its times mean nothing (and would simply be rejected).
+        body["stemEnvelope"] = nil
         // A plan override names one seam in one pair; it means nothing for the
         // other pairs, so the sweep never sees it.
         body["planOverride"] = nil
@@ -308,6 +327,10 @@ final class Console: @unchecked Sendable {
         let decision: Audition.Decision
         do {
             decision = try decide(outgoing: a, incoming: b, body: body)
+        } catch let failure as Audition.StemEnvelopeInput.Failure {
+            return .error(failure.errorDescription ?? "stemEnvelope 不合法", status: 400)
+        } catch let failure as StemEnvelope.ValidationFailure {
+            return .error(failure.errorDescription ?? "stemEnvelope 不合法", status: 400)
         } catch let failure as Audition.PlanOverride.Failure {
             return .error(failure.errorDescription ?? "planOverride 不合法", status: 400)
         } catch {
@@ -338,6 +361,7 @@ final class Console: @unchecked Sendable {
         // both mean the job will pay for a separation pass, which is what the
         // progress line is for.
         let wantsStem = decision.plannedStemTechnique != nil
+            || decision.stemEnvelope != nil
             || ((body["stem"] as? String).map { !$0.isEmpty && $0 != "none" } ?? false)
 
         let id = UUID().uuidString
@@ -384,6 +408,12 @@ final class Console: @unchecked Sendable {
                 if let t = r.stemTechnique { payload["stemTechnique"] = t }
                 if let s = r.stemSeconds { payload["stemSeconds"] = s }
                 if let s = r.stemSeparatedSeconds { payload["stemSeparatedSeconds"] = s }
+                if let s = r.stemIncomingSeparatedSeconds {
+                    payload["stemIncomingSeparatedSeconds"] = s
+                }
+                if !r.stemSeparatedSides.isEmpty {
+                    payload["stemSeparatedSides"] = r.stemSeparatedSides
+                }
                 if let s = r.stemVocalEnergyRatio { payload["stemVocalEnergyRatio"] = s }
                 if let reason = r.stemFallbackReason { payload["stemFallbackReason"] = reason }
                 self.finish(job, payload)

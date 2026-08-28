@@ -268,7 +268,21 @@ audio{width:100%;margin:.4rem 0;height:38px}
       </div>
     </div>
     <p class="muted" id="stemNote">stem 手法要先把出曲的叠加窗分离成人声/伴奏，首次约 20s，
-      同一窗口再渲染走 sidecar 缓存。批量视图不跑 stem。</p>
+      同一窗口再渲染走 sidecar 缓存。批量视图不跑 stem。
+      vocal exchange 还要再分离一次入曲，所以第一次约 40s。</p>
+  </div>
+
+  <div id="envWrap" style="display:none">
+    <h2>这次交接的四条增益曲线</h2>
+    <div class="card">
+      <p class="muted" id="envNote"></p>
+      <div class="tl" id="envPlot"></div>
+      <p class="legend" id="envLegend"></p>
+      <div class="row" id="envHandRow" style="display:none">
+        <span class="muted">这四条曲线是手写的（AI 给的 stemEnvelope），不是模板生成的。</span>
+        <button id="envClear">清除，回到手法选择</button>
+      </div>
+    </div>
   </div>
   <div id="knobs"></div>
 
@@ -316,6 +330,9 @@ audio{width:100%;margin:.4rem 0;height:38px}
 <script>
 const $ = s => document.querySelector(s);
 let BOOT = null, CONFIG = {}, REPORT = null, LAST_RENDER = null, BATCH = null;
+/// A hand-written four-lane orchestration for the current pair, or null. Like
+/// `PLAN_OV` it belongs to one seam, so switching pairs drops it.
+let STEM_ENV = null;
 
 // The three tiers, said the way a person would say them. The English term is
 // kept as a small annotation rather than dropped: it is what the code, the
@@ -361,6 +378,7 @@ async function boot() {
     acapella: "acapella over — 出曲人声飘在入曲上",
     instrumental: "instrumental out — 出曲抹掉人声收尾",
     duck: "vocal duck — 出曲人声压低",
+    exchange: "vocal exchange — 编排一次人声交接（读歌词定交接句）",
   };
   $("#stemSel").innerHTML = ['<option value="none">none（不用 stem）</option>']
     .concat((BOOT.stems || []).map(s => `<option value="${s}">${STEM_LABEL[s] || s}</option>`))
@@ -460,6 +478,9 @@ function requestBody() {
     stems: $("#stemsReady").checked,
     duckDB: -Math.abs(parseFloat($("#duckDB").value) || 9),
   };
+  // A hand-written envelope replaces the technique picker outright — the two
+  // are mutually exclusive on the server, and it is the more specific of them.
+  if (STEM_ENV) { body.stem = "none"; body.stemEnvelope = STEM_ENV; }
   const ov = {};
   for (const k of ["outPoint", "inPoint", "overlap"]) {
     if (PLAN_OV[k] !== null && PLAN_OV[k] !== undefined) ov[k] = PLAN_OV[k];
@@ -603,8 +624,16 @@ async function plan() {
     $("#err").textContent = "";
     $("#planTime").textContent = `重算 ${Math.round(performance.now() - t0)} ms`;
     paintVerdict(); paintPlanOverride(); paintTimelines(); paintSignals(); paintChain();
+    paintEnvelope();
   } catch (e) {
-    if (seq === planSeq) $("#err").textContent = String(e.message || e);
+    if (seq !== planSeq) return;
+    $("#err").textContent = String(e.message || e);
+    // A rejected hand-written envelope must stay reachable, or the page is
+    // wedged on an error it cannot be told to drop.
+    if (STEM_ENV) {
+      $("#envWrap").style.display = "";
+      $("#envHandRow").style.display = "";
+    }
   }
 }
 
@@ -748,6 +777,131 @@ function paintTimelines() {
   $("#timelines").onclick = timelineClick;
 }
 
+// ---------------------------------------------------------------- envelope
+//
+// The four lanes, drawn the same way the timelines are: one squashed viewBox,
+// labels in HTML underneath so type never stretches. Read-only on purpose —
+// curves are written by the exchange template or pasted from an AI, and a
+// drag-editor here would be a fourth way to say the same thing.
+
+const LANE_COLOR = {
+  outVocal: "var(--key)", outBed: "var(--accent)",
+  inVocal: "var(--good)", inBed: "var(--warn)",
+};
+/// Anything under this is inaudible under any bed; plotting all the way to
+/// −60 dB would spend half the panel on the difference between silent and
+/// silent.
+const ENV_FLOOR_DB = -48;
+
+function paintEnvelope() {
+  const env = REPORT && REPORT.stemEnvelope;
+  const wrap = $("#envWrap");
+  if (!env || !env.overlap) { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+
+  const W = 1000, H = 190, PADX = 6, TOP = 10, BASE = H - 22;
+  const x = s => PADX + (s / env.overlap) * (W - 2 * PADX);
+  const y = db => TOP + (Math.max(env.maxGainDB, 0) - Math.max(db, ENV_FLOOR_DB))
+    / (Math.max(env.maxGainDB, 0) - ENV_FLOOR_DB) * (BASE - TOP);
+
+  let g = "";
+  for (const db of [6, 0, -12, -24, -36, -48]) {
+    if (db > env.maxGainDB) continue;
+    g += `<line x1="${PADX}" y1="${y(db).toFixed(1)}" x2="${W - PADX}" y2="${y(db).toFixed(1)}"
+           stroke="var(--fg)" opacity="${db === 0 ? ".38" : ".13"}"
+           stroke-dasharray="${db === 0 ? "" : "4 5"}"/>`;
+    g += `<text x="${PADX + 3}" y="${(y(db) - 3).toFixed(1)}" font-size="11"
+           fill="var(--dim)">${db} dB</text>`;
+  }
+  // The instant the vocal changes hands, when this envelope came from the
+  // exchange template — the one number the curves are all built around.
+  const ex = REPORT.stemExchange;
+  if (ex && ex.fallbackReason == null) {
+    g += `<line x1="${x(ex.handover).toFixed(1)}" y1="${TOP - 6}"
+           x2="${x(ex.handover).toFixed(1)}" y2="${BASE}"
+           stroke="var(--good)" stroke-width="2" opacity=".8"/>`;
+  }
+  for (const lane of env.lanes) {
+    if (!lane.points.length) continue;
+    // An empty lane is 0 dB pass-through; a one-point lane is a flat hold.
+    let d = "";
+    lane.points.forEach((p, i) => {
+      d += `${i ? "L" : "M"} ${x(p[0]).toFixed(1)} ${y(p[1]).toFixed(1)} `;
+    });
+    g += `<path d="${d}" fill="none" stroke="${LANE_COLOR[lane.key]}"
+           stroke-width="2.2" stroke-linejoin="round" opacity=".95"/>`;
+    g += lane.points.map(p =>
+      `<circle cx="${x(p[0]).toFixed(1)}" cy="${y(p[1]).toFixed(1)}" r="3"
+        fill="${LANE_COLOR[lane.key]}"/>`).join("");
+  }
+  for (let s = 0; s <= env.overlap + 1e-6; s += 2) {
+    g += `<line x1="${x(s).toFixed(1)}" y1="${BASE}" x2="${x(s).toFixed(1)}" y2="${BASE + 6}"
+           stroke="var(--dim)"/>`;
+  }
+  $("#envPlot").innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:190px">${g}</svg>`;
+
+  const zero = env.lanes.filter(l => !l.points.length).map(l => l.label);
+  $("#envNote").innerHTML =
+    `横轴是叠加内部的 ${fmt(env.overlap)} 秒，纵轴是这条轨相对<b>原混音</b>的增益。`
+    + `这四条曲线作用在分离出来的 stem 上，`
+    + `叠加在推子/EQ 自动化<b>之上</b>——所以 0 dB 不是“不动”，是“交叉淡出原本要做的事，照做”。`
+    + (ex && ex.fallbackReason == null
+       ? `<br>交接落在第 <b>${fmt(ex.handover)}</b> 秒（出曲 ${mmss(ex.handoverAbsolute)}），`
+         + (ex.source === "lyric"
+            ? `依据是出曲歌词「${ex.lyricLine || ""}」唱完的位置。`
+            : "出曲这段没有可用的歌词行末，改用人声活跃度的低谷。")
+         + (ex.clampedFrom != null
+            ? `（原本算到 ${fmt(ex.clampedFrom)} 秒，被夹回允许窗口内。）` : "")
+       : "")
+    + (ex && ex.fallbackReason
+       ? `<br><span class="err">vocal exchange 没能编排出来：${ex.fallbackReason}</span>` : "")
+    + (zero.length ? `<br>直通（0 dB，不分离这一侧）：${zero.join("、")}` : "");
+  $("#envLegend").innerHTML = env.lanes
+    .map(l => `<span><i style="background:${LANE_COLOR[l.key]}"></i>${l.label}</span>`).join("");
+  $("#envHandRow").style.display = STEM_ENV ? "" : "none";
+}
+
+const ENV_LANES = ["outVocal", "outBed", "inVocal", "inBed"];
+
+/// The same rules `StemEnvelope.validate` and `Audition.StemEnvelopeInput`
+/// enforce, mirrored here so the AI preview never promises something the
+/// server will refuse.
+function stemEnvelopeError(env, overlap) {
+  if (typeof env !== "object" || env === null || Array.isArray(env)) {
+    return "stemEnvelope 不是一个对象";
+  }
+  for (const [key, rows] of Object.entries(env)) {
+    if (rows === null) continue;
+    if (!ENV_LANES.includes(key)) {
+      return `stemEnvelope 里没有 ${key} 这条轨（只有 ${ENV_LANES.join(" / ")}）`;
+    }
+    if (!Array.isArray(rows)) return `stemEnvelope.${key} 要是一个数组，每项是 [秒, dB]`;
+    if (rows.length > 16) {
+      return `stemEnvelope.${key} 有 ${rows.length} 个点，超过 16 个的上限`;
+    }
+    let previous = null;
+    for (const row of rows) {
+      if (!Array.isArray(row) || row.length !== 2) {
+        return `stemEnvelope.${key} 的每一项都要写成 [秒, dB] 两个数字`;
+      }
+      const t = Number(row[0]), db = Number(row[1]);
+      if (!isFinite(t) || !isFinite(db)) return `stemEnvelope.${key} 里有不是数字的取值`;
+      if (t < -1e-6 || t > overlap + 1e-6) {
+        return `stemEnvelope.${key} 的时间 ${t} 不在 0–${overlap.toFixed(2)} 秒之内`;
+      }
+      if (db < -60 - 1e-4 || db > 6 + 1e-4) {
+        return `stemEnvelope.${key} 的增益 ${db} dB 超出 −60…+6 的范围`;
+      }
+      if (previous !== null && t < previous - 1e-6) {
+        return `stemEnvelope.${key} 的时间必须递增：${previous} 之后又出现了 ${t}`;
+      }
+      previous = t;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- signals
 
 function paintSignals() {
@@ -809,7 +963,11 @@ function describeRender(r) {
       + `（${sgn(r.normalizationGainDB)} dB，只影响这个文件的响度，不影响过渡本身）`);
   }
   if (r.stemTechnique) {
-    bits.push(`stem ${r.stemTechnique} · 分离 ${fmt(r.stemSeparatedSeconds, 1)}s 用时`
+    const sides = (r.stemSeparatedSides || []).join("+") || "出曲";
+    const inc = r.stemIncomingSeparatedSeconds != null
+      ? ` + 入曲 ${fmt(r.stemIncomingSeparatedSeconds, 1)}s` : "";
+    bits.push(`stem ${r.stemTechnique} · 分离 ${sides}：`
+      + `${fmt(r.stemSeparatedSeconds, 1)}s${inc}，用时`
       + ` ${fmt(r.stemSeconds)}s${r.stemCacheHit ? "（缓存命中）" : ""}`);
   }
   let html = bits.join(" · ");
@@ -942,6 +1100,26 @@ function aiSystemPrompt() {
   lines.push("接法（对拍 / 交叉淡入淡出）不变：只有几何被改写。"
     + "对拍那一档会按原来的节拍周期重新折算小节数。");
   lines.push("");
+  lines.push("## 你还能编排这一次交接的四条增益曲线（stemEnvelope）");
+  lines.push("人声分离可用时，叠加期间有四条独立的通道：出曲人声、出曲伴奏、入曲人声、入曲伴奏。"
+    + "stemEnvelope 让你给每条通道各写一串折点，控制它们在叠加内部的增益走向：");
+  lines.push('- 写成 {"outVocal": [[秒, dB], ...], "outBed": ..., "inVocal": ..., "inBed": ...}');
+  lines.push("- 秒是**从叠加开始算**的相对时间（0 = 两首歌刚开始重叠），必须递增，"
+    + `且落在 0–${fmt(REPORT ? REPORT.plan.overlapDuration : 0)} 秒（这次叠加的长度）之内。`);
+  lines.push("- dB 范围 −60 到 +6；折点之间按 dB 线性插值，首尾之外保持端点值。");
+  lines.push("- 每条通道最多 16 个点；省略某条通道 = 那条直通（0 dB）。"
+    + "一侧的两条都省略，那一侧根本不会被分离，能省掉约 15 秒的模型推理。");
+  lines.push("- **重要**：这些增益作用在分离出来的 stem 上，并且叠加在推子/EQ 自动化**之上**。"
+    + "所以 0 dB 不是“音量恒定”，而是“交叉淡出原本要做的事照做”。"
+    + "想让出曲人声在淡出期间保持同样的响度，得自己把推子的倒数写进去（最多 +6 dB）。");
+  lines.push("典型形态：入曲伴奏先进铺底 → 出曲伴奏早退 → 出曲人声把这一句唱完 → 入曲人声接手。"
+    + "任何时刻只有一个人声在前面，伴奏床始终连续。");
+  lines.push("**想要标准的人声交接，直接写 \"stem\": \"exchange\" 就够了**："
+    + "系统会读出曲的 .lrc 歌词，把交接点放在离叠加中点最近的那一句唱完的位置，"
+    + "自动补偿推子，并在没有歌词时退回 vocal duck。"
+    + "只有当你想精细控制某条通道的形状时，才自己写 stemEnvelope。");
+  lines.push("\"stem\" 和 \"stemEnvelope\" 只能给一个，同时给会被拒绝。");
+  lines.push("");
   lines.push("下面的上下文里有两首歌的逐 2 秒 rms/人声曲线、小节第一拍、乐句起点和带时间戳的歌词，"
     + "足够你自己挑一个切点——比如让出曲人声收完最后一句、入曲从伴奏段先铺底。");
   lines.push("如果你判断问题出在**选点逻辑**（规划器总把入点锁死在某处、不肯从更早的纯伴奏进入）"
@@ -1065,6 +1243,22 @@ function aiContext() {
     ? `这次告诉规划器人声分离可用，它${r.plannedStemTechnique
         ? "自己选了 " + r.plannedStemTechnique : "没有选任何 stem 手法"}。`
     : "这次没有告诉规划器人声分离可用，stem 那一组参数完全没参与判断。");
+  const ex = r.stemExchange;
+  if (ex) {
+    lines.push(ex.fallbackReason
+      ? `vocal exchange 没能编排出来，已降级为 vocal duck：${ex.fallbackReason}`
+      : `vocal exchange 的交接句落在叠加的第 ${fmt(ex.handover)} 秒`
+        + `（出曲 ${mmss(ex.handoverAbsolute)}），依据是 ${ex.source === "lyric"
+            ? `歌词「${ex.lyricLine || ""}」唱完` : "人声活跃度的低谷"}。`);
+  }
+  if (r.stemEnvelope) {
+    lines.push("当前这次交接的四条增益曲线（秒是叠加内部的相对时间，dB 相对原混音）：");
+    for (const lane of r.stemEnvelope.lanes) {
+      lines.push(`  ${lane.key}（${lane.label}）：` + (lane.points.length
+        ? lane.points.map(p => `[${fmt(p[0], 2)}, ${fmt(p[1], 1)}]`).join(" ")
+        : "直通（0 dB，这一侧不分离）"));
+    }
+  }
   lines.push("");
   lines.push("## 当前结论");
   lines.push(`档位 ${r.tier}（${tierText(r.tier)}）${r.demotedByKey ? "，被和声降过一级" : ""}`
@@ -1113,13 +1307,19 @@ const AI_OUTPUT_SPEC = `## 请这样回复
   "planOverride": {"outPoint": 199.5, "inPoint": 2.0, "overlap": 12.0},
   "config": {"参数名": 新值, "另一个参数名": 新值},
   "styleOverride": "auto | plain | sweep | echo | staged",
-  "stem": "none | acapella | instrumental | duck",
+  "stem": "none | acapella | instrumental | duck | exchange",
+  "stemEnvelope": {"outVocal": [[0, 0], [9, 0], [9.8, -60]],
+                   "outBed":   [[0, 0], [3.6, -9], [9, -30], [12, -40]],
+                   "inVocal":  [[0, -40], [8.4, -40], [9, -30], [10, 0]],
+                   "inBed":    [[0, -6], [7.2, 0], [12, 0]]},
   "rationale": "为什么这么改，一两句话"
 }
 \`\`\`
 
 约束：
-- 四个字段全都可以省略；省略就表示保持现状。
+- 每个字段都可以省略；省略就表示保持现状。
+- "stem" 和 "stemEnvelope" 只能给一个。想要标准的人声交接就写 "stem": "exchange"，
+  想精细控制四条通道才写 "stemEnvelope"（秒是叠加内部的相对时间，dB 在 −60…+6）。
 - "planOverride" 只作用于当前这一对歌：里面 outPoint / inPoint / overlap 三项也各自可省。
   单位是秒（也接受 "3:19.5"）。想编排一次具体的过渡（比如让出曲人声收完最后一句、
   入曲先从伴奏铺底），用它，而不是去拧全局参数。
@@ -1256,6 +1456,21 @@ $("#parseAI").onclick = () => {
     else bad.push(`stem=${JSON.stringify(parsed.stem)}`);
   }
 
+  // stemEnvelope — the four-lane orchestration. Mutually exclusive with
+  // "stem": one picks a ready-made technique, the other writes the curves.
+  let stemEnv = null;
+  const se = parsed.stemEnvelope;
+  if (se !== undefined && se !== null) {
+    if (stem && stem !== "none") {
+      bad.push('"stem" 和 "stemEnvelope" 只能给一个：'
+        + '想要标准的人声交接就写 "stem": "exchange"，想精细控制才写 "stemEnvelope"');
+    } else {
+      const err = stemEnvelopeError(se, REPORT.plan.overlapDuration);
+      if (err) bad.push(err);
+      else if (Object.keys(se).length) stemEnv = se;
+    }
+  }
+
   // planOverride — the one part of the reply that speaks about *this* pair.
   let planOv = null;
   const po = parsed.planOverride;
@@ -1298,6 +1513,13 @@ $("#parseAI").onclick = () => {
   if (rows.length) notes.push("<b>要改的参数</b><br>" + rows.join("<br>"));
   if (style) notes.push(`<b>出曲离场手法</b> 改为 <code>${style}</code>`);
   if (stem) notes.push(`<b>stem 手法</b> 改为 <code>${stem}</code>`);
+  if (stemEnv) {
+    notes.push("<b>手写的四条增益曲线</b>（只影响当前这一对）<br>"
+      + ENV_LANES.filter(k => Array.isArray(stemEnv[k]) && stemEnv[k].length)
+          .map(k => `<code>${k}</code> ${stemEnv[k].length} 个点：`
+            + stemEnv[k].map(p => `${fmt(p[0], 1)}s→${fmt(p[1], 1)}dB`).join("，")).join("<br>")
+      + "<br><span class=\"muted\">没写到的通道保持直通（0 dB）。</span>");
+  }
   if (parsed.rationale) notes.push(`<b>AI 给的理由</b><br>${String(parsed.rationale)}`);
   if (ignored.length) {
     notes.push(`<span class="err">这些名字不存在，已忽略：${ignored.join("、")}</span>`);
@@ -1305,12 +1527,13 @@ $("#parseAI").onclick = () => {
   if (bad.length) {
     notes.push(`<span class="err">这些取值不合法，已拒绝：${bad.join("、")}</span>`);
   }
-  if (!rows.length && !style && !stem && !planOv) {
+  if (!rows.length && !style && !stem && !planOv && !stemEnv) {
     notes.push('<span class="err">解析出来了，但没有一项是能应用的改动。</span>');
     preview.innerHTML = notes.join("<br><br>");
     return;
   }
-  PENDING_AI = {config: accepted, style: style, stem: stem, planOverride: planOv};
+  PENDING_AI = {config: accepted, style: style, stem: stem, planOverride: planOv,
+                stemEnvelope: stemEnv};
   preview.innerHTML = notes.join("<br><br>");
   $("#applyAI").style.display = $("#cancelAI").style.display = "";
 };
@@ -1318,7 +1541,16 @@ $("#parseAI").onclick = () => {
 $("#applyAI").onclick = () => {
   if (!PENDING_AI) return;
   if (PENDING_AI.style) $("#styleSel").value = PENDING_AI.style;
-  if (PENDING_AI.stem) { $("#stemSel").value = PENDING_AI.stem; paintDuck(); }
+  if (PENDING_AI.stem) {
+    $("#stemSel").value = PENDING_AI.stem;
+    STEM_ENV = null;
+    paintDuck();
+  }
+  if (PENDING_AI.stemEnvelope) {
+    STEM_ENV = PENDING_AI.stemEnvelope;
+    $("#stemSel").value = "none";
+    paintDuck();
+  }
   $("#applyAI").style.display = $("#cancelAI").style.display = "none";
   const applied = Object.keys(PENDING_AI.config).length;
   const parts = [];
@@ -1330,6 +1562,7 @@ $("#applyAI").onclick = () => {
   }
   if (applied) parts.push(`${applied} 项参数改动`);
   if (PENDING_AI.style || PENDING_AI.stem) parts.push("手法改动");
+  if (PENDING_AI.stemEnvelope) parts.push("四条增益曲线");
   applyConfig(Object.assign({}, CONFIG, PENDING_AI.config));   // re-plans
   BATCH = null;
   $("#aiPreview").innerHTML = `已应用${parts.join("、") || "改动"}，决策已重算。`;
@@ -1374,6 +1607,8 @@ const pairIndex = () => BOOT.pairs.findIndex(
 function clearPlanOverrideAndPlan() {
   $("#ovOut").value = $("#ovIn").value = $("#ovLen").value = "";
   PLAN_OV = {outPoint: null, inPoint: null, overlap: null};
+  // Curves written against this overlap mean nothing against the next one.
+  STEM_ENV = null;
   $("#ovErr").textContent = "";
   paintPlanOverride();
   plan();
@@ -1407,7 +1642,8 @@ $("#outSel").onchange = clearPlanOverrideAndPlan;
 $("#inSel").onchange = clearPlanOverrideAndPlan;
 $("#styleSel").onchange = plan;
 $("#fadeOv").oninput = schedulePlan;
-$("#stemSel").onchange = () => { paintDuck(); plan(); };
+$("#stemSel").onchange = () => { STEM_ENV = null; paintDuck(); plan(); };
+$("#envClear").onclick = () => { STEM_ENV = null; plan(); };
 $("#stemsReady").onchange = () => { BATCH = null; plan(); };
 $("#duckDB").oninput = () => { paintDuck(); schedulePlan(); };
 

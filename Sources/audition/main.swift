@@ -54,7 +54,7 @@ let usage = """
 usage:
   audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
   audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged] [--fade N]
-                                  [--stem acapella|instrumental|duck[:9]]
+                                  [--stem acapella|instrumental|duck[:9]|exchange]
                                   [--pre N] [--post N] [--set name=value,...]
   audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                               [--style ...] [--fade N] [--pre N] [--post N]
@@ -65,12 +65,17 @@ usage:
 
   --style   force one technique, to hear it in isolation
   --stems   on|off (default off) — tell the planner a vocal separator is
-            available, so it may choose vocalDuck / acapellaOver itself. Off is
+            available, so it may choose vocalExchange / acapellaOver itself. Off is
             the product default and reproduces the pre-stem decision exactly.
   --stem    layer a stem technique on top of the chosen style (render only):
             acapella      the outgoing vocal floats over the incoming mix
             instrumental  the outgoing vocal is wiped, it leaves instrumental
             duck[:9]      the outgoing vocal held N dB down (default 9)
+            exchange      the orchestrated hand-off: the incoming bed lays down
+                          first, the outgoing bed leaves early, the outgoing
+                          vocal finishes its line (located from the .lrc
+                          sidecar) and the incoming vocal takes over. Splits
+                          both decks, so it pays for two separation passes.
             First use downloads a 64 MiB model; the separated window is cached
             beside the audio as <file>.stems-v1-<start>-<len>.caf.
   --fade    override the overlap length (seconds)
@@ -317,6 +322,8 @@ func runRender(_ args: Arguments) {
         if let technique = r.stemTechnique {
             stemLine = "\n    stem \(technique) — separated "
                 + "\(f(r.stemSeparatedSeconds ?? 0, 1))s in \(f(r.stemSeconds ?? 0))s"
+                + (r.stemIncomingSeparatedSeconds.map {
+                       " + \(f($0, 1))s of the incoming deck" } ?? "")
                 + (r.stemCacheHit ? " (cached)" : "")
                 + ", vocal/mix \(f(r.stemVocalEnergyRatio ?? 0, 3))"
             if (r.stemVocalEnergyRatio ?? 0) < 0.02 {
@@ -326,6 +333,17 @@ func runRender(_ args: Arguments) {
         }
         if let reason = r.stemFallbackReason {
             stemLine = "\n    stem NOT applied, rendered whole-mix: \(reason)"
+        }
+        // Where the vocal changed hands is the one thing about an exchange you
+        // cannot read off the technique's name.
+        if let x = d.stemExchange {
+            if let reason = x.fallbackReason {
+                stemLine += "\n    vocalExchange did not compile: \(reason)"
+            } else {
+                stemLine += "\n    hand-over at +\(f(x.handover, 2))s into the overlap"
+                    + " (\(f(x.handoverAbsolute, 2))s in the outgoing track), from \(x.source)"
+                    + (x.lyricLine.map { ": “\($0)”" } ?? "")
+            }
         }
         // The hand-over's gain ride, envelope and all — the render carries the
         // release too, so it is in the file you are about to play.

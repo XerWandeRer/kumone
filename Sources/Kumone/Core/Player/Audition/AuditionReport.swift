@@ -171,8 +171,37 @@ extension Audition {
         /// with the offer.
         public let stemsReady: Bool
         public let plannedStemTechnique: String?
+        /// How a `vocalExchange` compiled — where the vocal changes hands, on
+        /// which line, or why it degraded. Nil when no exchange was asked for.
+        public let stemExchange: ExchangeReport?
+        /// The four lanes the render will play, for the console's mini plot.
+        /// Nil for the one-shot gestures and for no stem at all.
+        public let stemEnvelope: EnvelopeReport?
         public let config: [String: Double]
         public let configDiff: [ConfigDiffEntry]
+    }
+
+    /// One `StemEnvelope`, flattened for the console: each lane is a list of
+    /// `[t, dB]` pairs in overlap-relative seconds.
+    public struct EnvelopeReport: Encodable, Sendable {
+        public struct LaneReport: Encodable, Sendable {
+            public let key: String
+            public let label: String
+            public let points: [[Double]]
+        }
+        public let overlap: TimeInterval
+        public let minGainDB: Double
+        public let maxGainDB: Double
+        public let lanes: [LaneReport]
+    }
+
+    public struct ExchangeReport: Encodable, Sendable {
+        public let handover: TimeInterval
+        public let handoverAbsolute: TimeInterval
+        public let source: String
+        public let lyricLine: String?
+        public let clampedFrom: TimeInterval?
+        public let fallbackReason: String?
     }
 
     // MARK: - Building the report
@@ -200,6 +229,24 @@ extension Audition {
             overridden: d.overridden,
             stemsReady: d.stemsReady,
             plannedStemTechnique: d.plannedStemTechnique,
+            stemExchange: d.stemExchange.map {
+                ExchangeReport(handover: $0.handover,
+                               handoverAbsolute: $0.handoverAbsolute,
+                               source: $0.source, lyricLine: $0.lyricLine,
+                               clampedFrom: $0.clampedFrom,
+                               fallbackReason: $0.fallbackReason)
+            },
+            stemEnvelope: d.stemEnvelope.map { envelope in
+                EnvelopeReport(
+                    overlap: d.overlapDuration,
+                    minGainDB: Double(StemEnvelope.minGainDB),
+                    maxGainDB: Double(StemEnvelope.maxGainDB),
+                    lanes: StemEnvelope.Lane.allCases.map { lane in
+                        EnvelopeReport.LaneReport(
+                            key: lane.jsonKey, label: lane.chineseLabel,
+                            points: envelope[lane].map { [$0.t, Double($0.gainDB)] })
+                    })
+            },
             config: d.config,
             configDiff: c.diffFromStandard.map {
                 ConfigDiffEntry(name: $0.name, standard: $0.standard, current: $0.current)
@@ -821,8 +868,13 @@ extension Audition {
     ) -> ChainStep {
         let rule = "人声分离可用时，再问两句：出曲的交接窗口里人声够不够密（"
             + String(format: "≥ %.2f 倍", c.stemVocalActiveRatio)
-            + "）？如果够，而且入曲开头也在唱，就不再砍短叠加，改成把出曲人声压低"
-            + String(format: "（vocal duck，%.0f dB）", c.stemDuckDepthDB)
+            + "）？如果够，而且入曲开头也在唱，就不再砍短叠加，改成编排一次人声交接"
+            + "（vocal exchange：入曲伴奏先铺底 → 出曲伴奏早退 → 出曲人声把这一句唱完 →"
+            + "入曲人声接手；交接句由歌词时间戳定位，落点被夹在叠加的 "
+            + String(format: "%.0f%%–%.0f%% 之间）；出曲没有歌词也没有人声曲线时，"
+                     + "退回把出曲人声整段压低 %.0f dB（vocal duck）",
+                     c.stemExchangeHandoverMin * 100, c.stemExchangeHandoverMax * 100,
+                     c.stemDuckDepthDB)
             + "；如果够，而入曲开头基本是伴奏（"
             + String(format: "≤ %.2f 倍", c.stemAcapellaIncomingVocalMax)
             + "）且这一对很搭，就让出曲的清唱飘在入曲上（acapella over）。"
@@ -852,7 +904,7 @@ extension Audition {
                              mmssText(base), baseOverlap)
         }
 
-        let outcome: String
+        var outcome: String
         if let technique = d.plannedStemTechnique {
             let moved = d.stemBaselineOutPoint.map { abs($0 - (d.outPoint ?? $0)) > 0.05 } ?? false
             outcome = "→ 升级到 \(technique)"
@@ -869,9 +921,26 @@ extension Audition {
             outcome = "→ 出曲这边够唱，但入曲开头既没热到要压低、也没静到能飘清唱"
                 + "（而且 acapella 只在“很搭”这一档才给），所以不用。"
         }
+        // The exchange compile is a second decision on top of the planner's,
+        // made where the lyrics are; it gets its own sentence rather than
+        // hiding inside the technique's name.
+        if let x = d.stemExchange {
+            if let reason = x.fallbackReason {
+                outcome += "　编排交接失败：\(reason)"
+            } else {
+                outcome += String(format: "　交接句落在叠加的第 %.2f 秒（出曲 %@）",
+                                  x.handover, mmssText(x.handoverAbsolute))
+                outcome += x.source == "lyric"
+                    ? "，依据是出曲歌词「\(x.lyricLine ?? "")」唱完的位置。"
+                    : "，出曲这段没有可用的歌词行末，改用人声活跃度的低谷。"
+                if let from = x.clampedFrom {
+                    outcome += String(format: "（原本算到 %.2f 秒，被夹回窗口内。）", from)
+                }
+            }
+        }
         return ChainStep(stage: "stem", title: "要不要动用人声分离",
                          rule: rule, detail: detail, outcome: outcome,
-                         fired: d.plannedStemTechnique != nil)
+                         fired: d.plannedStemTechnique != nil || d.stemEnvelope != nil)
     }
 
     private static func mmssText(_ t: TimeInterval) -> String {

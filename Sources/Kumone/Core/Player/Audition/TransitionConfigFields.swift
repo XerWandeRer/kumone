@@ -188,6 +188,14 @@ extension TransitionPlanner.Config {
               "两边都在唱时，出曲的人声被压低多少 dB（S1 盲听选的是 9）。"
                   + "调大 = 出曲人声让得更彻底，但也更容易听出“被人按住了”。",
               0, 24, 0.5, 1, \.stemDuckDepthDB),
+        field("stemExchangeHandoverMin", "stem",
+              "vocal exchange 的“交接句”最早可以落在叠加的百分之多少处。"
+                  + "太早入曲的伴奏还没铺开，换人声就像切了一刀。",
+              0.05, 0.7, 0.01, 2, \.stemExchangeHandoverMin),
+        field("stemExchangeHandoverMax", "stem",
+              "vocal exchange 的“交接句”最晚可以落在叠加的百分之多少处。"
+                  + "太晚入曲的人声还没站稳，出曲这边已经没声音了。",
+              0.4, 0.98, 0.01, 2, \.stemExchangeHandoverMax),
     ]
 
     /// This config as `name: value`, in field order.

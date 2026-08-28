@@ -153,8 +153,17 @@ enum TransitionPlanner {
         /// expensive to spend on a two-second clash-tier hand-over.
         var stemMinOverlap: TimeInterval = 5
         /// How far `vocalDuck` holds the outgoing vocal down, in dB of
-        /// attenuation (S1's blind test liked 9).
+        /// attenuation (S1's blind test liked 9). Also the depth
+        /// `vocalExchange` degrades to when it cannot find a hand-over.
         var stemDuckDepthDB: Double = 9
+        /// Where in the overlap `vocalExchange`'s hand-over may land, as a
+        /// share of the overlap. The compiler picks the outgoing lyric line-end
+        /// nearest the middle and then clamps it into this window: before 0.30
+        /// the incoming bed has not established itself and the swap sounds like
+        /// a cut; after 0.85 the new vocal has no room to arrive before the
+        /// outgoing deck is gone. Only read when a separator is available.
+        var stemExchangeHandoverMin: Double = 0.30
+        var stemExchangeHandoverMax: Double = 0.85
 
         static let standard = Config()
     }
@@ -347,13 +356,18 @@ enum TransitionPlanner {
     // vocal-carrying phrase boundary *before* the outro, and decline to name a
     // technique when no such boundary exists.
     //
-    //   1. vocalDuck — the outgoing window is vocal-active and so is the
+    //   1. vocalExchange — the outgoing window is vocal-active and so is the
     //      incoming opening. Without stems this is the one blend a DJ never
     //      allows, and the planner punishes it: the crossfade is cut to
     //      `vocalClashFadeCap`, and the 8/16-bar beat-matched upgrades are
-    //      refused. With stems the punishment becomes a technique — keep the
-    //      long overlap and hold the outgoing vocal `stemDuckDepthDB` down.
-    //      S1's blind test liked this best (3 of 6 pairs).
+    //      refused. With stems the punishment becomes a technique. S1 answered
+    //      it with a flat duck (`stemDuckDepthDB` for the whole window), which
+    //      its blind test liked best of the three gestures — but a duck only
+    //      *survives* two vocals, it does not resolve them: over a 12–16 s
+    //      overlap it still sounds like two players running at once. So the
+    //      planner now asks for the orchestrated hand-off instead, and the
+    //      duck is what that degrades to when the outgoing track has no
+    //      lyrics to hand over on (see `Audition.VocalExchange`).
     //   2. acapellaOver — the outgoing window is vocal-active and the incoming
     //      opening is instrumental-leaning, at `tier == .compatible` only.
     //      S1: this is the structure the technique was built for, and the one
@@ -396,9 +410,12 @@ enum TransitionPlanner {
         // over — same reading `vocalsClash` gives it.
         let incomingScore = vocalScore(incoming, from: inPoint, length: overlap)
         if let incomingScore, incomingScore > config.vocalClashRatio {
-            return StemChoice(
-                outPoint: outPoint,
-                technique: .vocalDuck(depthDB: Float(-abs(config.stemDuckDepthDB))))
+            // Both sides are singing across a long overlap — the case a flat
+            // duck only *survives* and an orchestrated hand-off actually
+            // solves. The planner names the template; `Audition.decide`
+            // compiles it against the outgoing track's lyrics, and degrades to
+            // the duck (visibly) when there is no phrase to hand over on.
+            return StemChoice(outPoint: outPoint, technique: .vocalExchange)
         }
         if tier == .compatible,
            (incomingScore ?? 0) <= config.stemAcapellaIncomingVocalMax {
