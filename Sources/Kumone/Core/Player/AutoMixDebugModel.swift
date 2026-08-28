@@ -156,6 +156,20 @@ struct AutoMixDebugSeam: Identifiable, Equatable {
     var at = Date()
     var from: String?
     var to: String?
+    /// The two tracks themselves, so the seam can be queued up and heard
+    /// again. Both were cached files by the time this seam played, so a replay
+    /// is a queue rebuild and a seek, not a download.
+    var outgoingTrack: Track?
+    var incomingTrack: Track?
+    /// The stem gesture the plan asked for, kept out of `planned` because a
+    /// feedback line is mostly a question about the gesture.
+    var gesture: String?
+    /// The debug overrides that were on when this seam played. A forced plan
+    /// is not an organic one and a mark on it must never look like one.
+    var overrides: [String] = []
+    /// Fingerprint of the effective planner config, so two marks made weeks
+    /// apart can be told apart by calibration.
+    var configFingerprint: String = ""
     /// The plan PlayerService armed — possibly not the one that ran.
     var planned: AutoMixDebugPlan?
     /// splicedSegment / liveOverlap / gapless.
@@ -169,6 +183,46 @@ struct AutoMixDebugSeam: Identifiable, Equatable {
     var fallback: String?
     /// What the pre-render had come to by the time the seam played.
     var prerender: String
+}
+
+/// Every debug override at once.
+///
+/// All-false is the shipped player, exactly: `AutoMixDebugOverrides` returns
+/// the config it was handed and the pre-render runs as it always has. The
+/// three feature switches are spelled as *disables* rather than as the knobs
+/// they shadow, so "default off" and "byte-identical" are the same statement —
+/// a switch that defaulted to the config's own `true` would have to be kept in
+/// sync with it forever.
+struct AutoMixOverrides: Equatable {
+    var forceBeatMatch = false
+    var disableTempoRamp = false
+    var disableDominantDeckBlend = false
+    var disableTwoClockExchange = false
+    /// Not a planner knob: skips the stem pre-render entirely so the seam is
+    /// carried by the live two-deck path — which is the *approximation* of a
+    /// stem hand-over, and the thing an A/B wants to compare against.
+    var forceLivePath = false
+
+    var isActive: Bool { self != AutoMixOverrides() }
+
+    /// Short names for the panel's badges and for a feedback line.
+    var badges: [String] {
+        var names: [String] = []
+        if forceBeatMatch { names.append("forceBeatMatch") }
+        if disableTempoRamp { names.append("noTempoRamp") }
+        if disableDominantDeckBlend { names.append("noDominantDeck") }
+        if disableTwoClockExchange { names.append("noTwoClock") }
+        if forceLivePath { names.append("forceLivePath") }
+        return names
+    }
+
+    /// Whether the change from `self` to `other` invalidates a pre-rendered
+    /// segment the engine may already be holding. Turning the live path on is
+    /// the whole point of that switch, and the engine has no un-arm call — so
+    /// this asks for the heavier re-arm instead of a plain re-plan.
+    func needsReArm(comparedTo other: AutoMixOverrides) -> Bool {
+        forceLivePath != other.forceLivePath
+    }
 }
 
 struct AutoMixDebugSnapshot: Equatable {
@@ -219,20 +273,34 @@ final class AutoMixDebugModel: ObservableObject {
     /// cleared the admission gates, so a listening test can hear a beat match
     /// on demand instead of hunting the library for a pair that passes.
     ///
-    /// Published because it is a control, not a mirror — flipping it must move
-    /// the checkbox and the badge. Deliberately **not** persisted: a forced
-    /// plan is not a plan the shipped player would have made, and an override
-    /// that survived a relaunch would eventually be mistaken for one.
-    @Published private(set) var forceBeatMatch = false
+    /// Published because these are controls, not mirrors — flipping one must
+    /// move its checkbox and its badge. Deliberately **not** persisted: an
+    /// overridden plan is not one the shipped player would have made, and an
+    /// override that survived a relaunch would eventually be mistaken for an
+    /// organic result.
+    @Published private(set) var overrides = AutoMixOverrides()
 
-    /// Go through `PlayerService.setForceBeatMatch` instead of calling this:
-    /// the flag alone leaves the seam that is *already* armed on its old plan,
-    /// and the whole point of the override is to hear the next one.
-    func writeForceBeatMatch(_ on: Bool) {
-        guard forceBeatMatch != on else { return }
-        forceBeatMatch = on
-        if !on { setForceNote(nil) }
+    /// Go through `PlayerService.setOverrides` instead of calling this: the
+    /// flags alone leave the seam that is *already* armed on its old plan, and
+    /// the whole point of an override is to hear the next one.
+    func writeOverrides(_ new: AutoMixOverrides) {
+        guard overrides != new else { return }
+        overrides = new
+        if !new.forceBeatMatch { setForceNote(nil) }
     }
+
+    /// How the seam a replay just re-planned differs from the one it was asked
+    /// to reproduce. Nil when they match, which is the expected case — the
+    /// analyses are cached, so the planner should decide identically.
+    @Published private(set) var replayDiff: String?
+
+    func setReplayDiff(_ diff: String?) { replayDiff = diff }
+
+    /// Feedback lines written this session. Published so the count next to the
+    /// mark buttons moves as they are pressed.
+    @Published private(set) var markCount = 0
+
+    func countMark() { markCount += 1 }
 
     /// Set by the planner path when the override was on. See `snapshot.forceNote`.
     func setForceNote(_ note: String?) {
@@ -356,39 +424,129 @@ enum AutoMixDebugOverrides {
     /// `rateDeviation` gate rather than mangled.
     static let forcedRateCap: Double = 0.08
 
-    /// `base`, unchanged, unless the force override is on.
+    /// `base`, unchanged, unless an override asks otherwise.
     ///
-    /// With it on, every *admission* gate is made non-binding and the
-    /// beat-match window is widened. The **physical** requirements are left
-    /// exactly as they are: both sides analyzed, tempo confident enough to be
-    /// worth aligning to, a downbeat to come in on, and an out point with room
-    /// for the overlap. Those are not opinions the panel may overrule — without
-    /// them there is no grid to match, and a "forced" plan would be a lie.
+    /// With **force beat switch** on, every *admission* gate is made
+    /// non-binding and the beat-match window is widened. The **physical**
+    /// requirements are left exactly as they are: both sides analyzed, tempo
+    /// confident enough to be worth aligning to, a downbeat to come in on, and
+    /// an out point with room for the overlap. Those are not opinions the panel
+    /// may overrule — without them there is no grid to match, and a "forced"
+    /// plan would be a lie.
+    ///
+    /// The three feature switches turn one gesture off each, which is how an
+    /// in-place A/B is run: flip, replay the same seam, listen to the pair.
     static func plannerConfig(_ base: TransitionPlanner.Config,
-                              forceBeatMatch: Bool) -> TransitionPlanner.Config {
-        guard forceBeatMatch else { return base }
+                              overrides: AutoMixOverrides) -> TransitionPlanner.Config {
+        guard overrides.isActive else { return base }
         var config = base
 
-        // Tier: loudness, timbre, tempo clash. All three now abstain, so the
-        // pair reaches the beat-match rule as `.compatible`.
-        config.neutralLoudnessDB = unreachableLoudnessDB
-        config.clashLoudnessDB = unreachableLoudnessDB
-        config.neutralTimbreDistance = unreachableTimbreDistance
-        config.clashTimbreDistance = unreachableTimbreDistance
-        config.clashTempoRatio = unreachableTempoRatio
-        // Harmony can only demote, and now never gets a key to demote on.
-        config.keyConfidenceThreshold = unreachableKeyConfidence
-        // Two vocals at once is the one thing a DJ never allows — which is
-        // exactly why someone testing wants to hear it happen on purpose.
-        config.vocalClashRatio = unreachableVocalRatio
+        if overrides.forceBeatMatch {
+            // Tier: loudness, timbre, tempo clash. All three now abstain, so
+            // the pair reaches the beat-match rule as `.compatible`.
+            config.neutralLoudnessDB = unreachableLoudnessDB
+            config.clashLoudnessDB = unreachableLoudnessDB
+            config.neutralTimbreDistance = unreachableTimbreDistance
+            config.clashTimbreDistance = unreachableTimbreDistance
+            config.clashTempoRatio = unreachableTempoRatio
+            // Harmony can only demote, and now never gets a key to demote on.
+            config.keyConfidenceThreshold = unreachableKeyConfidence
+            // Two vocals at once is the one thing a DJ never allows — which is
+            // exactly why someone testing wants to hear it happen on purpose.
+            config.vocalClashRatio = unreachableVocalRatio
 
-        // Both regimes' caps, so the result does not depend on whether the
-        // tempo ramp happens to be on.
-        config.maxBPMDeltaRatio = forcedBPMDeltaCap
-        config.rampMaxBPMDeltaRatio = forcedBPMDeltaCap
-        config.maxRateDeviation = forcedRateCap
-        config.rampMaxRateDeviation = forcedRateCap
+            // Both regimes' caps, so the result does not depend on whether the
+            // tempo ramp happens to be on.
+            config.maxBPMDeltaRatio = forcedBPMDeltaCap
+            config.rampMaxBPMDeltaRatio = forcedBPMDeltaCap
+            config.maxRateDeviation = forcedRateCap
+            config.rampMaxRateDeviation = forcedRateCap
+        }
+
+        // Applied after the force block on purpose: with the ramp off, the
+        // *stepped* caps are what the beat-match rule reads, and the force
+        // block set both pairs precisely so this composition works.
+        if overrides.disableTempoRamp { config.tempoRampEnabled = false }
+        if overrides.disableDominantDeckBlend { config.dominantDeckBlend = false }
+        if overrides.disableTwoClockExchange { config.twoClockExchange = false }
         return config
+    }
+}
+
+/// Where a "jump to seam" lands, and why.
+///
+/// The naive answer — a few seconds before the out point — breaks the very
+/// thing it is trying to audition: the seam is not an instant, it is a gesture
+/// with a run-up. A beat-matched hand-over glides the outgoing deck onto its
+/// matched tempo for thirteen seconds first, and pads its headroom before
+/// that; a stem hand-over is a background render that starts a minute out.
+/// Landing inside either produces a *different* transition from the one the
+/// listener meant to judge, and — worse — one that looks the same in the panel.
+///
+/// So the lead is the widest run-up any stage still needs, and the panel says
+/// which stage set it.
+enum AutoMixSeamJump {
+
+    /// Never land closer than this however little the plan needs: a listening
+    /// test needs the outgoing track in its ears before the hand-over to have
+    /// an opinion about the hand-over.
+    static let floorLead: TimeInterval = 30
+
+    struct Inputs: Equatable {
+        var outPoint: TimeInterval
+        var isBeatMatched = false
+        /// The plan's own glide length; 0 when it carries no ramp.
+        var rampLeadSeconds: TimeInterval = 0
+        /// The outgoing deck's headroom pad, in dB (≤ 0). Its glide-on is part
+        /// of the gesture and finishes exactly where the ramp begins.
+        var padDB: Double = 0
+        /// A stem technique is planned…
+        var needsStemPrerender = false
+        /// …and the engine has already been handed a segment for it.
+        var segmentArmed = false
+        /// How far ahead of the splice the orchestration starts a render job.
+        var prerenderLead: TimeInterval = 0
+        /// How far before the out point the splice itself begins.
+        var prerenderHandoff: TimeInterval = 0
+    }
+
+    struct Result: Equatable {
+        var lead: TimeInterval
+        /// Where to seek to. Never negative.
+        var target: TimeInterval
+        var reason: String
+        /// The jump lands inside the pre-render's runway with nothing armed, so
+        /// this seam will be carried by the live fallback rather than a splice.
+        /// Only ever true when the track is too short to hold the full runway.
+        var losesPrerender: Bool
+    }
+
+    static func compute(_ i: Inputs) -> Result {
+        var candidates: [(TimeInterval, String)] = [(floorLead, "floor")]
+        let rampLead = i.rampLeadSeconds
+            + TransitionAutomation.ratePadLeadSeconds(i.padDB)
+        if i.isBeatMatched, rampLead > 0 {
+            candidates.append((rampLead, String(
+                format: "tempo ramp %.0fs + pad lead-in %.0fs", i.rampLeadSeconds,
+                TransitionAutomation.ratePadLeadSeconds(i.padDB))))
+        }
+        let prerenderNeed = i.prerenderLead + i.prerenderHandoff
+        if i.needsStemPrerender, !i.segmentArmed {
+            candidates.append((prerenderNeed, String(
+                format: "stem pre-render runway %.0fs", prerenderNeed)))
+        }
+        let winner = candidates.max { $0.0 < $1.0 }!
+        // A short track cannot hold the run-up the plan wants; land at the top
+        // rather than refusing, and say what that costs.
+        let target = max(0, i.outPoint - winner.0)
+        let lead = i.outPoint - target
+        return Result(
+            lead: lead, target: target,
+            reason: lead < winner.0
+                ? "\(winner.1) — clamped to the start of the track"
+                : winner.1,
+            losesPrerender: i.needsStemPrerender && !i.segmentArmed
+                && lead < prerenderNeed)
     }
 }
 

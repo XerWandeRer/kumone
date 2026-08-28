@@ -164,13 +164,13 @@ import Foundation
         // for everyone who never opens the panel.
         var base = TransitionPlanner.Config.standard
         base.loudnessCompensation = false
-        #expect(AutoMixDebugOverrides.plannerConfig(base, forceBeatMatch: false) == base)
-        #expect(AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: false)
+        #expect(AutoMixDebugOverrides.plannerConfig(base, overrides: AutoMixOverrides()) == base)
+        #expect(AutoMixDebugOverrides.plannerConfig(.standard, overrides: AutoMixOverrides())
                 == TransitionPlanner.Config.standard)
     }
 
     @Test func overrideMakesEveryAdmissionGateAbstain() {
-        let forced = AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: true)
+        let forced = AutoMixDebugOverrides.plannerConfig(.standard, overrides: AutoMixOverrides(forceBeatMatch: true))
 
         // A cosine distance cannot exceed 2, a folded tempo ratio cannot exceed
         // 0.5, and a confidence cannot exceed 1 — so each of these gates is
@@ -193,7 +193,7 @@ import Foundation
     }
 
     @Test func overrideWidensTheWindowInBothTempoRegimes() {
-        let forced = AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: true)
+        let forced = AutoMixDebugOverrides.plannerConfig(.standard, overrides: AutoMixOverrides(forceBeatMatch: true))
         #expect(forced.beatMatchBPMDeltaCap == AutoMixDebugOverrides.forcedBPMDeltaCap)
         #expect(forced.beatMatchRateCap == AutoMixDebugOverrides.forcedRateCap)
 
@@ -212,7 +212,7 @@ import Foundation
 
     @Test func overrideLeavesThePhysicalRequirementsAlone() {
         let standard = TransitionPlanner.Config.standard
-        let forced = AutoMixDebugOverrides.plannerConfig(standard, forceBeatMatch: true)
+        let forced = AutoMixDebugOverrides.plannerConfig(standard, overrides: AutoMixOverrides(forceBeatMatch: true))
         // Without a confident tempo there is no grid to align, without room
         // there is no overlap, and without the track being long enough there is
         // nothing to transition out of. The panel does not get to pretend.
@@ -233,7 +233,7 @@ import Foundation
         // the gate has to keep measuring what the decks will actually play.
         var base = TransitionPlanner.Config.standard
         base.loudnessCompensation = false
-        #expect(!AutoMixDebugOverrides.plannerConfig(base, forceBeatMatch: true)
+        #expect(!AutoMixDebugOverrides.plannerConfig(base, overrides: AutoMixOverrides(forceBeatMatch: true))
             .loudnessCompensation)
     }
 
@@ -255,7 +255,7 @@ import Foundation
         }
         let forced = TransitionPlanner.plan(
             outgoing: outgoing, incoming: incoming,
-            config: AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: true))
+            config: AutoMixDebugOverrides.plannerConfig(.standard, overrides: AutoMixOverrides(forceBeatMatch: true)))
         guard case .beatMatched = forced.plan else {
             Issue.record("the override should have produced a beat-matched plan")
             return
@@ -278,6 +278,198 @@ import Foundation
             keyPitchClass: nil, keyIsMinor: false, keyConfidence: 0,
             vocalActivity: [], referenceLoudness: a.referenceLoudness,
             peakDBFS: a.peakDBFS)
+    }
+
+    // MARK: - Override composition
+
+    @Test func everySwitchOffIsIdentityWhateverElseIsSet() {
+        // The claim the whole feature rests on, stated over the *set* rather
+        // than one flag: nobody who never opens the panel is planned for
+        // differently.
+        var base = TransitionPlanner.Config.standard
+        base.loudnessCompensation = false
+        base.tempoRampEnabled = false          // a caller-set knob must survive
+        #expect(AutoMixDebugOverrides.plannerConfig(base, overrides: AutoMixOverrides())
+                == base)
+        #expect(!AutoMixOverrides().isActive)
+        #expect(AutoMixOverrides().badges.isEmpty)
+    }
+
+    @Test func featureSwitchesTurnOffExactlyTheirOwnGesture() {
+        let standard = TransitionPlanner.Config.standard
+        let ramp = AutoMixDebugOverrides.plannerConfig(
+            standard, overrides: AutoMixOverrides(disableTempoRamp: true))
+        #expect(!ramp.tempoRampEnabled)
+        #expect(ramp.dominantDeckBlend == standard.dominantDeckBlend)
+        #expect(ramp.twoClockExchange == standard.twoClockExchange)
+
+        let blend = AutoMixDebugOverrides.plannerConfig(
+            standard, overrides: AutoMixOverrides(disableDominantDeckBlend: true))
+        #expect(!blend.dominantDeckBlend)
+        #expect(blend.tempoRampEnabled == standard.tempoRampEnabled)
+
+        let exchange = AutoMixDebugOverrides.plannerConfig(
+            standard, overrides: AutoMixOverrides(disableTwoClockExchange: true))
+        #expect(!exchange.twoClockExchange)
+
+        // `forceLivePath` is not a planner knob at all: it short-circuits the
+        // pre-render, so the config must come back untouched.
+        #expect(AutoMixDebugOverrides.plannerConfig(
+            standard, overrides: AutoMixOverrides(forceLivePath: true)) == standard)
+    }
+
+    @Test func switchesComposeWithTheForceOverride() {
+        // Force + no ramp is the interesting composition: with the ramp off the
+        // *stepped* caps are what the beat-match rule reads, and the force
+        // block sets both pairs precisely so this still opens the window.
+        let both = AutoMixDebugOverrides.plannerConfig(
+            .standard,
+            overrides: AutoMixOverrides(forceBeatMatch: true, disableTempoRamp: true))
+        #expect(!both.tempoRampEnabled)
+        #expect(both.beatMatchBPMDeltaCap == AutoMixDebugOverrides.forcedBPMDeltaCap)
+        #expect(both.beatMatchRateCap == AutoMixDebugOverrides.forcedRateCap)
+        #expect(both.neutralTimbreDistance >= 2)
+
+        let all = AutoMixOverrides(
+            forceBeatMatch: true, disableTempoRamp: true, disableDominantDeckBlend: true,
+            disableTwoClockExchange: true, forceLivePath: true)
+        #expect(all.badges.count == 5)
+        #expect(all.needsReArm(comparedTo: AutoMixOverrides()))
+        #expect(!AutoMixOverrides(forceBeatMatch: true)
+            .needsReArm(comparedTo: AutoMixOverrides()))
+    }
+
+    // MARK: - Jump-to-seam lead
+
+    @Test func aPlainCrossfadeGetsTheFloorLead() {
+        let result = AutoMixSeamJump.compute(.init(outPoint: 180))
+        #expect(result.lead == AutoMixSeamJump.floorLead)
+        #expect(result.target == 150)
+        #expect(result.reason == "floor")
+        #expect(!result.losesPrerender)
+    }
+
+    @Test func aBeatMatchedSeamGetsItsWholeGlide() {
+        // 13 s of glide plus a 4 dB pad at 0.3 dB/s = 13.3 s of lead-in: 26.3 s
+        // in total, still under the floor, so the floor wins and the glide is
+        // covered anyway.
+        let short = AutoMixSeamJump.compute(
+            .init(outPoint: 200, isBeatMatched: true, rampLeadSeconds: 13, padDB: -4))
+        #expect(short.lead == AutoMixSeamJump.floorLead)
+
+        // A deeper pad pushes the run-up past the floor, and then the ramp sets
+        // the lead and says so.
+        let deep = AutoMixSeamJump.compute(
+            .init(outPoint: 200, isBeatMatched: true, rampLeadSeconds: 13, padDB: -8))
+        #expect(deep.lead > AutoMixSeamJump.floorLead)
+        #expect(deep.reason.hasPrefix("tempo ramp"))
+        #expect(abs(deep.lead - (13 + 8 / 0.3)) < 0.001)
+    }
+
+    @Test func anUnrenderedStemSeamWaitsForItsRunway() {
+        let result = AutoMixSeamJump.compute(.init(
+            outPoint: 200, needsStemPrerender: true, segmentArmed: false,
+            prerenderLead: 60, prerenderHandoff: 0.5))
+        #expect(abs(result.lead - 60.5) < 0.001)
+        #expect(result.reason.hasPrefix("stem pre-render runway"))
+        #expect(!result.losesPrerender)
+
+        // Already rendered and armed: the runway is spent, so the floor is
+        // enough and the listener gets to the seam sooner.
+        let armed = AutoMixSeamJump.compute(.init(
+            outPoint: 200, needsStemPrerender: true, segmentArmed: true,
+            prerenderLead: 60, prerenderHandoff: 0.5))
+        #expect(armed.lead == AutoMixSeamJump.floorLead)
+    }
+
+    @Test func aShortTrackClampsAndSaysWhatThatCosts() {
+        // The out point is 40 s in; a 60.5 s runway does not fit before it.
+        let result = AutoMixSeamJump.compute(.init(
+            outPoint: 40, needsStemPrerender: true, segmentArmed: false,
+            prerenderLead: 60, prerenderHandoff: 0.5))
+        #expect(result.target == 0)
+        #expect(result.lead == 40)
+        #expect(result.reason.contains("clamped"))
+        // …and the seam will therefore be carried by the live path.
+        #expect(result.losesPrerender)
+    }
+
+    // MARK: - Feedback corpus
+
+    @Test func aFeedbackLineIsOneVersionedRoundTrippableObject() throws {
+        let entry = AutoMixFeedbackEntry(
+            at: Date(timeIntervalSince1970: 1_700_000_000),
+            verdict: .bad,
+            note: "vocal came in\nover the outgoing chorus",
+            outgoing: .init(id: 1, title: "A"),
+            incoming: .init(id: 2, title: "B"),
+            planned: .init(AutoMixDebugPlan(
+                planned: .plain(.crossfade(duration: 6, outPoint: 150, inPoint: 0)),
+                outgoing: nil, incoming: nil)),
+            executed: .init(kind: "gapless", outPoint: nil, overlap: 0),
+            gesture: "vocalExchange",
+            path: "liveOverlap",
+            overrides: ["forceBeatMatch"],
+            config: "deadbeef")
+
+        let line = try AutoMixFeedbackLog.line(entry)
+        // The file's whole contract is one object per line, and a note is free
+        // text a listener types in a hurry.
+        #expect(!line.contains("\n"))
+        #expect(line.contains("\"v\":1"))
+
+        let decoded = try AutoMixFeedbackLog.decoder()
+            .decode(AutoMixFeedbackEntry.self, from: Data(line.utf8))
+        #expect(decoded.v == AutoMixFeedbackEntry.currentVersion)
+        #expect(decoded.verdict == .bad)
+        #expect(decoded.note == "vocal came in over the outgoing chorus")
+        #expect(decoded.outgoing?.id == 1)
+        #expect(decoded.incoming?.title == "B")
+        #expect(decoded.planned?.outPoint == 150)
+        #expect(decoded.executed?.kind == "gapless")
+        #expect(decoded.gesture == "vocalExchange")
+        #expect(decoded.path == "liveOverlap")
+        #expect(decoded.overrides == ["forceBeatMatch"])
+        #expect(decoded.config == "deadbeef")
+        #expect(decoded.at == entry.at)
+    }
+
+    @Test func appendingKeepsOneObjectPerLine() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("automix-feedback-\(UUID().uuidString).jsonl")
+        defer { try? FileManager.default.removeItem(at: url) }
+        for index in 0..<3 {
+            let entry = AutoMixFeedbackEntry(
+                at: Date(timeIntervalSince1970: TimeInterval(index)),
+                verdict: index.isMultiple(of: 2) ? .good : .bad,
+                note: nil, outgoing: nil, incoming: nil, planned: nil, executed: nil,
+                gesture: nil, path: nil, overrides: [], config: "0")
+            #expect(AutoMixFeedbackLog.append(entry, to: url))
+        }
+        let lines = try String(contentsOf: url, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        #expect(lines.count == 3)
+        let decoder = AutoMixFeedbackLog.decoder()
+        for line in lines {
+            _ = try decoder.decode(AutoMixFeedbackEntry.self, from: Data(line.utf8))
+        }
+    }
+
+    @Test func theConfigFingerprintIsStableAndDiscriminating() {
+        let standard = TransitionPlanner.Config.standard
+        // Stable across calls — a seeded hash would not be, and a corpus keyed
+        // on one could never be joined across sessions.
+        #expect(AutoMixFeedbackLog.configFingerprint(standard)
+                == AutoMixFeedbackLog.configFingerprint(standard))
+        // …and it moves when the calibration does.
+        var moved = standard
+        moved.rampMaxBPMDeltaRatio += 0.001
+        #expect(AutoMixFeedbackLog.configFingerprint(moved)
+                != AutoMixFeedbackLog.configFingerprint(standard))
+        #expect(AutoMixFeedbackLog.configFingerprint(
+            AutoMixDebugOverrides.plannerConfig(
+                standard, overrides: AutoMixOverrides(forceBeatMatch: true)))
+                != AutoMixFeedbackLog.configFingerprint(standard))
     }
 
     // MARK: - Model bookkeeping

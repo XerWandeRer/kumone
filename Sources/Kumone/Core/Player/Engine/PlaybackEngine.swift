@@ -898,6 +898,10 @@ final class PlaybackEngine: @unchecked Sendable {
         var trimDB: Double = 0
         var rideDB: Double = 0
         var ratePadDB: Double = 0
+        /// The pad this deck *would* take while bent, sized at load from the
+        /// track's own peak. Read by the debug panel's jump-to-seam, which has
+        /// to know how much lead-in the pad's glide will want.
+        var padCeilingDB: Double = 0
         /// A transition is running on this deck right now, so a rate off unity
         /// is expected rather than a leak.
         var inTransition = false
@@ -915,10 +919,17 @@ final class PlaybackEngine: @unchecked Sendable {
                     trimDB: state.trim > 0 ? 20 * log10(Double(state.trim)) : 0,
                     rideDB: state.rideDB,
                     ratePadDB: state.ratePadDB,
+                    padCeilingDB: state.padCeilingDB,
                     inTransition: live.map { $0.from == deck || $0.to == deck } ?? false)
             }
             return (snapshot(.a), snapshot(.b))
         }
+    }
+
+    /// One deck's gains, for a caller that only needs the one.
+    func deckGains(of deck: Deck) -> DeckGainSnapshot {
+        let both = deckGains()
+        return deck == .a ? both.a : both.b
     }
 
     /// Test hook: whether any transition is still scheduled or running.

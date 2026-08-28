@@ -973,7 +973,7 @@ final class PlayerService: ObservableObject {
             // likely to hit, by flipping the toggle on a track heard for the
             // first time. Say so rather than leaving the badge on next to a
             // crossfade.
-            if AutoMixDebugModel.shared.forceBeatMatch {
+            if AutoMixDebugModel.shared.overrides.forceBeatMatch {
                 AutoMixDebugModel.shared.setForceNote(
                     "force requested but impossible: "
                         + (currentAnalysis == nil ? "the playing track" : "the next track")
@@ -1003,7 +1003,7 @@ final class PlayerService: ObservableObject {
             outgoingLyricLineEnds: currentLocalURL
                 .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
         let config = plannerConfig
-        guard AutoMixDebugModel.shared.forceBeatMatch else {
+        guard AutoMixDebugModel.shared.overrides.forceBeatMatch else {
             AutoMixDebugModel.shared.setForceNote(nil)
             return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
                                           stems: stems, config: config, context: context)
@@ -1082,6 +1082,15 @@ final class PlayerService: ObservableObject {
     /// of the armed hand-over. Cheap — a few comparisons — until the moment it
     /// starts the one background job it will ever run for a given seam.
     private func updateStemPrerender() {
+        // Debug A/B: skip the render entirely so the seam is carried by the
+        // live two-deck path, which is the approximation a stem hand-over
+        // exists to beat. `setOverrides` tears down and re-arms when this is
+        // switched on, so a segment armed a moment ago is already gone.
+        if AutoMixDebugModel.shared.overrides.forceLivePath {
+            AutoMixDebugModel.shared.setPrerender(
+                .refused("force live path (debug override)"))
+            return
+        }
         guard StemSeparation.isAvailable,
               transitionArmed, let planned = armedPlan,
               planned.style.stemTechnique != nil,
@@ -1181,16 +1190,28 @@ final class PlayerService: ObservableObject {
         var config = TransitionPlanner.Config.standard
         config.loudnessCompensation = loudnessCompensationEnabled
         return AutoMixDebugOverrides.plannerConfig(
-            config, forceBeatMatch: AutoMixDebugModel.shared.forceBeatMatch)
+            config, overrides: AutoMixDebugModel.shared.overrides)
     }
 
-    /// Flip the debug panel's force-beat-switch override and re-derive the
-    /// hand-over that is already armed, so the toggle is heard at the *next*
-    /// seam rather than the one after it. The engine only swaps a plan that has
-    /// not started (`replaceTransitionPlan`), so this can never cut audio.
-    func setForceBeatMatch(_ on: Bool) {
-        AutoMixDebugModel.shared.writeForceBeatMatch(on)
-        replanArmedTransition()
+    /// Flip the debug panel's overrides and re-derive the hand-over that is
+    /// already armed, so a toggle is heard at the *next* seam rather than the
+    /// one after it — flipping and then replaying the same seam is the whole
+    /// point of the switches.
+    ///
+    /// A plain re-plan is enough for the planner knobs: the engine only swaps a
+    /// hand-over that has not started, so it can never cut audio. Turning the
+    /// live path on needs more, because the engine has no un-arm call for a
+    /// pre-rendered segment — the seam is torn down and re-armed instead, the
+    /// same two calls a seek makes.
+    func setOverrides(_ new: AutoMixOverrides) {
+        let old = AutoMixDebugModel.shared.overrides
+        AutoMixDebugModel.shared.writeOverrides(new)
+        if new.needsReArm(comparedTo: old), transitionArmed {
+            disarmTransition()
+            armTransitionIfReady()
+        } else {
+            replanArmedTransition()
+        }
     }
 
     /// Whether cross-track gain compensation is active right now. AutoMix off
@@ -1400,6 +1421,9 @@ final class PlayerService: ObservableObject {
         // The sidecar may have landed since the prefetch reported; a re-plan is
         // the natural moment to re-read it, and it is one `stat`.
         AutoMixDebugModel.shared.setNextAnalysis(next.analysis, localURL: next.localURL)
+        // A replay is waiting for exactly this: the seam it asked for, planned
+        // with both analyses in hand.
+        serviceSeamReplayIfPending()
     }
 
     /// The seam just became audible: freeze what was armed next to what the
@@ -1413,6 +1437,13 @@ final class PlayerService: ObservableObject {
         AutoMixDebugModel.shared.recordSeam(AutoMixDebugSeam(
             from: currentTrack?.name,
             to: pendingTransitionTrack?.name,
+            // Kept so the pair can be queued up and heard again; both are
+            // cached files by now, so a replay is a queue rebuild and a seek.
+            outgoingTrack: currentTrack,
+            incomingTrack: pendingTransitionTrack,
+            gesture: armedPlan?.style.stemTechnique?.label,
+            overrides: AutoMixDebugModel.shared.overrides.badges,
+            configFingerprint: AutoMixFeedbackLog.configFingerprint(plannerConfig),
             planned: planned,
             path: outcome.path.rawValue,
             executedKind: AutoMixDebugFormat.planKind(outcome.plan),
@@ -1420,6 +1451,143 @@ final class PlayerService: ObservableObject {
             executedOverlap: AutoMixDebugFormat.overlap(outcome.plan),
             fallback: AutoMixDebugFormat.fallback(planned: planned, executed: outcome.plan),
             prerender: AutoMixDebugModel.shared.currentPrerenderLabel))
+    }
+
+    // MARK: - Debug panel: jump, replay, mark
+
+    /// Why the panel's jump button is unavailable, or nil when it is not.
+    var seamJumpBlocker: String? {
+        guard transitionArmed, let planned = armedPlan else { return "nothing armed" }
+        guard let outPoint = planned.plan.outPoint else {
+            return "gapless — the seam is the end of the track"
+        }
+        guard outPoint > progress else { return "the out point is already behind us" }
+        return nil
+    }
+
+    /// The lead this seam needs, and why — the same computation the button
+    /// performs, exposed so the panel can show it before anyone presses.
+    func seamJumpPlan() -> AutoMixSeamJump.Result? {
+        guard seamJumpBlocker == nil, let planned = armedPlan,
+              let outPoint = planned.plan.outPoint else { return nil }
+        var inputs = AutoMixSeamJump.Inputs(outPoint: outPoint)
+        if case .beatMatched(let p) = planned.plan {
+            inputs.isBeatMatched = true
+            inputs.rampLeadSeconds = p.rampLeadSeconds
+        }
+        // The pad the *outgoing* deck will actually use, straight off the deck
+        // that is carrying the track — it is sized from that track's peak, so
+        // there is no useful constant to substitute.
+        inputs.padDB = engine.deckGains(of: activeDeck).padCeilingDB
+        inputs.needsStemPrerender = planned.style.stemTechnique != nil
+            && StemSeparation.isAvailable
+            && !AutoMixDebugModel.shared.overrides.forceLivePath
+        inputs.segmentArmed = engine.hasArmedSegment
+        inputs.prerenderLead = Self.stemPrerenderLead
+        inputs.prerenderHandoff = TransitionSegmentRenderer.handoff
+        return AutoMixSeamJump.compute(inputs)
+    }
+
+    /// Seek to the latest position that still leaves every stage of the
+    /// pipeline room to do its work. Goes through the ordinary `seek`, which
+    /// re-validates the armed hand-over against the new playhead — a jump must
+    /// not be a second, private path into the transition machinery.
+    func jumpToArmedSeam() {
+        guard let jump = seamJumpPlan() else { return }
+        seek(to: jump.target)
+    }
+
+    /// Set while a replay is waiting for its rebuilt queue to arm a hand-over.
+    /// One-shot: cleared by the jump it triggers, and by any track change.
+    private var pendingSeamReplay = false
+
+    /// Why the panel cannot replay this seam, or nil when it can.
+    func seamReplayBlocker(_ seam: AutoMixDebugSeam) -> String? {
+        guard seam.outgoingTrack != nil, seam.incomingTrack != nil else {
+            return "this seam was recorded without its tracks"
+        }
+        return nil
+    }
+
+    /// Queue the recorded pair again and jump to just before the seam, so the
+    /// same hand-over runs a second time.
+    ///
+    /// The plan is **re-derived, not replayed**: both analyses are cached, so
+    /// the planner should reach the same decision, and the panel badges the
+    /// difference if it does not. Replaying a frozen plan would hide exactly
+    /// the thing an A/B is trying to see — that a toggle changed the decision.
+    ///
+    /// The queue is rebuilt as an ad-hoc two-track list, which replaces
+    /// whatever was playing (personal FM included). That is the honest cost of
+    /// the feature and the panel says so.
+    func replaySeam(_ seam: AutoMixDebugSeam) {
+        guard seamReplayBlocker(seam) == nil,
+              let outgoing = seam.outgoingTrack, let incoming = seam.incomingTrack
+        else { return }
+        AutoMixDebugModel.shared.setReplayDiff(nil)
+        replayTarget = seam
+        play(tracks: [outgoing, incoming], source: .none, startAt: outgoing)
+        // Set after `play`, which runs `startPlaying` and clears it.
+        pendingSeamReplay = true
+    }
+
+    /// The seam a pending replay is trying to reproduce, for the diff badge.
+    private var replayTarget: AutoMixDebugSeam?
+
+    /// Called from `publishDebugPlan`: a replay waits for the *upgraded* plan,
+    /// not the first degraded one, because the outgoing analysis lands a beat
+    /// after playback starts and the seam is only real once it has.
+    private func serviceSeamReplayIfPending() {
+        guard pendingSeamReplay, currentAnalysis != nil, seamJumpBlocker == nil
+        else { return }
+        pendingSeamReplay = false
+        if let target = replayTarget?.planned, let planned = armedPlan {
+            AutoMixDebugModel.shared.setReplayDiff(
+                AutoMixDebugFormat.fallback(planned: target, executed: planned.plan))
+        }
+        replayTarget = nil
+        // Off this turn of the loop: we are inside `armTransitionIfReady`, and
+        // `seek` disarms and re-arms — doing that to the frame we are standing
+        // in would work, but only by accident.
+        Task { @MainActor [weak self] in
+            guard let self, let jump = self.seamJumpPlan() else { return }
+            self.seek(to: jump.target)
+        }
+    }
+
+    /// Append a listening verdict to the feedback corpus. `seam` nil marks the
+    /// hand-over that is armed right now, which has no executed side yet.
+    @discardableResult
+    func markSeam(verdict: AutoMixFeedbackEntry.Verdict, note: String?,
+                  seam: AutoMixDebugSeam?) -> Bool {
+        let trimmed = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let armed = armedPlan.map {
+            AutoMixDebugPlan(planned: $0, outgoing: currentAnalysis,
+                             incoming: prefetchedNext?.analysis)
+        }
+        let entry = AutoMixFeedbackEntry(
+            at: seam?.at ?? Date(),
+            verdict: verdict,
+            note: (trimmed?.isEmpty ?? true) ? nil : trimmed,
+            outgoing: (seam?.outgoingTrack ?? currentTrack)
+                .map { .init(id: $0.id, title: $0.name) },
+            incoming: (seam?.incomingTrack ?? pendingTransitionTrack)
+                .map { .init(id: $0.id, title: $0.name) },
+            planned: (seam?.planned ?? armed).map(AutoMixFeedbackEntry.PlanRef.init),
+            executed: seam.map {
+                .init(kind: $0.executedKind, outPoint: $0.executedOutPoint,
+                      overlap: $0.executedOverlap)
+            },
+            gesture: seam?.gesture ?? armedPlan?.style.stemTechnique?.label,
+            path: seam?.path,
+            overrides: seam?.overrides ?? AutoMixDebugModel.shared.overrides.badges,
+            config: seam.map { $0.configFingerprint.isEmpty
+                ? AutoMixFeedbackLog.configFingerprint(plannerConfig)
+                : $0.configFingerprint }
+                ?? AutoMixFeedbackLog.configFingerprint(plannerConfig))
+        guard AutoMixFeedbackLog.append(entry) else { return false }
+        AutoMixDebugModel.shared.countMark()
+        return true
     }
 
     // MARK: - Scrobble

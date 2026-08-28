@@ -31,6 +31,9 @@ struct AutoMixDebugPanel: View {
 
     @ObservedObject private var model = AutoMixDebugModel.shared
     @State private var alwaysOnTop = false
+    /// The note that will ride along with the next mark. Cleared on write, so
+    /// a note is never silently attached to two different seams.
+    @State private var markNote = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -40,6 +43,7 @@ struct AutoMixDebugPanel: View {
                     nextGroup
                     planGroup
                     prerenderGroup
+                    controlsGroup
                     seamsGroup
                 }
                 .padding(14)
@@ -128,8 +132,11 @@ struct AutoMixDebugPanel: View {
     @ViewBuilder
     private var planGroup: some View {
         DebugGroup("Plan (armed)") {
-            forceBeatMatchControl
-            Divider().padding(.vertical, 2)
+            if let note = model.snapshot.forceNote {
+                Text(verbatim: note)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let plan = model.snapshot.plan {
                 DebugRow("kind", plan.kind)
                 DebugRow("out point", AutoMixDebugFormat.clock(plan.outPoint)
@@ -153,41 +160,125 @@ struct AutoMixDebugPanel: View {
         }
     }
 
-    /// The one control on this panel that *changes* what the player does, so it
-    /// is labelled as an override and badged while it is on — a listening note
-    /// must never record a forced beat match as an organic one.
+    // MARK: - Controls
+    //
+    // Everything below *changes* what the player does, which is why it lives in
+    // one group under a heading that says so, and why every active override is
+    // badged: a listening note must never record an overridden seam as an
+    // organic one. Buttons are disabled with their reason showing rather than
+    // hidden — "why can't I press this" is itself diagnostic.
+
     @ViewBuilder
-    private var forceBeatMatchControl: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 8) {
-                Toggle(isOn: Binding(get: { model.forceBeatMatch },
-                                     set: { PlayerService.shared.setForceBeatMatch($0) })) {
-                    Text(verbatim: "Force beat switch (debug override)")
+    private var controlsGroup: some View {
+        DebugGroup("Controls (debug overrides)") {
+            if model.overrides.isActive {
+                HStack(spacing: 4) {
+                    ForEach(model.overrides.badges, id: \.self) { badge in
+                        Text(verbatim: badge)
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.25),
+                                        in: RoundedRectangle(cornerRadius: 3))
+                    }
+                    Spacer(minLength: 0)
                 }
-                .toggleStyle(.checkbox)
-                Spacer(minLength: 0)
-                if model.forceBeatMatch {
-                    Text(verbatim: "OVERRIDE ACTIVE")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Color.orange.opacity(0.25),
-                                    in: RoundedRectangle(cornerRadius: 3))
-                }
+                .padding(.bottom, 2)
             }
-            if model.forceBeatMatch {
+
+            overrideToggle("Force beat switch", \.forceBeatMatch)
+            if model.overrides.forceBeatMatch {
                 DebugRow("gates", "loudness / timbre / tempo-clash / key / vocal-clash: off")
                 DebugRow("window", String(
                     format: "bpm Δ ≤ %.0f %% · rate ≤ ±%.0f %%",
                     AutoMixDebugOverrides.forcedBPMDeltaCap * 100,
                     AutoMixDebugOverrides.forcedRateCap * 100))
-                if let note = model.snapshot.forceNote {
-                    Text(verbatim: note)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            }
+            overrideToggle("Disable tempo ramp", \.disableTempoRamp)
+            overrideToggle("Disable dominant-deck blend", \.disableDominantDeckBlend)
+            overrideToggle("Disable two-clock exchange", \.disableTwoClockExchange)
+            overrideToggle("Force live path (no stem pre-render)", \.forceLivePath)
+
+            Divider().padding(.vertical, 3)
+            jumpControl
+            Divider().padding(.vertical, 3)
+            markControl(seam: nil, label: "Mark the armed seam")
+        }
+    }
+
+    private func overrideToggle(_ label: String,
+                                _ key: WritableKeyPath<AutoMixOverrides, Bool>) -> some View {
+        Toggle(isOn: Binding(
+            get: { model.overrides[keyPath: key] },
+            set: { on in
+                var next = model.overrides
+                next[keyPath: key] = on
+                PlayerService.shared.setOverrides(next)
+            })) {
+                Text(verbatim: label)
+            }
+            .toggleStyle(.checkbox)
+    }
+
+    @ViewBuilder
+    private var jumpControl: some View {
+        let blocker = PlayerService.shared.seamJumpBlocker
+        let jump = PlayerService.shared.seamJumpPlan()
+        HStack(spacing: 8) {
+            Button {
+                PlayerService.shared.jumpToArmedSeam()
+            } label: {
+                Text(verbatim: "Jump to seam")
+            }
+            .disabled(blocker != nil)
+            if let blocker {
+                Text(verbatim: blocker).foregroundStyle(.secondary)
+            } else if let jump {
+                Text(verbatim: String(format: "→ %@ (lead %.0fs)",
+                                      AutoMixDebugFormat.clock(jump.target), jump.lead))
+            }
+            Spacer(minLength: 0)
+        }
+        if let jump {
+            DebugRow("lead set by", jump.reason)
+            if jump.losesPrerender {
+                Text(verbatim: "the track cannot hold the pre-render's runway — "
+                     + "this seam will take the live fallback")
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    /// Good / bad plus the shared note field. `seam` nil marks whatever is
+    /// armed right now; a history entry passes itself.
+    @ViewBuilder
+    private func markControl(seam: AutoMixDebugSeam?, label: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text(verbatim: label).foregroundStyle(.secondary)
+                Button { mark(.good, seam) } label: { Text(verbatim: "good") }
+                Button { mark(.bad, seam) } label: { Text(verbatim: "bad") }
+                Spacer(minLength: 0)
+                Text(verbatim: "\(model.markCount) marked this session")
+                    .foregroundStyle(.tertiary)
+            }
+            if seam == nil {
+                // One field, shared by every mark button on the panel: type the
+                // note, then press good/bad wherever the seam is. Cleared on
+                // write so a note never rides along with a second seam.
+                TextField(text: $markNote) {
+                    Text(verbatim: "note (optional) — applies to the next mark")
+                }
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+            }
+        }
+    }
+
+    private func mark(_ verdict: AutoMixFeedbackEntry.Verdict, _ seam: AutoMixDebugSeam?) {
+        PlayerService.shared.markSeam(verdict: verdict, note: markNote, seam: seam)
+        markNote = ""
     }
 
     private var prerenderGroup: some View {
@@ -216,11 +307,44 @@ struct AutoMixDebugPanel: View {
                         } ?? "—")
                         DebugRow("fallback", seam.fallback ?? "none — ran as planned")
                         DebugRow("pre-render", seam.prerender)
+                        if !seam.overrides.isEmpty {
+                            DebugRow("overrides", seam.overrides.joined(separator: " "))
+                        }
+                        DebugRow("config", seam.configFingerprint)
+                        if seam.id == model.snapshot.seams.first?.id {
+                            replayControl(seam)
+                        }
+                        markControl(seam: seam, label: "mark")
                     }
                     .padding(.vertical, 3)
                     if seam.id != model.snapshot.seams.last?.id { Divider() }
                 }
             }
+        }
+    }
+
+    /// Re-queue the recorded pair and jump to just before the seam. Only
+    /// offered on the newest entry — replaying an older one would have to
+    /// discard the two seams heard since, and "replay the thing I just heard"
+    /// is the whole use.
+    @ViewBuilder
+    private func replayControl(_ seam: AutoMixDebugSeam) -> some View {
+        let blocker = PlayerService.shared.seamReplayBlocker(seam)
+        HStack(spacing: 8) {
+            Button {
+                PlayerService.shared.replaySeam(seam)
+            } label: {
+                Text(verbatim: "Replay this seam")
+            }
+            .disabled(blocker != nil)
+            Text(verbatim: blocker ?? "replaces the queue with these two tracks")
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        if let diff = model.replayDiff {
+            Text(verbatim: "re-planned differently: \(diff)")
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
