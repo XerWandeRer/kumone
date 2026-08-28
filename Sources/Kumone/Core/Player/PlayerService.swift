@@ -922,17 +922,13 @@ final class PlayerService: ObservableObject {
                                      outPoint: max(duration - fade, duration * 0.6),
                                      inPoint: 0))
         }
-        // EXPERIMENTAL daytime-listening build: stem-aware planning plus a
-        // forced 15 s overlap floor, so long blends can be judged in real
-        // playback. The engine approximates stem techniques with a mid-band
-        // duck (TransitionAutomation.stemApproxDuckDB) — real stem audio
-        // arrives with S3's pre-render path. Revert to `stems: .none` with
-        // the plain `plannerConfig` for a shipping build.
-        var cfg = plannerConfig
-        cfg.minOverlap = 15
-        cfg.vocalClashFadeCap = 15
+        // Stem availability follows the process: the launcher installs a
+        // separator only when the model and metallib are actually usable
+        // (macOS, checkpoint on disk). Without one, `.none` keeps this the
+        // byte-identical whole-mix path.
+        let stems: StemAvailability = StemSeparation.isAvailable ? .ready : .none
         return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
-                                      stems: .ready, config: cfg)
+                                      stems: stems, config: plannerConfig)
         #endif
     }
 
