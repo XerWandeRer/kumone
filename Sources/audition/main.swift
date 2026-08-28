@@ -61,14 +61,18 @@ usage:
                               [--set name=value,...]
   audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
                   [--state DIR]
-  audition sweep  <corpusDir> [-o report.md] [--set name=value,...]
+  audition sweep  <corpusDir> [-o report.md] [--mode structure|tempo] [--set name=value,...]
   audition knobs  [--json]
 
   sweep     plan every adjacent seam inside each `p<N>-…` playlist twice — once
-            with the structure layer off (the pre-P3 decision) and once with it
-            on — and table the out/in points, the section each landed in, and
-            whether the lyric snap or the climax guard fired. Plans only: no
-            audio is rendered.
+            with a layer off and once with it on — and table what moved. Plans
+            only: no audio is rendered.
+            --mode structure (default): the structure layer off (the pre-P3
+            decision) vs on — out/in points, the section each landed in, and
+            whether the lyric snap or the climax guard fired.
+            --mode tempo: `tempoRampEnabled=0` (the ±8 %/±4 % stepped gate) vs
+            on (±11.5 %/±6 % with the glide) — which seams are newly
+            beat-matched, and what each deck bends to get there.
 
   --style   force one technique, to hear it in isolation
   --stems   on|off (default off) — tell the planner a vocal separator is
@@ -752,6 +756,122 @@ func structureGate(_ d: Audition.Decision, _ id: String) -> PlanGate? {
     d.planTrace.gates.last { $0.stage == .structure && $0.id == id }
 }
 
+/// One beat-match gate's row, for the tempo-ramp sweep.
+func beatMatchGate(_ d: Audition.Decision, _ id: String) -> PlanGate? {
+    d.planTrace.gates.last { $0.stage == .beatMatch && $0.id == id }
+}
+
+/// The knob that, off, reproduces the pre-ramp decision exactly: the old caps
+/// come back and the plan carries no ramp fields.
+let tempoRampOffOverrides: [String: Double] = ["tempoRampEnabled": 0]
+
+/// P4's before/after evidence, and the mirror image of the structure sweep
+/// above: the tempo ramp only ever changes *whether* a seam can be beat-matched
+/// at all (a wider gate the glide pays for), so the question is one row per
+/// seam — what did it get before, what does it get now, and what does each deck
+/// have to bend to earn it.
+func runTempoSweep(_ args: Arguments, pairs: [(playlist: String, a: URL, b: URL)],
+                   corpus: URL, playlists: Int) {
+    let extra = configOverrides(args)
+    // Read back off the decision's own resolved config rather than re-deriving
+    // it here, so a `--set rampLeadSeconds=…` run reports the lead it used.
+    var lead = 0.0
+    var rows: [String] = []
+    var upgraded = 0, alreadyMatched = 0, stillNot = 0
+    var bends: [Double] = []
+    var blockers: [String: Int] = [:]
+
+    for (index, pair) in pairs.enumerated() {
+        var oldArgs = args
+        oldArgs.flags["set"] = (tempoRampOffOverrides.merging(extra) { a, _ in a })
+            .map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+        let old = decide(oldArgs, a: pair.a, b: pair.b)
+        let new = decide(args, a: pair.a, b: pair.b)
+        lead = new.config["rampLeadSeconds"] ?? lead
+
+        let wasMatched = old.planKind == "beatMatched"
+        let isMatched = new.planKind == "beatMatched"
+        if isMatched && !wasMatched { upgraded += 1 }
+        else if isMatched { alreadyMatched += 1 }
+        else {
+            stillNot += 1
+            blockers[new.planTrace.blocker?.id ?? "—", default: 0] += 1
+        }
+
+        // The bend each deck takes, and the gap it is closing. Read off the new
+        // decision's own ledger so the numbers are the ones the gate compared.
+        let delta = beatMatchGate(new, "bpmDelta")?.value
+        let outBend = new.outgoingRate.map { (Double($0) - 1) * 100 }
+        let inBend = new.incomingRate.map { (Double($0) - 1) * 100 }
+        if isMatched && !wasMatched, let outBend { bends.append(abs(outBend)) }
+
+        let marker = (isMatched && !wasMatched) ? "  ← newly beat-matched" : ""
+        print("[\(index + 1)/\(pairs.count)] \(pair.playlist) · \(old.outgoingName) → "
+              + "\(old.incomingName)  \(old.planKind) → \(new.planKind)"
+              + (delta.map { String(format: "  (Δ%.1f %%)", $0 * 100) } ?? "") + marker)
+        rows.append("| \(pair.playlist) | \(old.outgoingName) → \(old.incomingName)"
+                    + " | \(f(old.outgoingBPM, 1)) → \(f(old.incomingBPM, 1))"
+                    + " | \(delta.map { f($0 * 100, 1) + " %" } ?? "—")"
+                    + " | \(old.planKind) → \(new.planKind)"
+                    + " | \(outBend.map { String(format: "%+.2f %%", $0) } ?? "—")"
+                    + " | \(inBend.map { String(format: "%+.2f %%", $0) } ?? "—")"
+                    + " | \(isMatched ? f(lead, 1) + " s" : "—")"
+                    + " | \(f(old.overlapDuration)) → \(f(new.overlapDuration)) s"
+                    + " | \(isMatched && !wasMatched ? "**yes**" : "—")"
+                    // Why *this* seam is not beat-matched. Without it a table
+                    // of unchanged rows says nothing: a pair blocked at the
+                    // tempo-confidence gate was never a candidate for the
+                    // widening, and must not be read as evidence against it.
+                    + " | \(new.planTrace.blocker?.id ?? "—") |")
+    }
+
+    var summary = ["## Tempo-ramp sweep", "",
+                   "Corpus: `\(corpus.path)` · \(pairs.count) seams across \(playlists) "
+                   + "playlists · generated "
+                   + ISO8601DateFormatter().string(from: Date()),
+                   "",
+                   "`old` = `tempoRampEnabled=0` (byte-identical to the pre-ramp planner: "
+                   + "±8 % gap, ±4 % bend, stepped) · `new` = shipped defaults "
+                   + "(±11.5 % gap, ±6 % bend, "
+                   + String(format: "%.1f s glide).", lead), ""]
+    summary.append("- newly beat-matched (was crossfade/gapless for tempo reasons): "
+                   + "\(upgraded)/\(pairs.count)")
+    summary.append("- already beat-matched under the old caps: \(alreadyMatched)/\(pairs.count)")
+    summary.append("- still not beat-matched: \(stillNot)/\(pairs.count)")
+    if !blockers.isEmpty {
+        summary.append("  - blocked at: "
+                       + blockers.sorted { $0.value > $1.value }
+                           .map { "`\($0.key)` ×\($0.value)" }.joined(separator: ", "))
+    }
+    if !bends.isEmpty {
+        let sorted = bends.sorted()
+        summary.append(String(format: "  - outgoing bend on the new ones: min %.2f %% · "
+                              + "median %.2f %% · max %.2f %%",
+                              sorted.first!, sorted[sorted.count / 2], sorted.last!))
+    }
+    summary.append("")
+
+    let document = (summary + [
+        "| playlist | pair | BPM out → in | folded gap | plan | out bend | in bend "
+            + "| ramp lead | overlap | new | blocked at |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ] + rows).joined(separator: "\n") + "\n"
+    emitSweep(document, args)
+}
+
+func emitSweep(_ document: String, _ args: Arguments) {
+    if let out = args.flags["output"] {
+        let docURL = url(out)
+        try? FileManager.default.createDirectory(at: docURL.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        do { try document.write(to: docURL, atomically: true, encoding: .utf8) }
+        catch { fail("could not write \(docURL.path): \(error.localizedDescription)") }
+        print("\nwrote \(docURL.path)")
+    } else {
+        print("\n" + document)
+    }
+}
+
 func runSweep(_ args: Arguments) {
     guard let dirArg = args.positional.first else { fail(usage) }
     let corpus = url(dirArg)
@@ -776,6 +896,16 @@ func runSweep(_ args: Arguments) {
     for key in playlists.keys.sorted() {
         let group = playlists[key]!
         for (a, b) in zip(group, group.dropFirst()) { pairs.append((key, a, b)) }
+    }
+
+    // Same corpus walk, two questions. `--mode tempo` asks the P4 one (did the
+    // ramp widen the beat-match gate onto this seam); the default asks P3's.
+    switch args.flags["mode"] ?? "structure" {
+    case "structure": break
+    case "tempo":
+        runTempoSweep(args, pairs: pairs, corpus: corpus, playlists: playlists.count)
+        return
+    case let other: fail("unknown --mode '\(other)'; expected structure|tempo")
     }
 
     let extra = configOverrides(args)
@@ -857,17 +987,7 @@ func runSweep(_ args: Arguments) {
             + "| structure conf out/in | plan | overlap |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ] + rows).joined(separator: "\n") + "\n"
-
-    if let out = args.flags["output"] {
-        let docURL = url(out)
-        try? FileManager.default.createDirectory(at: docURL.deletingLastPathComponent(),
-                                                 withIntermediateDirectories: true)
-        do { try document.write(to: docURL, atomically: true, encoding: .utf8) }
-        catch { fail("could not write \(docURL.path): \(error.localizedDescription)") }
-        print("\nwrote \(docURL.path)")
-    } else {
-        print("\n" + document)
-    }
+    emitSweep(document, args)
 }
 
 // MARK: - Entry
