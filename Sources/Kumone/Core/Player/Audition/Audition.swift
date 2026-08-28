@@ -740,6 +740,12 @@ public enum Audition {
         // The render plays the decks at exactly the trims the product would.
         options.outgoingTrimDB = decision.signals.outgoingTrimDB
         options.incomingTrimDB = decision.signals.incomingTrimDB
+        // …and with the same bent-rate headroom pad, which needs each track's
+        // own peak. Without these the render would clip where the player does
+        // not, which is exactly the kind of divergence the audition exists to
+        // rule out.
+        options.outgoingPeakDBFS = decision.outgoingAnalysis.peakDBFS
+        options.incomingPeakDBFS = decision.incomingAnalysis.peakDBFS
         // …and at exactly the gain ride it would ride, release included.
         options.rideDB = decision.planned.rideDB
         let result = try OfflineTransitionRenderer.render(

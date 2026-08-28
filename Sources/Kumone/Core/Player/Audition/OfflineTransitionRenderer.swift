@@ -41,6 +41,12 @@ enum OfflineTransitionRenderer {
         /// what this renderer produced before compensation existed.
         var outgoingTrimDB: Double = 0
         var incomingTrimDB: Double = 0
+        /// The two tracks' sample peaks (`TrackAnalysis.peakDBFS`), used only
+        /// to size each deck's bent-rate headroom pad exactly as the player
+        /// would (`LoudnessCompensation.timePitchPadDB`). Nil — the default —
+        /// means no pad, which is what a deck with no analysis gets live.
+        var outgoingPeakDBFS: Double? = nil
+        var incomingPeakDBFS: Double? = nil
 
         /// The hand-over's gain ride for the incoming deck, in dB
         /// (`PlannedTransition.rideDB`), applied exactly as the live engine
@@ -295,6 +301,12 @@ enum OfflineTransitionRenderer {
         // on the fader, never on the mixer.
         from.trim = LoudnessCompensation.gain(fromDB: options.outgoingTrimDB)
         to.trim = LoudnessCompensation.gain(fromDB: options.incomingTrimDB)
+        // Sized here, engaged where each deck actually bends — the same two
+        // decisions the engine makes, in the same order.
+        from.padCeilingDB = LoudnessCompensation.timePitchPadDB(
+            forPeakDBFS: options.outgoingPeakDBFS, afterTrimDB: options.outgoingTrimDB)
+        to.padCeilingDB = LoudnessCompensation.timePitchPadDB(
+            forPeakDBFS: options.incomingPeakDBFS, afterTrimDB: options.incomingTrimDB)
         engine.mainMixerNode.outputVolume = 1
         for deck in decks { deck.connect(engine: engine, format: format) }
 
@@ -404,8 +416,13 @@ enum OfflineTransitionRenderer {
             let tempoRamp = TransitionAutomation.tempoRamp(for: planned.plan)
             var preRollRequest = options.preRoll
             if let tempoRamp, options.extendPreRollForTempoRamp {
+                // Room for the glide *and* for the headroom pad's own lead-in
+                // ahead of it, or the render would open on a deck already
+                // part-padded — and, worse, would clip in the stretch the pad
+                // is supposed to have covered before the bend began.
+                let padLead = TransitionAutomation.ratePadLeadSeconds(from.padCeilingDB)
                 preRollRequest = max(preRollRequest,
-                                     (outPoint ?? 0) - tempoRamp.start + 1)
+                                     (outPoint ?? 0) - tempoRamp.start + padLead + 1)
             }
             let outStart = max(0, (outPoint ?? 0) - preRollRequest)
             // Pre-roll is measured on the *outgoing song's* clock — the deck
@@ -490,8 +507,15 @@ enum OfflineTransitionRenderer {
                 var pumped: AVAudioFrameCount = 0
                 let target = outPoint ?? 0
                 let tickSeconds = Double(tickFrames) / sampleRate
+                let padLead = TransitionAutomation.ratePadLeadSeconds(from.padCeilingDB)
+                let padStart = tempoRamp.start - padLead
                 while outgoingSource < target - 1e-9 {
                     let rate = tempoRamp.rate(at: outgoingSource)
+                    // The pad lands exactly where the bend begins — the same
+                    // lead-in the engine's wait tick gives it.
+                    from.setRatePad(db: from.padCeilingDB * Double(
+                        TransitionAutomation.ramp(outgoingSource, from: padStart,
+                                                  to: tempoRamp.start)))
                     from.timePitch.rate = rate
                     // Clamp the last chunk so the pre-roll lands *on* the out
                     // point rather than a tick past it.
@@ -518,6 +542,9 @@ enum OfflineTransitionRenderer {
             to.schedule(inBuffer)
             if case .beatMatched(let p) = planned.plan {
                 to.timePitch.rate = p.incomingRate
+                // Full value at once, under a fader still at 0 — the engine's
+                // `beginOverlapLocked` makes the same move for the same reason.
+                to.setRatePad(db: to.padCeilingDB)
                 if !planned.style.stagedEQ {
                     to.eq.bands[DeckChain.Band.low.rawValue].gain = TransitionAutomation.bassCutDB
                 }
@@ -613,6 +640,9 @@ enum OfflineTransitionRenderer {
                 from.setFader(0)
                 DeckChain.neutralize(timePitch: from.timePitch, eq: from.eq, delay: from.delay)
                 to.timePitch.rate = 1
+                // Rate home, so the pad it was covering for goes too — the
+                // same order `settleTickLocked` releases them in.
+                to.setRatePad(db: 0)
             }
 
             // --- Post-roll: the incoming track alone, still letting go of the
@@ -765,17 +795,29 @@ enum OfflineTransitionRenderer {
         /// through the current curve value rather than clobbering it.
         var ride: Float = 1
         var faderRequest: Float = 1
+        /// Bent-rate headroom pad; see `PlaybackEngine.DeckState.ratePad`. The
+        /// third multiplier, and the render has to carry it or the audition
+        /// A/B is a different signal path from the player.
+        var ratePad: Float = 1
+        /// How far this deck comes down while bent, in dB (≤ 0).
+        var padCeilingDB: Double = 0
 
         /// The single fader writer, mirroring `PlaybackEngine.setFaderLocked`:
-        /// callers speak in 0–1 and both gains are folded in here.
+        /// callers speak in 0–1 and all three gains are folded in here.
         func setFader(_ value: Float) {
             faderRequest = value
-            player.volume = value * trim * ride
+            player.volume = value * trim * ride * ratePad
         }
 
         /// Move the ride and re-apply the fader through it.
         func setRide(db: Double) {
             ride = LoudnessCompensation.gain(fromDB: db)
+            setFader(faderRequest)
+        }
+
+        /// Move the bent-rate pad and re-apply the fader through it.
+        func setRatePad(db: Double) {
+            ratePad = LoudnessCompensation.gain(fromDB: db)
             setFader(faderRequest)
         }
 

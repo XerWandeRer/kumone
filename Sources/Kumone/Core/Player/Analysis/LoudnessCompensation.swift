@@ -48,6 +48,34 @@ enum LoudnessCompensation {
         /// stays conservative on the real stereo file — and cover
         /// inter-sample overshoot with the same allowance.
         var downmixPeakAllowanceDB: Double = 3
+        /// How far above its input peak `AVAudioUnitTimePitch` can push a
+        /// signal while it is running at a **non-unity rate**.
+        ///
+        /// Measured, not guessed: four masters × six rates × five `overlap`
+        /// settings, peak in vs peak out through `player → timePitch`.
+        ///
+        ///   | master | worst overshoot |
+        ///   |---|---|
+        ///   | Kendrick "LOVE." (0 dBFS-peak) | +6.41 dB |
+        ///   | Kelela "Happy Ending" | +6.17 dB |
+        ///   | KnowKnow "Uh" | +5.25 dB |
+        ///   | 刘珂矣 "半壶纱" | +4.69 dB |
+        ///
+        /// Two findings shape how it is used. First, it does **not** scale with
+        /// the bend: a 0.65 % rate change already costs the full overshoot, and
+        /// a 10 % one costs no more. The phase vocoder is either engaged or it
+        /// is not, so the pad is binary-on-bent rather than proportional.
+        /// Second, `overlap` does not help — the figures are flat from 8 to 32
+        /// within measurement noise, at 3.5× the CPU — so there is no way to
+        /// tune the overshoot away and it has to be paid for in headroom.
+        ///
+        /// 5.5 dB is the *typical* worst case (the mean of the four maxima),
+        /// deliberately not the absolute one. Padding to 6.5 would cost every
+        /// hot master another dB of real loudness to prevent the last handful
+        /// of single-sample overs, and on the material that provoked this the
+        /// unpadded excursion was 100 samples in 1.3 million. Guaranteeing the
+        /// last of those is not worth a dB of the song.
+        var timePitchOvershootDB: Double = 5.5
 
         static let standard = Config()
     }
@@ -88,6 +116,42 @@ enum LoudnessCompensation {
     ) -> Double {
         guard let peak = analysis?.peakDBFS, peak.isFinite else { return 0 }
         return max(0, config.peakCeilingDBFS - (peak + config.downmixPeakAllowanceDB + trimDB))
+    }
+
+    /// **Bent-rate headroom pad**: how far a deck must be held down, in dB,
+    /// while it is playing at a non-unity rate, so the time-pitch unit's
+    /// overshoot (`timePitchOvershootDB`) does not push it past the ceiling.
+    ///
+    /// Negative or zero — this is only ever a cut. Zero for most of the
+    /// library, which is the point of sizing it from the track's own peak: a
+    /// master that already sits 6 dB below the ceiling after its trim absorbs
+    /// the overshoot on its own and is left completely alone. Only genuinely
+    /// hot masters on small trims pay anything.
+    ///
+    /// Zero, too, when the peak is unknown. That is the opposite of
+    /// `boostHeadroomDB`'s conservatism, and deliberately: refusing a boost you
+    /// cannot justify costs nothing, but padding a track you cannot measure
+    /// costs real loudness on every track the analyzer has not reached yet.
+    ///
+    /// Unlike the boost guard this does **not** charge `downmixPeakAllowanceDB`
+    /// against the budget. That allowance covers the analyzer's mono peak
+    /// possibly sitting below the true stereo peak, and it is there to make an
+    /// otherwise unbounded decision safe. Here the thing being guarded is
+    /// already characterised end-to-end on stereo signal, and the 5.5 dB
+    /// carries its own conservatism; stacking the two would spend several dB
+    /// of loudness on an uncertainty neither measurement supports. (On the
+    /// corpus the mono peak reads at or *above* the stereo peak anyway —
+    /// "LOVE." analyses at +0.60 dBFS against a 0 dBFS stereo master.)
+    /// Takes the peak directly rather than a `TrackAnalysis`, because the deck
+    /// that needs it is handed one number at load time and never sees the
+    /// analysis — the same shape as `trimDB`.
+    static func timePitchPadDB(
+        forPeakDBFS peakDBFS: Double?, afterTrimDB trimDB: Double,
+        config: Config = .standard
+    ) -> Double {
+        guard let peak = peakDBFS, peak.isFinite else { return 0 }
+        let bentPeak = peak + trimDB + config.timePitchOvershootDB
+        return min(0, config.peakCeilingDBFS - bentPeak)
     }
 
     /// dB → linear gain, the multiplier a fader is scaled by.

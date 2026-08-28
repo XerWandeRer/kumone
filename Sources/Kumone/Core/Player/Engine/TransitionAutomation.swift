@@ -169,6 +169,27 @@ enum TransitionAutomation {
     /// release is still running. The engine carries it on the deck instead.
     static let rideReleaseDBPerSecond: Double = 0.3
 
+    /// How fast the bent-rate headroom pad
+    /// (`LoudnessCompensation.timePitchPadDB`) is glided on, in dB per second.
+    ///
+    /// The same number as the ride's release and for the same reason — it is
+    /// the rate at which a level change stops presenting itself as an event —
+    /// but it buys something different: the pad has to be **completely in
+    /// before the deck's rate leaves unity**, because the time-pitch overshoot
+    /// does not scale with the bend. A pad that faded in alongside the glide
+    /// would be covering a third of the overshoot for the first half of it.
+    /// So the pad gets its own lead-in *ahead* of the tempo ramp, and this is
+    /// what sets its length: |pad| / 0.3 dB/s, about 10 s at the deepest pad
+    /// the caps allow.
+    static let ratePadGlideDBPerSecond: Double = 0.3
+
+    /// Seconds of unbent lead-in a deck needs to have `padDB` fully glided on
+    /// by the time its tempo ramp starts.
+    static func ratePadLeadSeconds(_ padDB: Double) -> TimeInterval {
+        guard padDB.isFinite, padDB != 0 else { return 0 }
+        return abs(padDB) / ratePadGlideDBPerSecond
+    }
+
     /// The ride level, in dB, `elapsed` seconds after the overlap ended.
     /// A linear-in-dB release to 0, which is a constant-slope fader move —
     /// the shape a hand on a trim knob makes.

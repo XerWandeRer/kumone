@@ -1725,8 +1725,13 @@ struct PlaybackEngineSmokeTests {
                 let engine = PlaybackEngine()
                 let log = EventLog(engine)
                 defer { engine.stopAll() }
-                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
-                      (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil
+                // Loaded as 0 dBFS-peak masters, so both decks really do owe a
+                // bent-rate headroom pad and "was it handed back" is a
+                // question with teeth.
+                guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a,
+                                            peakDBFS: 0)) != nil,
+                      (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b,
+                                            peakDBFS: 0)) != nil
                 else { return nil }
                 engine.outputVolume = 0
                 engine.play(deck: .a, from: 2.6)
@@ -1756,10 +1761,13 @@ struct PlaybackEngineSmokeTests {
                 case .cancelMidRelease:
                     engine.cancelScheduledTransition()
                 }
-                // Well past the 6 s release, whatever happened to it.
-                let deadline = Date().addingTimeInterval(9)
-                while Date() < deadline {
-                    if abs(engine.effectSnapshot(of: .b).rate - 1) < 0.001 { break }
+                // Well past the 6 s release, whatever happened to it. Waiting
+                // on the transition clearing rather than on the rate looking
+                // close enough to 1: the settle only hands back the pad once
+                // it declares the restore *done*, and a rate of 1.0006 is
+                // within any sane tolerance while still being mid-glide.
+                let deadline = Date().addingTimeInterval(12)
+                while Date() < deadline, engine.hasPendingTransition {
                     Thread.sleep(forTimeInterval: 0.1)
                 }
                 return engine.effectSnapshot(of: .b)
@@ -1769,9 +1777,108 @@ struct PlaybackEngineSmokeTests {
                 + "detuned — it will sound underwater until the track ends (\(snapshot))"
             let coloured = "\(interruption.rawValue): the live deck's chain must be "
                 + "transparent once the hand-over is done with it (\(snapshot))"
+            let padded = "\(interruption.rawValue): the bent-rate headroom pad outlived "
+                + "the bend — the rest of the song plays quiet (\(snapshot))"
             #expect(abs(snapshot.rate - 1) < 0.001, "\(detuned)")
             #expect(snapshot.effectsAreNeutral, "\(coloured)")
+            // The pad is a gain, so `effectsAreNeutral` cannot see it: it has
+            // to be asserted separately, and on the same six teardown orders —
+            // a deck left padded is a deck playing the rest of its song a few
+            // dB down, which is quieter to notice and no easier to explain.
+            // Asserted on the *target*, like the ride's release: what must be
+            // true is that it has been let go of, not that a 0.3 dB/s glide has
+            // already finished.
+            #expect(abs(snapshot.ratePadTargetDB) < 0.001, "\(padded)")
+            #expect(snapshot.ratePadDB <= 0.001, "the pad is only ever a cut (\(snapshot))")
         }
+    }
+
+    /// The bent-rate headroom pad, on a real graph: it goes on *before* the
+    /// deck's rate leaves unity, holds while bent, and is gone once the rate is
+    /// home — and a deck with headroom to spare never sees it at all.
+    ///
+    /// The pad exists because `AVAudioUnitTimePitch` at a non-unity rate can
+    /// push a signal several dB above its own input peak, which on a 0 dBFS
+    /// master clips; the tempo ramp made that much worse by holding the
+    /// outgoing deck bent at full fader for the whole glide.
+    @Test func theHeadroomPadRidesInAheadOfTheBendAndLeavesWithIt() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome {
+            var beforePad: Double?
+            var padded: Double?
+            var atFullBend: (pad: Double, rate: Float)?
+            var afterRelease: Double?
+            var quietMasterPad: Double?
+        }
+        // Ramp window [2.7, 4.7]; a 0 dBFS master on no trim owes 6.5 dB, so
+        // the pad's own lead-in is ~21.7 s — far longer than this fixture — and
+        // it engages from the moment the plan is armed.
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.90, incomingRate: 1.05,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 2))
+
+        let result = withWatchdog("headroomPad", timeout: 45) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a,
+                                        peakDBFS: 0)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b,
+                                        peakDBFS: 0)) != nil else { return o }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 0.2)
+            o.beforePad = engine.effectSnapshot(of: .a).ratePadDB
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+
+            // Inside the pad's lead-in but before the bend: padding, unbent.
+            Thread.sleep(forTimeInterval: 0.6)
+            let early = engine.effectSnapshot(of: .a)
+            o.padded = early.ratePadDB
+            // At full bend, the pad must be at full value.
+            _ = pollPosition(engine, deck: .a, past: 4.85, timeout: 8)
+            let bent = engine.effectSnapshot(of: .a)
+            o.atFullBend = (bent.ratePadDB, bent.rate)
+
+            _ = log.wait(timeout: 15) {
+                if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                return false
+            }
+            let deadline = Date().addingTimeInterval(9)
+            while Date() < deadline, engine.hasPendingTransition {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            o.afterRelease = engine.effectSnapshot(of: .b).ratePadTargetDB
+
+            // A quiet master, same everything else: never padded.
+            let quiet = PlaybackEngine()
+            defer { quiet.stopAll() }
+            guard (try? quiet.loadFile(at: Fixtures.eightSecondCAF, on: .a,
+                                       peakDBFS: -20)) != nil,
+                  (try? quiet.loadFile(at: Fixtures.sixSecondCAF, on: .b,
+                                       peakDBFS: -20)) != nil else { return o }
+            quiet.outputVolume = 0
+            quiet.play(deck: .a, from: 2.0)
+            quiet.scheduleTransition(.plain(plan), from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 1.2)
+            o.quietMasterPad = quiet.effectSnapshot(of: .a).ratePadDB
+            return o
+        }
+        guard let o = result, let before = o.beforePad, let padded = o.padded,
+              let full = o.atFullBend, let after = o.afterRelease,
+              let quiet = o.quietMasterPad else { return }
+
+        #expect(before == 0, "an unbent deck starts unpadded (\(before))")
+        #expect(padded < -0.05, "the pad must lead the bend, not follow it (\(padded))")
+        #expect(full.pad < -0.05 && abs(full.rate - 0.90) < 0.002,
+                "fully bent, so fully padded (pad \(full.pad), rate \(full.rate))")
+        #expect(full.pad <= padded + 1e-6, "the pad only deepens as the bend approaches")
+        #expect(abs(after) < 0.001,
+                "the pad must be let go of once the rate is home (\(after))")
+        #expect(quiet == 0,
+                "a master with headroom to spare must never be padded (\(quiet))")
     }
 
     /// The contract-violation exit from `beginOverlapLocked`: the incoming deck

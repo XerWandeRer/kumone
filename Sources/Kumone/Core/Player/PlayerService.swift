@@ -722,7 +722,8 @@ final class PlayerService: ObservableObject {
             guard generation == resolveGeneration else { return }
             if let local,
                let fileDuration = try? engine.loadFile(
-                   at: local, on: activeDeck, trimDB: loudnessTrimDB(for: cachedAnalysis)) {
+                   at: local, on: activeDeck, trimDB: loudnessTrimDB(for: cachedAnalysis),
+                   peakDBFS: cachedAnalysis?.peakDBFS) {
                 hasLocalFile = true
                 currentLocalURL = local
                 persistCurrentLyricsSidecar()
@@ -944,7 +945,8 @@ final class PlayerService: ObservableObject {
         guard !transitionArmed, let next = prefetchedNext else { return }
         let incoming = activeDeck.other
         guard (try? engine.loadFile(at: next.localURL, on: incoming,
-                                    trimDB: loudnessTrimDB(for: next.analysis))) != nil else {
+                                    trimDB: loudnessTrimDB(for: next.analysis),
+                                    peakDBFS: next.analysis?.peakDBFS)) != nil else {
             prefetchedNext = nil
             AutoMixDebugModel.shared.setNextStage(.failed("incoming deck would not load the file"))
             return

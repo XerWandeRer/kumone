@@ -168,6 +168,35 @@ final class PlaybackEngine: @unchecked Sendable {
         var rideReleaseFromDB: Double = 0
         var rideReleaseElapsed: TimeInterval = 0
 
+        /// **Bent-rate headroom pad**: the *third* multiplier on every fader
+        /// write, and the only one that exists for a reason that is not
+        /// musical. `AVAudioUnitTimePitch` at a non-unity rate can push a
+        /// signal several dB above its own input peak
+        /// (`LoudnessCompensation.timePitchOvershootDB`), so a hot master
+        /// played bent clips — which the tempo ramp made much worse by holding
+        /// the outgoing deck bent at *full fader* for the whole glide, where
+        /// the bend used to happen only inside an overlap under a falling one.
+        ///
+        /// It is a property of the material *and* of the moment: sized once
+        /// from the track's own peak (`padCeilingDB`), then engaged and
+        /// released as the deck's rate leaves and returns to unity. 1 for every
+        /// deck with headroom to spare, which is most of them, and every path
+        /// is then bit-identical to the player before it existed.
+        var ratePad: Float = 1
+        var ratePadDB: Double = 0
+        /// Where the pad is heading. Equal to `ratePadDB` = settled. Released
+        /// on the deck's own glide timer, not the transition's, for exactly the
+        /// reason the ride is: it has to survive the transition being torn down
+        /// underneath it, and a cancel mid-release must not strand it.
+        var ratePadTargetDB: Double = 0
+        /// How far this deck would have to come down while bent, in dB (≤ 0).
+        /// Computed at load from the track's peak and trim; 0 means the track
+        /// absorbs the overshoot on its own and is never padded.
+        var padCeilingDB: Double = 0
+        /// The trim this deck was loaded at, in dB — kept because the pad is
+        /// derived from it and `trim` is already a linear multiplier.
+        var trimDB: Double = 0
+
         // Progressive-stream bookkeeping.
         var pendingStreamBuffers = 0
         var streamStalled = false
@@ -427,7 +456,12 @@ final class PlaybackEngine: @unchecked Sendable {
     /// taken here rather than through a setter so it is fixed for the whole
     /// time the track is on the deck: an analysis that lands mid-song cannot
     /// move it, and the next load is the earliest it can change.
-    func loadFile(at url: URL, on deck: Deck, trimDB: Double = 0) throws -> TimeInterval {
+    /// `peakDBFS` is the loaded track's sample peak (`TrackAnalysis.peakDBFS`),
+    /// used only to size this deck's bent-rate headroom pad. Nil — no analysis
+    /// yet — means no pad: see `LoudnessCompensation.timePitchPadDB` for why
+    /// the unknown case errs the opposite way from the boost guard.
+    func loadFile(at url: URL, on deck: Deck, trimDB: Double = 0,
+                  peakDBFS: Double? = nil) throws -> TimeInterval {
         try queue.sync {
             let file = try AVAudioFile(forReading: url)
             let state = deckStates[deck]!
@@ -438,6 +472,12 @@ final class PlaybackEngine: @unchecked Sendable {
             invalidateTransitionLocked(touching: deck)
             resetDeckLocked(state)
             state.trim = LoudnessCompensation.gain(fromDB: trimDB)
+            state.trimDB = trimDB
+            // Sized once, here, from the material — like the trim, and for the
+            // same reason: a pad that moved mid-song would be a level jump.
+            // *Applying* it is a separate decision, made when the deck is bent.
+            state.padCeilingDB = LoudnessCompensation.timePitchPadDB(
+                forPeakDBFS: peakDBFS, afterTrimDB: trimDB)
             let fileFormat = file.processingFormat
             if fileFormat.sampleRate == graphFormat.sampleRate,
                fileFormat.channelCount == graphFormat.channelCount {
@@ -759,6 +799,10 @@ final class PlaybackEngine: @unchecked Sendable {
         /// value it is gliding towards (equal = settled). 0/0 = no ride.
         var rideDB: Double = 0
         var rideTargetDB: Double = 0
+        /// The bent-rate headroom pad currently on this deck, in dB (≤ 0),
+        /// and the value it is gliding towards (equal = settled).
+        var ratePadDB: Double = 0
+        var ratePadTargetDB: Double = 0
         var rate: Float
         var eqGlobalGain: Float = 0
         var lowGain: Float
@@ -784,8 +828,9 @@ final class PlaybackEngine: @unchecked Sendable {
         /// compensated deck at full fade sits at its trim by construction, and
         /// one still unwinding a hand-over's gain ride sits at trim × ride.
         var isNeutral: Bool {
-            effectsAreNeutral
-                && abs(volume - trim * LoudnessCompensation.gain(fromDB: rideDB)) < 0.001
+            effectsAreNeutral && abs(ratePadTargetDB) < 0.001
+                && abs(volume - trim * LoudnessCompensation.gain(fromDB: rideDB)
+                       * LoudnessCompensation.gain(fromDB: ratePadDB)) < 0.001
         }
 
         /// The pose `resetDeckLocked` parks a spent deck in: transparent chain
@@ -802,6 +847,8 @@ final class PlaybackEngine: @unchecked Sendable {
                 trim: state.trim,
                 rideDB: state.rideDB,
                 rideTargetDB: state.rideTargetDB,
+                ratePadDB: state.ratePadDB,
+                ratePadTargetDB: state.ratePadTargetDB,
                 rate: state.timePitch.rate,
                 eqGlobalGain: state.eq.globalGain,
                 lowGain: state.band(.low).gain,
@@ -949,7 +996,7 @@ final class PlaybackEngine: @unchecked Sendable {
     /// (`TransitionAutomation` included) and never see either gain.
     private func setFaderLocked(_ state: DeckState, _ value: Float) {
         state.faderRequest = value
-        let level = value * state.trim * state.ride
+        let level = value * state.trim * state.ride * state.ratePad
         if state.pendingFaderRestore != nil {
             state.pendingFaderRestore = level
         } else {
@@ -985,6 +1032,40 @@ final class PlaybackEngine: @unchecked Sendable {
         setFaderLocked(state, state.faderRequest)
     }
 
+    // MARK: - Bent-rate headroom pad (locked)
+
+    /// Put the deck's pad at `db` now and re-write its fader at the new gain.
+    /// Only ever called where the move is inaudible — under a fader at 0, or
+    /// spread across the tempo glide by the caller.
+    private func setRatePadLocked(_ state: DeckState, db: Double) {
+        state.ratePadTargetDB = db
+        guard abs(state.ratePadDB - db) > 0.0001 else { return }
+        state.ratePadDB = db
+        state.ratePad = LoudnessCompensation.gain(fromDB: db)
+        setFaderLocked(state, state.faderRequest)
+    }
+
+    /// Start letting go of the deck's pad: unity is the target, reached at
+    /// `TransitionAutomation.ratePadGlideDBPerSecond`.
+    ///
+    /// Like `releaseRideLocked`, this deliberately lives on the *deck*. The pad
+    /// goes on for a hand-over but it is let go of long after one — and a
+    /// cancel, a re-arm or a seek mid-release must not strand a deck several dB
+    /// down for the rest of its song. The deck's glide timer outlives every
+    /// transition, so it is the only owner that can promise that.
+    private func releaseRatePadLocked(_ state: DeckState) {
+        guard abs(state.ratePadDB) > 0.0001 else {
+            state.ratePadTargetDB = 0
+            return
+        }
+        state.ratePadTargetDB = 0
+        startRideTimerLocked()
+    }
+
+    /// The pad this deck owes while bent — 0 for anything with headroom to
+    /// spare, which is most of the library.
+    private func padTargetLocked(_ state: DeckState) -> Double { state.padCeilingDB }
+
     /// Clear the ride bookkeeping without touching the fader — for a deck
     /// being taken out of service, where the fader is separately silenced (or,
     /// for an echo tail, deliberately left exactly where the overlap left it).
@@ -995,6 +1076,11 @@ final class PlaybackEngine: @unchecked Sendable {
         state.rideReleaseFromDB = 0
         state.rideReleaseElapsed = 0
         state.ride = 1
+        // The pad belongs to a bend that is over too. Cleared without a fader
+        // write for the same reason as the ride: this deck has just been
+        // silenced, or is deliberately holding an echo tail's level.
+        state.ratePadDB = 0
+        state.ratePad = 1
     }
 
     /// Start letting go of the deck's ride: unity is the target, reached at
@@ -1045,22 +1131,43 @@ final class PlaybackEngine: @unchecked Sendable {
         rideTimer = timer
     }
 
+    /// One tick of the deck-level gain glides — the ride's release, and the
+    /// bent-rate pad's. Two independent multipliers on the same fader, both
+    /// owned by the deck rather than by any transition, both let go of at
+    /// 0.3 dB/s because that is the slope at which a level change stops being
+    /// an event. A deck can be unwinding both at once (a hand-over that both
+    /// rode the incoming level and padded it for the bend), which is exactly
+    /// why they are separate numbers and one fader write.
     private func rideTickLocked() {
         var anyGliding = false
         for state in deckStates.values {
-            guard abs(state.rideDB - state.rideTargetDB) > 0.0001 else { continue }
+            let ridingHome = abs(state.rideDB - state.rideTargetDB) > 0.0001
+            let paddingHome = abs(state.ratePadDB - state.ratePadTargetDB) > 0.0001
+            guard ridingHome || paddingHome else { continue }
             // A sourceless deck is out of service (or ringing an echo tail
             // whose level is already written into player.volume) — never write
-            // its fader. `resetDeckLocked` has already cleared the ride, so
-            // this is belt and braces.
+            // its fader. `resetDeckLocked` has already cleared both, so this is
+            // belt and braces.
             if case .none = state.source { continue }
             anyGliding = true
             guard !isPaused else { continue }
-            state.rideReleaseElapsed += Self.rideTick
-            let db = TransitionAutomation.rideDB(
-                state.rideReleaseFromDB, secondsAfterOverlap: state.rideReleaseElapsed)
-            state.rideDB = db
-            state.ride = LoudnessCompensation.gain(fromDB: db)
+            if ridingHome {
+                state.rideReleaseElapsed += Self.rideTick
+                let db = TransitionAutomation.rideDB(
+                    state.rideReleaseFromDB, secondsAfterOverlap: state.rideReleaseElapsed)
+                state.rideDB = db
+                state.ride = LoudnessCompensation.gain(fromDB: db)
+            }
+            if paddingHome {
+                // A plain constant-slope walk towards the target, in dB. The
+                // pad has no "release from" bookkeeping because, unlike the
+                // ride, it is only ever released *to* unity.
+                let step = TransitionAutomation.ratePadGlideDBPerSecond * Self.rideTick
+                let remaining = state.ratePadTargetDB - state.ratePadDB
+                state.ratePadDB += remaining > 0
+                    ? Swift.min(step, remaining) : Swift.max(-step, remaining)
+                state.ratePad = LoudnessCompensation.gain(fromDB: state.ratePadDB)
+            }
             setFaderLocked(state, state.faderRequest)
         }
         if !anyGliding {
@@ -1599,8 +1706,25 @@ final class PlaybackEngine: @unchecked Sendable {
     /// tempo. Now it arrives already bent, a `segmentHandoff` early.
     private func updateTempoRampLocked(_ tr: TransitionState, position: TimeInterval) {
         guard let ramp = TransitionAutomation.tempoRamp(for: tr.plan) else { return }
-        guard position >= ramp.start else { return }
         let from = deckStates[tr.from]!
+
+        // The headroom pad goes on **before** the bend, not with it. The
+        // time-pitch overshoot does not scale with the rate — the phase
+        // vocoder is either engaged or it is not, and a 0.65 % bend already
+        // costs the full several dB — so a pad that faded in alongside the
+        // glide would be covering a fraction of the overshoot for the whole
+        // first half of it, which is exactly the clipping this exists to stop.
+        // It gets its own lead-in instead, at the ride's inaudible 0.3 dB/s,
+        // timed to land precisely where the rate leaves unity.
+        let padTarget = padTargetLocked(from)
+        let padStart = ramp.start - TransitionAutomation.ratePadLeadSeconds(padTarget)
+        if padTarget != 0, position >= padStart {
+            tr.rampActive = true      // so every teardown path hands it back
+            setRatePadLocked(from, db: padTarget * Double(
+                TransitionAutomation.ramp(position, from: padStart, to: ramp.start)))
+        }
+
+        guard position >= ramp.start else { return }
         // Anchor on first entry, and never past the end — a glide with no room
         // left is a step, which is exactly what this seam used to be.
         let anchor = tr.rampFrom ?? Swift.min(position, ramp.end)
@@ -1608,6 +1732,8 @@ final class PlaybackEngine: @unchecked Sendable {
         tr.rampActive = true
         let bent = TransitionAutomation.TempoRamp(
             start: anchor, end: ramp.end, target: ramp.target)
+
+        // The pad is already fully on by here (see above); hold it.
         from.timePitch.rate = bent.rate(at: position)
     }
 
@@ -1624,7 +1750,12 @@ final class PlaybackEngine: @unchecked Sendable {
         guard tr.rampActive else { return }
         tr.rampActive = false
         tr.rampFrom = nil
-        deckStates[tr.from]?.timePitch.rate = 1
+        guard let from = deckStates[tr.from] else { return }
+        from.timePitch.rate = 1
+        // The pad exists only to cover the bend; the bend is gone, so it goes
+        // with it — but *glided*, not snapped. This deck is still playing, and
+        // it is the same several dB going back up that went carefully down.
+        releaseRatePadLocked(from)
     }
 
     /// The wait can span minutes; idle at the slow tick and only switch to
@@ -1706,6 +1837,11 @@ final class PlaybackEngine: @unchecked Sendable {
 
         if case .beatMatched(let plan) = tr.plan {
             to.timePitch.rate = plan.incomingRate
+            // The incoming deck is bent from its very first sample, so its pad
+            // goes on at full value right here — the same argument the gain
+            // ride makes a few lines below: the fader is about to be written to
+            // 0, so there is nothing audible for the step to land on.
+            setRatePadLocked(to, db: padTargetLocked(to))
             if !tr.style.stagedEQ { to.band(.low).gain = Self.bassCutDB }
         }
         if tr.style.stagedEQ {
@@ -1995,7 +2131,10 @@ final class PlaybackEngine: @unchecked Sendable {
                 startNodeIfNeededLocked(to)
             }
             setFaderLocked(to, 1)
+            // Same as a normal finish: this deck is the track now, so both of
+            // its deck-level gains are let go of gently rather than snapped.
             releaseRideLocked(to)
+            releaseRatePadLocked(to)
             neutralizeEffectsLocked(to)
             resetDeckLocked(from)
             eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
@@ -2013,6 +2152,7 @@ final class PlaybackEngine: @unchecked Sendable {
         }
         neutralizeEffectsLocked(to)
         setRideLocked(to, db: 0)
+        setRatePadLocked(to, db: 0)
         neutralizeEffectsLocked(from)
         let resumeAt = segment.outgoingTime(at: elapsed)
         switch from.source {
@@ -2068,6 +2208,13 @@ final class PlaybackEngine: @unchecked Sendable {
             to.timePitch.rate = settle.incomingRate
             if settle.rateRestoreDone {
                 tr.restoringRate = false
+                // Back at unity rate, so the pad has nothing left to cover.
+                // Released here rather than alongside the rate glide because
+                // it is a gain move and the rate is not: the rate hurries back
+                // to get out of the phase vocoder, the pad only has to be
+                // inaudible, and dropping it early would un-pad a deck that is
+                // still bent.
+                releaseRatePadLocked(to)
             } else {
                 done = false
             }
@@ -2164,6 +2311,7 @@ final class PlaybackEngine: @unchecked Sendable {
             tr.restoringRate = true
         } else {
             to.timePitch.rate = 1
+            releaseRatePadLocked(to)
         }
         if tr.restoringRate || tailRinging {
             tr.phase = .settling
@@ -2265,6 +2413,7 @@ final class PlaybackEngine: @unchecked Sendable {
             // is silent, so dropping it is inaudible; leaving it would colour
             // whatever this deck is reused for next.
             setRideLocked(to, db: 0)
+            setRatePadLocked(to, db: 0)
             to.isPlaying = false
             setFaderLocked(from, 1)
             neutralizeEffectsLocked(from)
@@ -2274,7 +2423,15 @@ final class PlaybackEngine: @unchecked Sendable {
             // so it keeps its fader; `from` is spent. A ride release on `to`
             // is left running: it belongs to the deck, not to this transition,
             // and whatever happens to that deck next settles or clears it.
+            //
+            // The bent-rate pad needs saying out loud, though, because
+            // `neutralizeEffectsLocked` snaps the rate back to unity and the
+            // pad is the thing that was covering for that rate. Left alone it
+            // would hold this deck — which *is* the music now — several dB down
+            // for the rest of the song. Released, not snapped: same gain, same
+            // slope, and it outlives this transition on the deck's own timer.
             neutralizeEffectsLocked(to)
+            releaseRatePadLocked(to)
             silenceDeckLocked(from)
         }
     }

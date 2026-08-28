@@ -124,6 +124,47 @@ import Foundation
         #expect(before.loudnessGapDB > 1.5, "the old cap left ~2 dB for the gate to judge")
     }
 
+    // MARK: - Bent-rate headroom pad
+
+    /// The pad is sized from the track's own peak, so most of the library pays
+    /// nothing: only a master hot enough that the time-pitch overshoot would
+    /// push it past the ceiling comes down at all.
+    @Test func onlyHotMastersPayTheBentRatePad() {
+        let c = LoudnessCompensation.Config.standard
+        // "LOVE.": +0.60 dBFS peak on a −4.06 dB trim. 0.60 − 4.06 + 5.5 =
+        // +2.04 against a −1 ceiling, so it owes ~3 dB.
+        let hot = LoudnessCompensation.timePitchPadDB(forPeakDBFS: 0.596, afterTrimDB: -4.06)
+        #expect(abs(hot - -3.04) < 0.01, "\(hot)")
+        // A quiet master with the same trim has headroom to spare and is left
+        // completely alone — no pad, so no path changes for it at all.
+        #expect(LoudnessCompensation.timePitchPadDB(
+            forPeakDBFS: -12, afterTrimDB: -4.06) == 0)
+        // Exactly at the ceiling: still nothing owed.
+        #expect(LoudnessCompensation.timePitchPadDB(
+            forPeakDBFS: -(c.timePitchOvershootDB + 1), afterTrimDB: 0) == 0)
+        // It is only ever a cut, never a lift.
+        for peak in stride(from: -30.0, through: 3.0, by: 1.0) {
+            #expect(LoudnessCompensation.timePitchPadDB(
+                forPeakDBFS: peak, afterTrimDB: -3) <= 0)
+        }
+        // Unknown peak → no pad. The opposite of the boost guard's
+        // conservatism, and deliberately: see the doc comment.
+        #expect(LoudnessCompensation.timePitchPadDB(forPeakDBFS: nil, afterTrimDB: -4) == 0)
+        #expect(LoudnessCompensation.boostHeadroomDB(for: nil, afterTrimDB: -4) == 0)
+    }
+
+    /// The pad's lead-in is what makes it useful: the overshoot is full from
+    /// the first fraction of a percent of bend, so the pad has to be all the
+    /// way on before the rate moves at all.
+    @Test func thePadIsFullyOnBeforeTheBendBegins() {
+        let lead = TransitionAutomation.ratePadLeadSeconds(-3.04)
+        #expect(abs(lead - 3.04 / 0.3) < 0.01, "\(lead)")
+        // …at the ride's inaudible slope, not faster.
+        #expect(3.04 / lead <= TransitionAutomation.ratePadGlideDBPerSecond + 1e-9)
+        // No pad, no lead — a deck with headroom keeps the plain ramp window.
+        #expect(TransitionAutomation.ratePadLeadSeconds(0) == 0)
+    }
+
     // MARK: - 2. Neutral overlap cap
 
     @Test func theNeutralCapIsTenSecondsAndTheClashCapIsUnchanged() {
