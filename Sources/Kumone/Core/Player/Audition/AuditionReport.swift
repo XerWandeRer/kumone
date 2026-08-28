@@ -55,6 +55,24 @@ extension Audition {
         public let downbeats: [TimeInterval]
         /// Candidate mix points, best first (the console draws the top ones).
         public let phraseBoundaries: [TimeInterval]
+        /// Structural sections, in time order; empty when the segmenter was not
+        /// confident (the console then says so rather than drawing nothing).
+        public let sections: [SectionReport]
+        public let structureConfidence: Double
+    }
+
+    /// One `TrackAnalysis.Section`, flattened for the console. Nothing decides
+    /// anything on this yet (predev P2 is the eyeball pass) — it is drawn on the
+    /// timeline and written into the AI bundle so a human, and an AI, can check
+    /// the labels against the lyrics before the planner is allowed to use them.
+    public struct SectionReport: Encodable, Sendable {
+        public let start: TimeInterval
+        public let end: TimeInterval
+        /// "intro" | "verse" | "chorus" | "bridge" | "drop" | "outro"
+        public let kind: String
+        public let repetition: Int
+        public let energy: Double
+        public let vocalDensity: Double
     }
 
     public struct SignalMark: Encodable, Sendable {
@@ -290,7 +308,13 @@ extension Audition {
             // Whole-track grids get big; one downbeat every other bar is
             // plenty for a 900-px timeline.
             downbeats: thin(a.downbeats, to: 400),
-            phraseBoundaries: Array(a.phraseBoundaries.prefix(60)))
+            phraseBoundaries: Array(a.phraseBoundaries.prefix(60)),
+            sections: a.sections.map {
+                SectionReport(start: $0.start, end: $0.end, kind: $0.kind.rawValue,
+                              repetition: $0.repetition, energy: Double($0.energy),
+                              vocalDensity: Double($0.vocalDensity))
+            },
+            structureConfidence: a.structureConfidence)
     }
 
     private static func thin(_ xs: [TimeInterval], to limit: Int) -> [TimeInterval] {
