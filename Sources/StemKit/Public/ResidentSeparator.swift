@@ -44,10 +44,20 @@ public final class ResidentStemSeparator: @unchecked Sendable {
         if let executable = Bundle.main.executableURL?.deletingLastPathComponent() {
             candidates.append(executable.appendingPathComponent("mlx.metallib"))
         }
-        candidates.append(Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/mlx.metallib"))
         for bundle in Bundle.allBundles + Bundle.allFrameworks {
             if let url = bundle.url(forResource: "mlx", withExtension: "metallib") {
                 candidates.append(url)
+            }
+        }
+        // An Xcode-built SwiftPM package ships it inside its own resource
+        // bundle, which is not loaded and so not in `allBundles`.
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("mlx.metallib"))
+            let contents = (try? FileManager.default.contentsOfDirectory(
+                at: resources, includingPropertiesForKeys: nil)) ?? []
+            for bundle in contents where bundle.pathExtension == "bundle" {
+                candidates.append(bundle.appendingPathComponent("mlx.metallib"))
+                candidates.append(bundle.appendingPathComponent("Contents/Resources/mlx.metallib"))
             }
         }
         return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
