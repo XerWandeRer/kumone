@@ -53,6 +53,18 @@ enum OfflineTransitionRenderer {
         /// hearing that you cannot hear it being let go of.
         var rideDB: Double = 0
 
+        /// Whether the post-roll is stretched so a gain ride finishes unwinding
+        /// inside the render (see `rideDB`).
+        ///
+        /// True — the default — is what auditioning wants: the file has to
+        /// contain the whole release for the release to be judged. The live
+        /// pre-render path sets it false, because there the release is *handed
+        /// back to the deck* at the splice (`Mix.rideDBAtEnd`) and continues on
+        /// the engine's own glide timer; rendering another 13 s of the incoming
+        /// track just to finish it would be 13 s of separation budget spent on
+        /// audio the deck can play itself.
+        var stretchPostRollForRideRelease = true
+
         /// Loudness the finished file is normalized to before it is written, or
         /// nil to write it at its natural level.
         ///
@@ -139,12 +151,102 @@ enum OfflineTransitionRenderer {
         }
     }
 
+    // MARK: - The rendered mix
+
+    /// Where one deck's source track is at one instant of the rendered mix.
+    ///
+    /// The pair of lists a `Mix` carries is the only description of how render
+    /// time maps onto the two songs' own clocks: a beat-matched deck consumes
+    /// `rate` source seconds per rendered second, and a deck that is not
+    /// playing yet (or has stopped) consumes none. The live splice reads its
+    /// cue points off these, and reports playback position through them.
+    struct TimelinePoint: Sendable, Equatable {
+        /// Seconds from the start of the rendered mix.
+        var offset: TimeInterval
+        /// Position in that deck's source track at `offset`.
+        var source: TimeInterval
+    }
+
+    /// The finished mix, before normalization and before anything is written.
+    /// `render` turns one of these into a WAV; the live pre-render path plays
+    /// it straight out of memory.
+    struct Mix: Sendable {
+        var channels: [[Float]]
+        var sampleRate: Double
+        var duration: TimeInterval
+        /// Where in the mix the overlap starts / how long it lasts.
+        var overlapStart: TimeInterval
+        var overlapDuration: TimeInterval
+        var outgoing: [TimelinePoint]
+        var incoming: [TimelinePoint]
+        /// The ride the render actually applied, and where its release had got
+        /// to when the mix ended — non-zero whenever the post-roll was shorter
+        /// than the release, which is the normal case for a live segment.
+        var rideDB: Double
+        var rideDBAtEnd: Double
+        var rideReleaseSeconds: TimeInterval
+        var stemApplied: StemTechniqueLayer.Applied?
+        var stemFallbackReason: String?
+
+        /// Source position of one deck at `offset`, linearly interpolated
+        /// between breakpoints and clamped to the ends.
+        static func source(of timeline: [TimelinePoint], at offset: TimeInterval) -> TimeInterval {
+            guard let first = timeline.first, let last = timeline.last else { return 0 }
+            if offset <= first.offset { return first.source }
+            if offset >= last.offset { return last.source }
+            var low = 0, high = timeline.count - 1
+            while high - low > 1 {
+                let mid = (low + high) / 2
+                if timeline[mid].offset <= offset { low = mid } else { high = mid }
+            }
+            let a = timeline[low], b = timeline[high]
+            let span = b.offset - a.offset
+            guard span > 1e-12 else { return b.source }
+            return a.source + (b.source - a.source) * ((offset - a.offset) / span)
+        }
+    }
+
     // MARK: - Entry point
 
     static func render(_ planned: PlannedTransition,
                        outgoing outgoingURL: URL, incoming incomingURL: URL,
                        to outputURL: URL, options: Options = Options()) throws -> Result {
         let started = Date()
+        var mix = try renderMix(planned, outgoing: outgoingURL, incoming: incomingURL,
+                                options: options)
+
+        // --- Blind-test normalization, then the one and only file write.
+        let normalization = normalize(&mix.channels, options: options)
+        try write(mix.channels, to: outputURL, format: DeckChain.format,
+                  sampleRate: mix.sampleRate)
+
+        return Result(outputURL: outputURL, duration: mix.duration,
+                      overlapStart: mix.overlapStart, overlapDuration: mix.overlapDuration,
+                      renderSeconds: Date().timeIntervalSince(started),
+                      outgoingTrimDB: options.outgoingTrimDB,
+                      incomingTrimDB: options.incomingTrimDB,
+                      rideDB: mix.rideDB,
+                      rideReleaseSeconds: mix.rideReleaseSeconds,
+                      measuredLUFS: normalization.measuredLUFS,
+                      normalizationGainDB: normalization.gainDB,
+                      normalizationTargetLUFS: options.normalizeToLUFS,
+                      stemTechnique: mix.stemApplied?.technique.label,
+                      stemSeconds: mix.stemApplied?.seconds,
+                      stemSeparatedSeconds: mix.stemApplied?.separatedSeconds,
+                      stemIncomingSeparatedSeconds: mix.stemApplied?.incomingSeparatedSeconds,
+                      stemSeparatedSides: mix.stemApplied?.separatedSides ?? [],
+                      stemVocalEnergyRatio: mix.stemApplied?.vocalEnergyRatio,
+                      stemCacheHit: mix.stemApplied?.cacheHit ?? false,
+                      stemFallbackReason: mix.stemFallbackReason)
+    }
+
+    /// Render a transition into memory. This is the whole computation — the
+    /// deck graph, the stem layer, the automation, the settling and the ride —
+    /// with nothing done to the result: `render` normalizes and writes it, the
+    /// live pre-render path splices it into playback.
+    static func renderMix(_ planned: PlannedTransition,
+                          outgoing outgoingURL: URL, incoming incomingURL: URL,
+                          options: Options = Options()) throws -> Mix {
         let format = DeckChain.format
         let sampleRate = format.sampleRate
         let geometry = TransitionAutomation.Geometry(plan: planned.plan)
@@ -172,7 +274,7 @@ enum OfflineTransitionRenderer {
         var rideDB: Double = 0
         if case .gapless = planned.plan {} else { rideDB = options.rideDB }
         let rideRelease = TransitionAutomation.rideReleaseDuration(rideDB)
-        let postRoll = rideRelease > 0
+        let postRoll = (rideRelease > 0 && options.stretchPostRollForRideRelease)
             ? max(options.postRoll, rideRelease + 1)
             : options.postRoll
 
@@ -230,6 +332,30 @@ enum OfflineTransitionRenderer {
         var written: AVAudioFrameCount = 0
         var stemApplied: StemTechniqueLayer.Applied?
         var stemFallback: String?
+        var endRideDB: Double = 0
+
+        // Where the two source tracks are as the mix plays. A deck consumes
+        // `rate` source seconds per rendered second while it is playing and
+        // none at all before it starts or after it stops, so the map is built
+        // alongside the render rather than reconstructed from the plan.
+        var rendered: TimeInterval = 0
+        var outgoingSource: TimeInterval = 0
+        var incomingSource: TimeInterval = 0
+        var outgoingTimeline: [TimelinePoint] = []
+        var incomingTimeline: [TimelinePoint] = []
+        func mark() {
+            outgoingTimeline.append(TimelinePoint(offset: rendered, source: outgoingSource))
+            incomingTimeline.append(TimelinePoint(offset: rendered, source: incomingSource))
+        }
+        /// Advance the clocks by one pumped chunk, at the rates the decks ran
+        /// it at (0 = that deck was not playing).
+        func advance(_ frames: AVAudioFrameCount, outgoingRate: Double, incomingRate: Double) {
+            let seconds = Double(frames) / sampleRate
+            rendered += seconds
+            outgoingSource += seconds * outgoingRate
+            incomingSource += seconds * incomingRate
+            mark()
+        }
 
         if case .gapless = planned.plan {
             if planned.style.stemTechnique != nil {
@@ -241,12 +367,15 @@ enum OfflineTransitionRenderer {
             let tail = min(options.preRoll, outDuration)
             let outBuffer = try loadSegment(outgoingURL, from: outDuration - tail,
                                             seconds: tail, format: format)
+            outgoingSource = outDuration - tail
+            mark()
             from.schedule(outBuffer)
             from.setFader(1)
             from.player.play()
             let tailFrames = outBuffer.frameLength
             try pump(tailFrames)
             written += tailFrames
+            advance(tailFrames, outgoingRate: 1, incomingRate: 0)
             overlapStart = Double(tailFrames) / sampleRate
 
             from.player.stop()
@@ -257,6 +386,7 @@ enum OfflineTransitionRenderer {
             to.player.play()
             try pump(inBuffer.frameLength)
             written += inBuffer.frameLength
+            advance(inBuffer.frameLength, outgoingRate: 0, incomingRate: 1)
         } else {
             let outStart = max(0, (outPoint ?? 0) - options.preRoll)
             let preRoll = (outPoint ?? 0) - outStart
@@ -321,12 +451,16 @@ enum OfflineTransitionRenderer {
             }
 
             // --- Pre-roll: the outgoing track alone, chain transparent.
+            outgoingSource = outStart
+            incomingSource = inPoint
+            mark()
             from.schedule(outBuffer)
             from.setFader(1)
             from.player.play()
             let preRollFrames = AVAudioFrameCount((preRoll * sampleRate).rounded())
             try pump(preRollFrames)
             written += preRollFrames
+            advance(preRollFrames, outgoingRate: 1, incomingRate: 0)
             overlapStart = preRoll
 
             // --- Overlap: `beginOverlapLocked`'s priming, then the ramps.
@@ -360,6 +494,8 @@ enum OfflineTransitionRenderer {
                 if frame.echoThrown { echoThrown = true }
                 try pump(tickFrames)
                 written += tickFrames
+                advance(tickFrames, outgoingRate: Double(frame.outgoing.rate),
+                        incomingRate: Double(frame.incoming.rate))
                 elapsed += tickSeconds
             }
 
@@ -415,6 +551,8 @@ enum OfflineTransitionRenderer {
                     rideStep()
                     try pump(tickFrames)
                     written += tickFrames
+                    advance(tickFrames, outgoingRate: 0,
+                            incomingRate: Double(restoringRate ? s.incomingRate : 1))
                     settled += tickSeconds
                     sinceOverlap += tickSeconds
                 }
@@ -430,42 +568,36 @@ enum OfflineTransitionRenderer {
                 rideStep()
                 try pump(tickFrames)
                 written += tickFrames
+                advance(tickFrames, outgoingRate: 0, incomingRate: 1)
                 post += tickSeconds
                 sinceOverlap += tickSeconds
             }
+            // Whatever is left of the ride when the mix ends is handed back to
+            // the caller rather than snapped away: the live splice puts it on
+            // the incoming deck and lets the engine's own glide finish it. The
+            // write below is therefore only ever reached with the release
+            // already spent (`postFrames > 0` implies `post < postRoll`, which
+            // implies the loop stopped because `sinceOverlap >= rideRelease`).
+            let rideDBAtEnd = TransitionAutomation.rideDB(
+                rideDB, secondsAfterOverlap: sinceOverlap)
             if rideDB != 0 { to.setRide(db: 0) }
             let postFrames = AVAudioFrameCount(
                 (max(0, postRoll - post) * sampleRate).rounded())
             if postFrames > 0 {
                 try pump(postFrames)
                 written += postFrames
+                advance(postFrames, outgoingRate: 0, incomingRate: 1)
             }
+            endRideDB = rideDBAtEnd
         }
 
-        // --- Blind-test normalization, then the one and only file write.
-        let normalization = normalize(&mix, options: options)
-        try write(mix, to: outputURL, format: engine.manualRenderingFormat,
-                  sampleRate: sampleRate)
-
-        let duration = Double(written) / sampleRate
-        return Result(outputURL: outputURL, duration: duration,
-                      overlapStart: overlapStart, overlapDuration: overlap,
-                      renderSeconds: Date().timeIntervalSince(started),
-                      outgoingTrimDB: options.outgoingTrimDB,
-                      incomingTrimDB: options.incomingTrimDB,
-                      rideDB: rideDB,
-                      rideReleaseSeconds: rideRelease,
-                      measuredLUFS: normalization.measuredLUFS,
-                      normalizationGainDB: normalization.gainDB,
-                      normalizationTargetLUFS: options.normalizeToLUFS,
-                      stemTechnique: stemApplied?.technique.label,
-                      stemSeconds: stemApplied?.seconds,
-                      stemSeparatedSeconds: stemApplied?.separatedSeconds,
-                      stemIncomingSeparatedSeconds: stemApplied?.incomingSeparatedSeconds,
-                      stemSeparatedSides: stemApplied?.separatedSides ?? [],
-                      stemVocalEnergyRatio: stemApplied?.vocalEnergyRatio,
-                      stemCacheHit: stemApplied?.cacheHit ?? false,
-                      stemFallbackReason: stemFallback)
+        return Mix(channels: mix, sampleRate: sampleRate,
+                   duration: Double(written) / sampleRate,
+                   overlapStart: overlapStart, overlapDuration: overlap,
+                   outgoing: outgoingTimeline, incoming: incomingTimeline,
+                   rideDB: rideDB, rideDBAtEnd: endRideDB,
+                   rideReleaseSeconds: rideRelease,
+                   stemApplied: stemApplied, stemFallbackReason: stemFallback)
     }
 
     // MARK: - Output normalization and write-out

@@ -164,6 +164,18 @@ final class PlaybackEngine: @unchecked Sendable {
 
     private let deckStates: [Deck: DeckState]
 
+    /// The third player: a pre-rendered hand-over (`TransitionSegment`) plays
+    /// here while both decks are silent.
+    ///
+    /// It is a full `DeckChain` rather than a bare player wired to the mixer,
+    /// and that is the whole trick of the splice: an identical chain has
+    /// identical latency, so audio scheduled on the shared render clock to
+    /// start where a deck's audio stops actually *lands* there. Its knobs are
+    /// never automated — it plays what was rendered, at unity — and its source
+    /// is always `.none`, which keeps it out of every loop that walks
+    /// `deckStates` (the ride glide, the flush window, configuration changes).
+    private let segmentState = DeckState()
+
     private var isPaused = false
     private var sessionConfigured = false
 
@@ -200,6 +212,11 @@ final class PlaybackEngine: @unchecked Sendable {
     /// of a second before its out point is perfectly legitimate — the prefetch
     /// can land late. See `resolvePlanLocked`.
     private static let transitionArrivalGuard: TimeInterval = 0.05
+    /// How far ahead of the splice a pre-rendered segment is put on the render
+    /// clock. `play(at:)` needs a host time in the future, and the wait tick
+    /// runs at 50 Hz — a quarter second is an order of magnitude more slack
+    /// than either needs, and the segment simply idles until its moment.
+    private static let segmentArmLead: TimeInterval = 0.25
     /// Longest crossfade a degraded plan falls back to.
     private static let fallbackCrossfadeDuration: TimeInterval = 4
     /// Slack the fallback crossfade needs beyond its own length; below this
@@ -211,6 +228,11 @@ final class PlaybackEngine: @unchecked Sendable {
     private enum TransitionPhase {
         case waiting        // watching the from deck approach the out point
         case armed          // gapless: incoming play(at:) is scheduled
+        /// A pre-rendered segment is scheduled on the render clock; the
+        /// outgoing deck is still playing normally into the splice point.
+        case segmentArmed
+        /// The pre-rendered segment is what the listener hears.
+        case segmentPlaying
         case overlapping    // crossfade/beatMatched ramp in progress
         /// After the overlap: ramp a beat-matched rate back to 1.0 and/or let
         /// an `.echoOut` tail ring out before the decks go neutral.
@@ -230,6 +252,10 @@ final class PlaybackEngine: @unchecked Sendable {
         var elapsed: TimeInterval = 0
         var restoreElapsed: TimeInterval = 0
         var midpointSent = false
+        /// A pre-rendered stem hand-over for exactly this plan, if one was
+        /// finished in time. Nil is the ordinary case and means the live
+        /// two-deck overlap below runs, unchanged.
+        var segment: TransitionSegment?
         /// `.echoOut`: the delay has been thrown and the outgoing deck is
         /// being cut; set once, at `echoStopOffset`.
         var echoThrown = false
@@ -294,14 +320,23 @@ final class PlaybackEngine: @unchecked Sendable {
         }
         deckStates = states
 
+        DeckChain.configureBands(segmentState.eq)
+        DeckChain.configureDelay(segmentState.delay)
+        engine.attach(segmentState.player)
+        engine.attach(segmentState.timePitch)
+        engine.attach(segmentState.eq)
+        engine.attach(segmentState.delay)
+
         // Touch the mixer so it is wired to the output before first start.
         engine.mainMixerNode.outputVolume = 1
 
-        // Wire both chains once, before the engine ever starts — the graph
+        // Wire all three chains once, before the engine ever starts — the graph
         // is immutable from here on (see graphFormat).
         for state in deckStates.values {
             connectChainLocked(state, format: graphFormat)
         }
+        connectChainLocked(segmentState, format: graphFormat)
+        segmentState.player.volume = 0
 
         // Output device / route changes stop the engine and wipe every player
         // node's schedule — on macOS this fires when switching audio devices,
@@ -514,6 +549,13 @@ final class PlaybackEngine: @unchecked Sendable {
             // would blast in the moment playback resumes. Disarm; the wait
             // tick re-arms after resume.
             self.disarmGaplessLocked()
+            // A pre-rendered segment is armed on the same host clock, and the
+            // incoming deck's hand-back inside one is too. Both are undone
+            // here and re-armed by the tick after playback resumes; a segment
+            // that is already sounding needs nothing, because it freezes with
+            // the engine exactly like the decks do.
+            self.disarmSegmentLocked()
+            self.disarmSegmentTailLocked()
             // An echo tail cannot decay while the engine is stopped, and a
             // frozen wet delay would blare back on resume — end it now.
             if let tr = self.transition, tr.phase == .settling, tr.echoTailRinging {
@@ -574,7 +616,7 @@ final class PlaybackEngine: @unchecked Sendable {
     }
 
     func position(of deck: Deck) -> TimeInterval {
-        queue.sync { livePositionLocked(deckStates[deck]!) }
+        queue.sync { reportedPositionLocked(deck) }
     }
 
     func duration(of deck: Deck) -> TimeInterval? {
@@ -622,6 +664,31 @@ final class PlaybackEngine: @unchecked Sendable {
             self.startTransitionTimerLocked(interval: self.slowTickInterval)
         }
     }
+
+    /// Hand the engine a pre-rendered hand-over to play in place of the live
+    /// overlap of the transition it currently has waiting.
+    ///
+    /// Rejected — silently, leaving the live path armed — unless the segment
+    /// belongs to *this* plan and the outgoing deck has not yet reached the
+    /// splice point. Both are the same rule: a segment is audio cut for one
+    /// exact seam, so anything that has moved the seam (a seek that degraded
+    /// the plan, a late re-plan, a pre-render that finished too late) makes it
+    /// the wrong audio, and the live path is always still there.
+    func armTransitionSegment(_ segment: TransitionSegment) {
+        queue.async {
+            guard let tr = self.transition, tr.phase == .waiting, tr.segment == nil,
+                  let signature = TransitionSegment.Signature(plan: tr.plan),
+                  signature == segment.signature,
+                  case .file = self.deckStates[tr.to]!.source
+            else { return }
+            let position = self.livePositionLocked(self.deckStates[tr.from]!)
+            guard position < segment.spliceStart - Self.segmentArmLead else { return }
+            tr.segment = segment
+        }
+    }
+
+    /// Test hook: is a pre-rendered segment armed for the pending transition?
+    var hasArmedSegment: Bool { queue.sync { transition?.segment != nil } }
 
     /// Snapshot of one deck's fader + effect parameters. Test hook: the only
     /// way to assert that a transition left the reused deck neutral.
@@ -1067,6 +1134,34 @@ final class PlaybackEngine: @unchecked Sendable {
         return position
     }
 
+    /// The position to *report* for a deck, which is only ever different from
+    /// its own clock while a pre-rendered segment is playing.
+    ///
+    /// There, neither deck is sounding: the outgoing one has stopped and the
+    /// incoming one has not started, yet the hand-over takes ten to twenty
+    /// seconds and the progress bar has to keep moving through it. The segment
+    /// knows where it is on both songs' clocks, so each deck is reported at the
+    /// position the segment is playing of *its* track. Because `PlayerService`
+    /// swaps which deck it asks about at `transitionMidpoint`, what the user
+    /// sees is the outgoing track running out and then the incoming one
+    /// starting — the same story the live overlap tells.
+    private func reportedPositionLocked(_ deck: Deck) -> TimeInterval {
+        let state = deckStates[deck]!
+        guard let tr = transition, tr.phase == .segmentPlaying, let segment = tr.segment,
+              let elapsed = segmentElapsedLocked() else {
+            return livePositionLocked(state)
+        }
+        if deck == tr.from {
+            state.lastKnownPosition = segment.outgoingTime(at: elapsed)
+            return state.lastKnownPosition
+        }
+        if deck == tr.to, !state.isPlaying {
+            state.lastKnownPosition = segment.incomingTime(at: elapsed)
+            return state.lastKnownPosition
+        }
+        return livePositionLocked(state)
+    }
+
     private func durationLocked(_ state: DeckState) -> TimeInterval? {
         switch state.source {
         case .file(let file):
@@ -1284,12 +1379,27 @@ final class PlaybackEngine: @unchecked Sendable {
             // pre-seek position; undo it and let the wait tick re-arm.
             disarmGaplessLocked()
         }
+        if tr.phase == .segmentArmed {
+            // Same story: the segment is pinned to a render time derived from
+            // where the playhead was. Re-armed by the wait tick if the plan
+            // survives the seek below.
+            disarmSegmentLocked()
+        }
         guard tr.phase == .waiting else { return }
         let resolved = resolvePlanLocked(
             PlannedTransition(plan: tr.plan, style: tr.style, rideDB: tr.rideDB),
             from: deckStates[deck]!)
-        transition = TransitionState(plan: resolved.plan, style: resolved.style,
-                                     rideDB: resolved.rideDB, from: tr.from, to: tr.to)
+        let state = TransitionState(plan: resolved.plan, style: resolved.style,
+                                    rideDB: resolved.rideDB, from: tr.from, to: tr.to)
+        // A segment is audio cut for one seam: it survives the seek only if the
+        // seam did, and only if the playhead is still short of the splice.
+        if let segment = tr.segment,
+           let signature = TransitionSegment.Signature(plan: resolved.plan),
+           signature == segment.signature,
+           livePositionLocked(deckStates[deck]!) < segment.spliceStart - Self.segmentArmLead {
+            state.segment = segment
+        }
+        transition = state
         startTransitionTimerLocked(interval: slowTickInterval)
     }
 
@@ -1322,6 +1432,10 @@ final class PlaybackEngine: @unchecked Sendable {
             transitionWaitTickLocked(tr)
         case .armed:
             break // gapless: waiting for the outgoing deck's completion
+        case .segmentArmed:
+            segmentArmedTickLocked(tr)
+        case .segmentPlaying:
+            updateSegmentLocked(tr)
         case .overlapping:
             tr.elapsed += transitionTimerInterval
             updateOverlapLocked(tr)
@@ -1354,6 +1468,19 @@ final class PlaybackEngine: @unchecked Sendable {
             guard let outPoint = tr.plan.outPoint else { return }
             let position = livePositionLocked(from)
             let rate = Double(max(from.timePitch.rate, 0.01))
+            if let segment = tr.segment {
+                // A pre-rendered hand-over starts one head window early, and on
+                // the render clock rather than on this tick.
+                if position < segment.spliceStart - Self.segmentArmLead {
+                    adjustWaitTimerLocked(
+                        remaining: (segment.spliceStart - position) / rate)
+                    return
+                }
+                if armSegmentLocked(tr, segment: segment) { return }
+                // The clock was unavailable: drop the segment and let the live
+                // overlap below carry this hand-over.
+                tr.segment = nil
+            }
             adjustWaitTimerLocked(remaining: (outPoint - position) / rate)
             if position + transitionTimerInterval / 2 >= outPoint {
                 beginOverlapLocked(tr)
@@ -1454,6 +1581,274 @@ final class PlaybackEngine: @unchecked Sendable {
         tr.phase = .overlapping
         tr.elapsed = 0
         startTransitionTimerLocked(interval: tickInterval)
+    }
+
+    // MARK: - Pre-rendered segment splice (locked)
+
+    /// Seconds the segment player has emitted, or nil before its scheduled
+    /// start time arrives (`play(at:)` reports a negative sample time until
+    /// then) or while the engine cannot say.
+    ///
+    /// This is the splice's only clock. Everything the tick does — the two
+    /// crossfades, the midpoint, the hand-back — is a function of it, so the
+    /// 50 Hz tick only decides *when* a parameter is written, never *what* it
+    /// is: a late tick lands the same value it would have landed on time.
+    private func segmentElapsedLocked() -> TimeInterval? {
+        guard let nodeTime = segmentState.player.lastRenderTime,
+              let playerTime = segmentState.player.playerTime(forNodeTime: nodeTime),
+              playerTime.sampleRate > 0, playerTime.sampleTime >= 0 else { return nil }
+        return Double(playerTime.sampleTime) / playerTime.sampleRate
+    }
+
+    /// Put the segment on the render clock so its first sample lands exactly
+    /// where the outgoing deck's `spliceStart` frame does. Returns false when
+    /// the clock cannot be read or the moment has already passed, which is the
+    /// caller's cue to fall back to the live overlap.
+    private func armSegmentLocked(_ tr: TransitionState,
+                                  segment: TransitionSegment) -> Bool {
+        let from = deckStates[tr.from]!
+        let sampleRate = graphFormat.sampleRate
+        let frame = AVAudioFramePosition(
+            ((segment.spliceStart - from.startOffset) * sampleRate).rounded())
+        guard frame >= 0, from.player.isPlaying,
+              let start = from.player.nodeTime(
+                forPlayerTime: AVAudioTime(sampleTime: frame, atRate: sampleRate)),
+              start.isHostTimeValid,
+              start.hostTime > mach_absolute_time()
+        else { return false }
+
+        ensureEngineRunningLocked()
+        segmentState.generation += 1
+        segmentState.player.stop()
+        segmentState.player.scheduleBuffer(segment.buffer, at: nil, options: [],
+                                           completionHandler: nil)
+        // Silent until the head crossfade opens it: the segment's first half
+        // second duplicates what the outgoing deck is already playing.
+        segmentState.player.volume = 0
+        segmentState.faderRequest = 0
+        segmentState.player.play(at: start)
+        tr.phase = .segmentArmed
+        startTransitionTimerLocked(interval: tickInterval)
+        return true
+    }
+
+    /// Waiting for the scheduled start. If it never comes (a configuration
+    /// change dropped the schedule, the render clock stalled), the splice point
+    /// simply passes and the hand-over falls back to the live overlap.
+    private func segmentArmedTickLocked(_ tr: TransitionState) {
+        guard let segment = tr.segment else {
+            disarmSegmentLocked()
+            return
+        }
+        if segmentElapsedLocked() != nil {
+            tr.phase = .segmentPlaying
+            updateSegmentLocked(tr)
+            return
+        }
+        let position = livePositionLocked(deckStates[tr.from]!)
+        if position > segment.spliceStart + segment.handoffIn + 0.5 {
+            disarmSegmentLocked()
+            tr.segment = nil
+        }
+    }
+
+    /// Take the segment back off the render clock, leaving the outgoing deck
+    /// exactly as it was found. Only valid while nothing has been handed over
+    /// yet (`.segmentArmed`).
+    private func disarmSegmentLocked() {
+        guard let tr = transition, tr.phase == .segmentArmed else { return }
+        parkSegmentLocked()
+        tr.phase = .waiting
+    }
+
+    /// Undo an incoming deck that has been scheduled for the segment's tail but
+    /// has not started sounding yet — its `play(at:)` is on the host clock,
+    /// which keeps running while the engine is paused.
+    private func disarmSegmentTailLocked() {
+        guard let tr = transition, tr.phase == .segmentPlaying,
+              let segment = tr.segment,
+              let elapsed = segmentElapsedLocked(), elapsed < segment.handoffOutStart
+        else { return }
+        let to = deckStates[tr.to]!
+        guard to.isPlaying else { return }
+        to.generation += 1
+        hardSilenceFaderLocked(to)
+        to.player.stop()
+        to.isPlaying = false
+    }
+
+    private func parkSegmentLocked() {
+        segmentState.generation += 1
+        segmentState.player.volume = 0
+        segmentState.faderRequest = 0
+        segmentState.player.stop()
+    }
+
+    /// One tick of a playing segment: the head crossfade off the outgoing
+    /// deck, the midpoint latch, the tail crossfade back onto the incoming one.
+    private func updateSegmentLocked(_ tr: TransitionState) {
+        guard let segment = tr.segment, let elapsed = segmentElapsedLocked() else { return }
+        let from = deckStates[tr.from]!
+        let to = deckStates[tr.to]!
+
+        // --- Head. The segment opens with the same audio the outgoing deck is
+        // playing, at the same trim, so the two are crossfaded *linearly*: for
+        // identical material `(1-u)·x + u·x` is `x`, and the swap is silent.
+        if from.isPlaying {
+            if elapsed < segment.handoffIn {
+                let u = Float(max(0, elapsed / segment.handoffIn))
+                setFaderLocked(from, 1 - u)
+                setSegmentFaderLocked(u)
+            } else {
+                setSegmentFaderLocked(1)
+                retireOutgoingForSegmentLocked(from)
+            }
+        }
+
+        if !tr.midpointSent, elapsed >= segment.midpointOffset {
+            tr.midpointSent = true
+            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+        }
+
+        // --- Tail, the head's mirror image: the incoming deck is started on
+        // the segment's own clock, playing the same audio the segment's last
+        // half second carries, and the two are crossfaded the same way.
+        let tailStart = segment.handoffOutStart
+        if !to.isPlaying, elapsed >= tailStart - Self.segmentArmLead {
+            startIncomingFromSegmentLocked(tr, segment: segment)
+        }
+        if to.isPlaying, elapsed >= tailStart {
+            let u = Float(min(1, max(0, (elapsed - tailStart) / max(segment.handoffOut, 1e-3))))
+            setFaderLocked(to, u)
+            setSegmentFaderLocked(1 - u)
+        }
+        if elapsed >= segment.duration - tickInterval {
+            finishSegmentLocked(tr)
+        }
+    }
+
+    /// The segment's fader. Deliberately not `setFaderLocked`: the segment
+    /// deck has no trim and no ride (both are already baked into the rendered
+    /// audio), and it must never be caught by a deck's flush window.
+    private func setSegmentFaderLocked(_ value: Float) {
+        segmentState.faderRequest = value
+        segmentState.player.volume = value
+    }
+
+    /// The outgoing deck has been crossfaded away. Stopped and silenced, but
+    /// deliberately **not** `resetDeckLocked`: its file stays loaded so an
+    /// aborted splice can resume normal playback from the mapped position.
+    private func retireOutgoingForSegmentLocked(_ state: DeckState) {
+        state.generation += 1   // orphan the completion the stop fires
+        hardSilenceFaderLocked(state)
+        state.player.stop()
+        neutralizeEffectsLocked(state)
+        state.isPlaying = false
+    }
+
+    /// Cue the incoming deck to where the segment's tail is and start it on the
+    /// render clock, so the deck and the segment are playing the same samples
+    /// at the same time.
+    private func startIncomingFromSegmentLocked(_ tr: TransitionState,
+                                                segment: TransitionSegment) {
+        let to = deckStates[tr.to]!
+        guard case .file(let file) = to.source else { return }
+        let sampleRate = graphFormat.sampleRate
+        let frame = AVAudioFramePosition((segment.handoffOutStart * sampleRate).rounded())
+        guard let start = segmentState.player.nodeTime(
+                forPlayerTime: AVAudioTime(sampleTime: frame, atRate: sampleRate)),
+              start.isHostTimeValid, start.hostTime > mach_absolute_time()
+        else { return }
+        scheduleSegmentLocked(to, file: file, from: segment.incomingResume, deck: tr.to)
+        // The ride is still unwinding where the segment ends; the deck picks it
+        // up at that value and finishes the release on its own glide timer.
+        setRideLocked(to, db: segment.incomingRideDB)
+        setFaderLocked(to, 0)
+        to.isPlaying = true
+        to.player.play(at: start)
+    }
+
+    private func finishSegmentLocked(_ tr: TransitionState) {
+        let from = deckStates[tr.from]!
+        let to = deckStates[tr.to]!
+        if !tr.midpointSent {
+            tr.midpointSent = true
+            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+        }
+        if !to.isPlaying, let segment = tr.segment {
+            // The tail never started (the clock was unavailable at the arm
+            // point). Start the incoming deck now: a few milliseconds of seam
+            // is worth more than a silent deck.
+            if case .file(let file) = to.source {
+                scheduleSegmentLocked(to, file: file, from: segment.incomingResume, deck: tr.to)
+                setRideLocked(to, db: segment.incomingRideDB)
+                to.isPlaying = true
+                startNodeIfNeededLocked(to)
+            }
+        }
+        setFaderLocked(to, 1)
+        releaseRideLocked(to)
+        parkSegmentLocked()
+        if from.isPlaying { retireOutgoingForSegmentLocked(from) }
+        resetDeckLocked(from)
+        eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
+        transition = nil
+        stopTransitionTimerLocked()
+    }
+
+    /// Abort a playing segment and put the decks back in charge, at whatever
+    /// position the segment had reached on their own timelines.
+    ///
+    /// Before the midpoint the outgoing track is still "the song", so it comes
+    /// back; after it, the incoming one is, so it takes over — the same rule
+    /// `cancelTransitionLocked` applies to a live overlap.
+    private func abortSegmentLocked(_ tr: TransitionState) {
+        guard let segment = tr.segment else { return }
+        let from = deckStates[tr.from]!
+        let to = deckStates[tr.to]!
+        let elapsed = segmentElapsedLocked() ?? 0
+        parkSegmentLocked()
+
+        if tr.midpointSent {
+            if !to.isPlaying, case .file(let file) = to.source {
+                scheduleSegmentLocked(to, file: file,
+                                      from: segment.incomingTime(at: elapsed), deck: tr.to)
+                setRideLocked(to, db: segment.incomingRideDB)
+                to.isPlaying = true
+                startNodeIfNeededLocked(to)
+            }
+            setFaderLocked(to, 1)
+            releaseRideLocked(to)
+            neutralizeEffectsLocked(to)
+            resetDeckLocked(from)
+            eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
+            return
+        }
+
+        // The hand-over never became audible: the incoming deck goes back to
+        // parked-and-loaded, and the outgoing one resumes where the segment
+        // had got to in its own track.
+        if to.isPlaying {
+            to.generation += 1
+            hardSilenceFaderLocked(to)
+            to.player.stop()
+            to.isPlaying = false
+        }
+        neutralizeEffectsLocked(to)
+        setRideLocked(to, db: 0)
+        neutralizeEffectsLocked(from)
+        let resumeAt = segment.outgoingTime(at: elapsed)
+        switch from.source {
+        case .file(let file):
+            scheduleSegmentLocked(from, file: file, from: resumeAt, deck: tr.from)
+        case .convertedFile(let feeder):
+            seekFeederLocked(from, feeder: feeder, to: resumeAt)
+        case .stream, .none:
+            return
+        }
+        setFaderLocked(from, 1)
+        from.isPlaying = true
+        startNodeIfNeededLocked(from)
     }
 
     /// Void a pending/running transition that depends on `deck`, leaving both
@@ -1651,6 +2046,12 @@ final class PlaybackEngine: @unchecked Sendable {
         switch tr.phase {
         case .waiting:
             break
+        case .segmentArmed:
+            // Nothing has been handed over yet; take the segment back off the
+            // clock and leave the outgoing deck exactly as it is.
+            parkSegmentLocked()
+        case .segmentPlaying:
+            abortSegmentLocked(tr)
         case .armed, .overlapping:
             if tr.midpointSent {
                 // Past the audible midpoint the incoming deck IS the current
@@ -1702,6 +2103,13 @@ final class PlaybackEngine: @unchecked Sendable {
         // An armed gapless hand-over died with the graph; disarm it so the
         // restart below doesn't blast the incoming deck from position zero.
         disarmGaplessLocked()
+        // A pre-rendered segment died with it too, and unlike a deck it cannot
+        // be resumed from a position: cancel the hand-over, which puts whichever
+        // track is current back on its own deck at the mapped position for the
+        // rescheduling loop below to pick up.
+        if let tr = transition, tr.phase == .segmentArmed || tr.phase == .segmentPlaying {
+            cancelTransitionLocked()
+        }
         for state in deckStates.values {
             state.generation += 1 // orphan any in-flight completions
         }
