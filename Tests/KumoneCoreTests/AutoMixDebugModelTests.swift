@@ -156,6 +156,130 @@ import Foundation
         #expect(AutoMixDebugFormat.clock(nil) == "—")
     }
 
+    // MARK: - Force-beat-switch override
+
+    @Test func overrideOffIsExactlyTheConfigItWasGiven() {
+        // The whole safety claim of the override in one assertion: off, the
+        // planner is handed the identical value, so planning is byte-identical
+        // for everyone who never opens the panel.
+        var base = TransitionPlanner.Config.standard
+        base.loudnessCompensation = false
+        #expect(AutoMixDebugOverrides.plannerConfig(base, forceBeatMatch: false) == base)
+        #expect(AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: false)
+                == TransitionPlanner.Config.standard)
+    }
+
+    @Test func overrideMakesEveryAdmissionGateAbstain() {
+        let forced = AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: true)
+
+        // A cosine distance cannot exceed 2, a folded tempo ratio cannot exceed
+        // 0.5, and a confidence cannot exceed 1 — so each of these gates is
+        // unreachable by construction, not merely unlikely.
+        #expect(forced.neutralTimbreDistance >= 2)
+        #expect(forced.clashTimbreDistance >= 2)
+        #expect(forced.clashTempoRatio >= 1)
+        #expect(forced.keyConfidenceThreshold > 1)
+        #expect(forced.neutralLoudnessDB >= 240)
+        #expect(forced.clashLoudnessDB >= 240)
+        #expect(forced.vocalClashRatio >= 1000)
+
+        // A pair that clashes on every signal now reads compatible.
+        let clashing = TransitionPlanner.Signals(
+            loudnessGapDB: 18, trimmedLoudnessGapDB: 18, rawLoudnessGapDB: 18,
+            outgoingTrimDB: 0, incomingTrimDB: 0, rideDB: 0,
+            timbreDistance: 0.9, tempoRatio: 0.45)
+        #expect(TransitionPlanner.tier(of: clashing, config: .standard) == .clash)
+        #expect(TransitionPlanner.tier(of: clashing, config: forced) == .compatible)
+    }
+
+    @Test func overrideWidensTheWindowInBothTempoRegimes() {
+        let forced = AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: true)
+        #expect(forced.beatMatchBPMDeltaCap == AutoMixDebugOverrides.forcedBPMDeltaCap)
+        #expect(forced.beatMatchRateCap == AutoMixDebugOverrides.forcedRateCap)
+
+        // Which regime is in force must not change the answer.
+        var stepped = forced
+        stepped.tempoRampEnabled = false
+        #expect(stepped.beatMatchBPMDeltaCap == AutoMixDebugOverrides.forcedBPMDeltaCap)
+        #expect(stepped.beatMatchRateCap == AutoMixDebugOverrides.forcedRateCap)
+
+        // Wider than shipped, but the bend stays somewhere a time-pitch unit
+        // can go without announcing itself.
+        #expect(forced.beatMatchBPMDeltaCap > TransitionPlanner.Config.standard
+                    .beatMatchBPMDeltaCap)
+        #expect(forced.beatMatchRateCap <= 0.08)
+    }
+
+    @Test func overrideLeavesThePhysicalRequirementsAlone() {
+        let standard = TransitionPlanner.Config.standard
+        let forced = AutoMixDebugOverrides.plannerConfig(standard, forceBeatMatch: true)
+        // Without a confident tempo there is no grid to align, without room
+        // there is no overlap, and without the track being long enough there is
+        // nothing to transition out of. The panel does not get to pretend.
+        #expect(forced.bpmConfidenceThreshold == standard.bpmConfidenceThreshold)
+        #expect(forced.minTrackDuration == standard.minTrackDuration)
+        #expect(forced.maxOverlap == standard.maxOverlap)
+        #expect(forced.minOverlap == standard.minOverlap)
+        #expect(forced.maxOverlapShare == standard.maxOverlapShare)
+        #expect(forced.tailWindowSeconds == standard.tailWindowSeconds)
+        #expect(forced.tailWindowShare == standard.tailWindowShare)
+        #expect(forced.stableCV == standard.stableCV)
+        #expect(forced.useStructureOutPoints == standard.useStructureOutPoints)
+        #expect(forced.tempoRampEnabled == standard.tempoRampEnabled)
+    }
+
+    @Test func overrideCarriesTheCallersLoudnessCompensation() {
+        // The override must not quietly re-enable a setting the user turned off:
+        // the gate has to keep measuring what the decks will actually play.
+        var base = TransitionPlanner.Config.standard
+        base.loudnessCompensation = false
+        #expect(!AutoMixDebugOverrides.plannerConfig(base, forceBeatMatch: true)
+            .loudnessCompensation)
+    }
+
+    @Test func forcedPlanBeatMatchesAPairTheGatesWouldHaveRefused() {
+        // 100 vs 112 BPM: 12 % apart, past the shipped 11.5 % window, and the
+        // two tracks are given clashing timbre so the tier would refuse anyway.
+        // The candidates have to sit in the tail window the out-point search
+        // restricts itself to (`max(duration/2, outLimit − 60 s)` = 180 s here),
+        // or the pair fails on a physical requirement the override cannot lift
+        // and the test would be measuring the wrong refusal.
+        var outgoing = analysis(duration: 240, phraseBoundaries: [200, 190, 182])
+        var incoming = analysis(duration: 240, phraseBoundaries: [200, 190, 182])
+        outgoing = withBPM(outgoing, 100, melProfile: [1, 0, 0, 0])
+        incoming = withBPM(incoming, 112, melProfile: [0, 0, 0, 1])
+
+        let organic = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming)
+        if case .beatMatched = organic.plan {
+            Issue.record("fixture is supposed to be refused by the shipped gates")
+        }
+        let forced = TransitionPlanner.plan(
+            outgoing: outgoing, incoming: incoming,
+            config: AutoMixDebugOverrides.plannerConfig(.standard, forceBeatMatch: true))
+        guard case .beatMatched = forced.plan else {
+            Issue.record("the override should have produced a beat-matched plan")
+            return
+        }
+    }
+
+    /// Rebuild an analysis at a given tempo, with a beat/downbeat grid that
+    /// actually matches it — the beat-match rule reads both.
+    private func withBPM(_ a: TrackAnalysis, _ bpm: Double,
+                         melProfile: [Float]) -> TrackAnalysis {
+        let beat = 60 / bpm
+        return TrackAnalysis(
+            version: a.version, bpm: bpm, bpmConfidence: 0.9,
+            beats: stride(from: 0.0, to: a.duration, by: beat).map { $0 },
+            downbeats: stride(from: 0.0, to: a.duration, by: beat * 4).map { $0 },
+            phraseBoundaries: a.phraseBoundaries,
+            rmsEnvelope: a.rmsEnvelope, outroFadeStart: nil,
+            introEnd: a.introEnd, duration: a.duration,
+            melProfile: melProfile,
+            keyPitchClass: nil, keyIsMinor: false, keyConfidence: 0,
+            vocalActivity: [], referenceLoudness: a.referenceLoudness,
+            peakDBFS: a.peakDBFS)
+    }
+
     // MARK: - Model bookkeeping
 
     @Test @MainActor func seamHistoryKeepsTheLastThreeNewestFirst() {

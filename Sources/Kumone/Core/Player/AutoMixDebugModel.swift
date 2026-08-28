@@ -156,6 +156,10 @@ struct AutoMixDebugSnapshot: Equatable {
     var prerender = AutoMixPrerenderState.idle
     /// Newest first; the last three seams.
     var seams: [AutoMixDebugSeam] = []
+    /// Why the force override did not get a beat-matched plan out of this pair,
+    /// when it was asked to. Nil while the override is off, and nil when it
+    /// worked — the badge says the rest.
+    var forceNote: String?
 }
 
 @MainActor
@@ -186,6 +190,34 @@ final class AutoMixDebugModel: ObservableObject {
 
     /// Test hook: the history as recorded, without opening a window to publish it.
     var currentSeamsForTesting: [AutoMixDebugSeam] { live.seams }
+
+    // MARK: - Debug overrides
+
+    /// **Force beat switch**: plan every following seam as if the pair had
+    /// cleared the admission gates, so a listening test can hear a beat match
+    /// on demand instead of hunting the library for a pair that passes.
+    ///
+    /// Published because it is a control, not a mirror — flipping it must move
+    /// the checkbox and the badge. Deliberately **not** persisted: a forced
+    /// plan is not a plan the shipped player would have made, and an override
+    /// that survived a relaunch would eventually be mistaken for one.
+    @Published private(set) var forceBeatMatch = false
+
+    /// Go through `PlayerService.setForceBeatMatch` instead of calling this:
+    /// the flag alone leaves the seam that is *already* armed on its old plan,
+    /// and the whole point of the override is to hear the next one.
+    func writeForceBeatMatch(_ on: Bool) {
+        guard forceBeatMatch != on else { return }
+        forceBeatMatch = on
+        if !on { setForceNote(nil) }
+    }
+
+    /// Set by the planner path when the override was on. See `snapshot.forceNote`.
+    func setForceNote(_ note: String?) {
+        guard live.forceNote != note else { return }
+        live.forceNote = note
+        publish()
+    }
 
     private init() {}
 
@@ -261,6 +293,80 @@ final class AutoMixDebugModel: ObservableObject {
             live.seams.removeLast(live.seams.count - Self.seamHistoryLimit)
         }
         publish()
+    }
+}
+
+/// The planner configuration the debug overrides derive.
+///
+/// It lives here, next to the panel that switches it on, rather than as an
+/// extension on `TransitionPlanner.Config` — the audition console and the
+/// offline renderer build their own configs and must never reach a forcing one
+/// by accident. `PlayerService.plannerConfig` is the single caller.
+enum AutoMixDebugOverrides {
+
+    // Non-binding sentinels, chosen so each is provably past the top of its
+    // own signal's range rather than merely large: a reader can check that the
+    // gate cannot fire without knowing the corpus.
+
+    /// A dB gap wider than any two masters can differ by.
+    static let unreachableLoudnessDB: Double = 240
+    /// Cosine distance is bounded by 2 for any pair of vectors.
+    static let unreachableTimbreDistance: Double = 2
+    /// A folded tempo ratio is at most 0.5 by construction (past that the fold
+    /// picks the other octave), so 1 can never be exceeded.
+    static let unreachableTempoRatio: Double = 1
+    /// Confidences are 0–1, so a 2.0 gate makes `keyDistance` always abstain
+    /// and harmony can never demote the tier.
+    static let unreachableKeyConfidence: Double = 2
+    /// Vocal scores are a window's density over the track's own mean; 1000
+    /// is far past anything a real contour produces, so the clash never fires.
+    static let unreachableVocalRatio: Double = 1000
+
+    /// **How far the beat-match window opens under the override.** A quarter
+    /// of the outgoing tempo, after double/half-time folding — wide enough
+    /// that essentially any pair in the library is offered a match.
+    static let forcedBPMDeltaCap: Double = 0.25
+    /// **And how far it does not.** The decks still meet in the middle, and a
+    /// time-pitch unit bending more than ±8 % stops sounding like a tempo and
+    /// starts sounding like a fault, which would make the listening note about
+    /// the artifact instead of about the transition. So the bend stays capped,
+    /// and a pair further apart than roughly 13.8 % is honestly refused at the
+    /// `rateDeviation` gate rather than mangled.
+    static let forcedRateCap: Double = 0.08
+
+    /// `base`, unchanged, unless the force override is on.
+    ///
+    /// With it on, every *admission* gate is made non-binding and the
+    /// beat-match window is widened. The **physical** requirements are left
+    /// exactly as they are: both sides analyzed, tempo confident enough to be
+    /// worth aligning to, a downbeat to come in on, and an out point with room
+    /// for the overlap. Those are not opinions the panel may overrule — without
+    /// them there is no grid to match, and a "forced" plan would be a lie.
+    static func plannerConfig(_ base: TransitionPlanner.Config,
+                              forceBeatMatch: Bool) -> TransitionPlanner.Config {
+        guard forceBeatMatch else { return base }
+        var config = base
+
+        // Tier: loudness, timbre, tempo clash. All three now abstain, so the
+        // pair reaches the beat-match rule as `.compatible`.
+        config.neutralLoudnessDB = unreachableLoudnessDB
+        config.clashLoudnessDB = unreachableLoudnessDB
+        config.neutralTimbreDistance = unreachableTimbreDistance
+        config.clashTimbreDistance = unreachableTimbreDistance
+        config.clashTempoRatio = unreachableTempoRatio
+        // Harmony can only demote, and now never gets a key to demote on.
+        config.keyConfidenceThreshold = unreachableKeyConfidence
+        // Two vocals at once is the one thing a DJ never allows — which is
+        // exactly why someone testing wants to hear it happen on purpose.
+        config.vocalClashRatio = unreachableVocalRatio
+
+        // Both regimes' caps, so the result does not depend on whether the
+        // tempo ramp happens to be on.
+        config.maxBPMDeltaRatio = forcedBPMDeltaCap
+        config.rampMaxBPMDeltaRatio = forcedBPMDeltaCap
+        config.maxRateDeviation = forcedRateCap
+        config.rampMaxRateDeviation = forcedRateCap
+        return config
     }
 }
 

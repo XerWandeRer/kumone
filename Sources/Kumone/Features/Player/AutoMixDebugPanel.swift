@@ -108,6 +108,8 @@ struct AutoMixDebugPanel: View {
     @ViewBuilder
     private var planGroup: some View {
         DebugGroup("Plan (armed)") {
+            forceBeatMatchControl
+            Divider().padding(.vertical, 2)
             if let plan = model.snapshot.plan {
                 DebugRow("kind", plan.kind)
                 DebugRow("out point", AutoMixDebugFormat.clock(plan.outPoint)
@@ -127,6 +129,43 @@ struct AutoMixDebugPanel: View {
                 DebugRow("countdown", countdown(to: plan.outPoint))
             } else {
                 DebugRow("state", "nothing armed")
+            }
+        }
+    }
+
+    /// The one control on this panel that *changes* what the player does, so it
+    /// is labelled as an override and badged while it is on — a listening note
+    /// must never record a forced beat match as an organic one.
+    @ViewBuilder
+    private var forceBeatMatchControl: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Toggle(isOn: Binding(get: { model.forceBeatMatch },
+                                     set: { PlayerService.shared.setForceBeatMatch($0) })) {
+                    Text(verbatim: "Force beat switch (debug override)")
+                }
+                .toggleStyle(.checkbox)
+                Spacer(minLength: 0)
+                if model.forceBeatMatch {
+                    Text(verbatim: "OVERRIDE ACTIVE")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.25),
+                                    in: RoundedRectangle(cornerRadius: 3))
+                }
+            }
+            if model.forceBeatMatch {
+                DebugRow("gates", "loudness / timbre / tempo-clash / key / vocal-clash: off")
+                DebugRow("window", String(
+                    format: "bpm Δ ≤ %.0f %% · rate ≤ ±%.0f %%",
+                    AutoMixDebugOverrides.forcedBPMDeltaCap * 100,
+                    AutoMixDebugOverrides.forcedRateCap * 100))
+                if let note = model.snapshot.forceNote {
+                    Text(verbatim: note)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }

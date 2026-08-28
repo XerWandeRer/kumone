@@ -967,6 +967,18 @@ final class PlayerService: ObservableObject {
         if currentAnalysis == nil || next.analysis == nil {
             // Analyses not ready (first listen, current track still
             // streaming): a plain crossfade still beats a hard cut.
+            //
+            // No analysis means no beat grid, so this is the one refusal the
+            // force override cannot argue with — and the one a listener is most
+            // likely to hit, by flipping the toggle on a track heard for the
+            // first time. Say so rather than leaving the badge on next to a
+            // crossfade.
+            if AutoMixDebugModel.shared.forceBeatMatch {
+                AutoMixDebugModel.shared.setForceNote(
+                    "force requested but impossible: "
+                        + (currentAnalysis == nil ? "the playing track" : "the next track")
+                        + " has no analysis yet")
+            }
             guard duration > 45 else { return .plain(.gapless) }
             let fade: TimeInterval = 6
             return .plain(.crossfade(duration: fade,
@@ -990,8 +1002,30 @@ final class PlayerService: ObservableObject {
         let context = TransitionPlanner.PlanContext(
             outgoingLyricLineEnds: currentLocalURL
                 .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
-        return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
-                                      stems: stems, config: plannerConfig, context: context)
+        let config = plannerConfig
+        guard AutoMixDebugModel.shared.forceBeatMatch else {
+            AutoMixDebugModel.shared.setForceNote(nil)
+            return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
+                                          stems: stems, config: config, context: context)
+        }
+        // Forced: take the ledger too. Under the override every admission gate
+        // abstains, so whatever `blocker` names is one of the physical
+        // requirements the panel refuses to fake — which is exactly the sentence
+        // the listener needs when the seam comes out as a crossfade anyway.
+        // The traced overload decides identically; it only costs the ledger,
+        // and only on a seam somebody asked to force.
+        var trace: PlanTrace? = PlanTrace()
+        let planned = TransitionPlanner.plan(
+            outgoing: currentAnalysis, incoming: next.analysis, stems: stems,
+            config: config, context: context, trace: &trace)
+        if case .beatMatched = planned.plan {
+            AutoMixDebugModel.shared.setForceNote(nil)
+        } else {
+            AutoMixDebugModel.shared.setForceNote(
+                trace?.blocker.map { "force requested but impossible: \($0.label) — \($0.detail)" }
+                    ?? "force requested but impossible: no beat-matched plan and no blocking gate")
+        }
+        return planned
         #endif
     }
 
@@ -1138,10 +1172,25 @@ final class PlayerService: ObservableObject {
     /// `Config.standard` with the one knob the user can see: the planner's
     /// loudness gate must measure the same thing the decks will play, so the
     /// compensation setting has to reach it.
+    ///
+    /// The debug panel's force override is applied here rather than at the one
+    /// planning call, so the stem pre-render is built against the very config
+    /// the plan was made under. Off — always, on iOS and for anyone who has not
+    /// opened the panel — `plannerConfig` returns exactly what it always did.
     private var plannerConfig: TransitionPlanner.Config {
         var config = TransitionPlanner.Config.standard
         config.loudnessCompensation = loudnessCompensationEnabled
-        return config
+        return AutoMixDebugOverrides.plannerConfig(
+            config, forceBeatMatch: AutoMixDebugModel.shared.forceBeatMatch)
+    }
+
+    /// Flip the debug panel's force-beat-switch override and re-derive the
+    /// hand-over that is already armed, so the toggle is heard at the *next*
+    /// seam rather than the one after it. The engine only swaps a plan that has
+    /// not started (`replaceTransitionPlan`), so this can never cut audio.
+    func setForceBeatMatch(_ on: Bool) {
+        AutoMixDebugModel.shared.writeForceBeatMatch(on)
+        replanArmedTransition()
     }
 
     /// Whether cross-track gain compensation is active right now. AutoMix off
