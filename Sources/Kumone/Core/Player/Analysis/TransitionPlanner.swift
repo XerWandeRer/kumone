@@ -165,7 +165,88 @@ enum TransitionPlanner {
         var stemExchangeHandoverMin: Double = 0.30
         var stemExchangeHandoverMax: Double = 0.85
 
+        // --- Structure layer (predev §2.3). Read *only* when the analysis on
+        // the relevant side carries `sections` — a v7 sidecar the segmenter was
+        // confident about. Every other track (older sidecar, ambient material,
+        // broken beat tracking) leaves this whole block unread and decides
+        // field-for-field what it decided before the layer existed.
+        //
+        // The principle the block is built to: **candidates change, gates do
+        // not**. Nothing here can let a pair through a gate it used to fail; it
+        // only changes *which* out/in points the unchanged five-signal / tier /
+        // bar-upgrade machinery is offered, and in what order.
+
+        /// Prefer section boundaries — the final chorus's end above all — over
+        /// the RMS-jump-scored `phraseBoundaries` when picking an out point.
+        /// Off puts all three out-point searches (beat-matched, crossfade,
+        /// stem) back on the bare boundary list, which is what makes a listening
+        /// test able to revert this one behaviour on its own.
+        var useStructureOutPoints: Bool = true
+        /// Take the in point from the first *core* section (verse or chorus)
+        /// instead of `introEnd`'s "first second above 25 % of peak". Off
+        /// restores `introEnd` everywhere, `intakeCapacity`'s anchor included.
+        var useStructureInPoint: Bool = true
+        /// Confidence a track's `sections` must carry before the planner will
+        /// take points from them.
+        ///
+        /// The segmenter already drops sections below its own gate, so at the
+        /// default this re-gate never fires — it is deliberately a *second*
+        /// reading of the same number, so the console can raise the bar for a
+        /// listening test ("only act on structure I am very sure about")
+        /// without re-analyzing the library, and so a sidecar written by a
+        /// future, looser segmenter cannot silently widen what the planner
+        /// acts on.
+        var structureConfidenceGate: Double = StructureSegmenter.confidenceGate
+        /// How far back an out-point candidate may be pulled to land on a lyric
+        /// line end. Four seconds is a little over one 4-bar phrase at 120 BPM:
+        /// far enough to rescue a candidate that fell one line short of the full
+        /// stop, short enough that it can never walk a candidate into the
+        /// previous section. Beyond it the candidate is left where it was rather
+        /// than dragged somewhere structurally different. 0 turns snapping off.
+        var lyricSnapMaxSeconds: TimeInterval = 4
+        /// **Climax guard**: how many bars before the final chorus's start an
+        /// out point is forbidden. Sending the song away eight bars before its
+        /// biggest moment is the single most offensive cut there is, and the
+        /// energy heuristics have no concept of it — a pre-chorus lift reads as
+        /// a fat RMS jump and scores *well*. Sixteen bars is the usual length of
+        /// that lift. Bars are measured at the outgoing track's own tempo, or at
+        /// a flat 4 s when its tempo is not confident.
+        var climaxGuardBarsBefore: Int = 16
+        /// …and how many bars *into* the final chorus stay forbidden. 0 — the
+        /// default — makes the window `[start − before, start)`: landing exactly
+        /// on the downbeat the chorus begins is a legitimate hand-over (the
+        /// listener hears the new track arrive on the big one), it is the eight
+        /// bars of anticipation before it that must not be cut.
+        var climaxGuardBarsAfter: Int = 0
+        /// Sanity clamp on the structural in point, against `introEnd`: a
+        /// mislabelled "first verse" two minutes in must not skip a third of the
+        /// song. The back slack exists because a section boundary snapped to a
+        /// downbeat can legitimately sit a hair before the energy threshold
+        /// `introEnd` found; outside either bound the planner falls back to
+        /// `introEnd` and says so in the trace.
+        var structureInPointSlackSeconds: TimeInterval = 2
+        var structureInPointMaxLeadSeconds: TimeInterval = 60
+
         static let standard = Config()
+    }
+
+    /// Per-hand-over facts the planner cannot derive from two `TrackAnalysis`
+    /// values, and which are therefore *given* to it rather than looked up.
+    ///
+    /// The planner is a pure function and stays one: no file is read here, no
+    /// clock consulted. The one thing the structure layer wants that analysis
+    /// does not carry is *where the outgoing singer stops singing* — words are
+    /// not a signal the analyzer computes — so the caller that already knows
+    /// the outgoing file's URL (`PlayerService`, `Audition.decide`) reads its
+    /// `.lrc` and hands the timestamps over. Everything defaults to "unknown",
+    /// and unknown means the decision is exactly what it was before this type
+    /// existed.
+    struct PlanContext: Sendable, Equatable {
+        /// Ascending line-end timestamps of the **outgoing** track
+        /// (`Audition.Lyrics.lineEnds`). Empty = no snapping.
+        var outgoingLyricLineEnds: [TimeInterval] = []
+
+        static let none = PlanContext()
     }
 
     // The shipped numbers, kept as the flat names the rest of the codebase and
@@ -197,14 +278,19 @@ enum TransitionPlanner {
     ///   path passes — the result is field-for-field what it was before the
     ///   stem layer existed; `.ready` lets the two rules in "Stem layer" below
     ///   re-aim the out point and add a `StemTechnique`.
+    /// - Parameter context: facts about this particular hand-over that no
+    ///   `TrackAnalysis` carries — today, the outgoing track's lyric line ends.
+    ///   `.none` (the default) decides exactly what the planner decided before
+    ///   the structure layer existed.
     static func plan(
         outgoing: TrackAnalysis?, incoming: TrackAnalysis?,
         stems: StemAvailability = .none,
-        config: Config = .standard
+        config: Config = .standard,
+        context: PlanContext = .none
     ) -> PlannedTransition {
         var untraced: PlanTrace?
         return plan(outgoing: outgoing, incoming: incoming, stems: stems,
-                    config: config, trace: &untraced)
+                    config: config, context: context, trace: &untraced)
     }
 
     /// The same decision, with an optional gate-by-gate ledger.
@@ -221,6 +307,7 @@ enum TransitionPlanner {
         outgoing: TrackAnalysis?, incoming: TrackAnalysis?,
         stems: StemAvailability = .none,
         config: Config = .standard,
+        context: PlanContext = .none,
         trace: inout PlanTrace?
     ) -> PlannedTransition {
         guard let outgoing, let incoming else {
@@ -271,9 +358,41 @@ enum TransitionPlanner {
                  } ?? "at least one key is below the confidence gate, so harmony abstains")
         if demotedByKey { tier = .neutral }
 
+        // --- Candidate generation (predev §2.3). Computed once and handed to
+        // all three out-point searches and to both plan shapes, so beat-matched,
+        // crossfade and stem hand-overs can never disagree about where this
+        // pair's structure says the seams are.
+        let candidates = outPointCandidates(outgoing, context: context, config: config)
+        let inChoice = inPointChoice(incoming, config: config)
+        // `passed` here is "nothing went wrong", not "structure was used": an
+        // empty candidate list is a real problem, a list made only of phrase
+        // boundaries is the ordinary path. See `PlanGate.Stage.structure`.
+        _ = note(&trace, .structure, "structureCandidates", !candidates.points.isEmpty,
+                 Double(candidates.structuralCount), nil,
+                 String(format: "%d of %d candidates come from sections "
+                        + "(%d phrase boundaries behind them; structure confidence %.2f "
+                        + "against a %.2f gate)",
+                        candidates.structuralCount, candidates.points.count,
+                        outgoing.phraseBoundaries.count, outgoing.structureConfidence,
+                        config.structureConfidenceGate))
+        _ = note(&trace, .structure, "climaxGuard", !candidates.guardFellBack,
+                 Double(candidates.guardRejected), nil,
+                 candidates.guardWindow.map { window in
+                     String(format: "final chorus starts at %.2f s; %d candidate(s) inside "
+                            + "[%.2f s, %.2f s)%@",
+                            candidates.climaxStart ?? 0, candidates.guardRejected,
+                            window.start, window.end,
+                            candidates.guardFellBack
+                                ? " — every candidate was, so the guard stood down"
+                                : "")
+                 } ?? "no final chorus to protect, so the guard never fires")
+        _ = note(&trace, .structure, "inPointSource", true, inChoice.point, nil,
+                 (inChoice.section == nil ? "introEnd: " : "section: ") + inChoice.detail)
+
         var matched: (plan: BeatMatchedPlan, stem: StemTechnique?)?
         if tier == .compatible {
             matched = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
+                                      candidates: candidates.points, inAnchor: inChoice.point,
                                       stems: stems, config: config, trace: &trace)
         } else if trace != nil {
             // The tier already ended this pair's beat-match hopes, so the rest
@@ -284,8 +403,29 @@ enum TransitionPlanner {
             // anything else have stopped it?
             var shadow: PlanTrace? = PlanTrace()
             _ = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
+                                candidates: candidates.points, inAnchor: inChoice.point,
                                 stems: stems, config: config, trace: &shadow)
             trace?.shadowGates = shadow?.gates ?? []
+        }
+        // One last structure note, once the seam is final: whether the point
+        // this pair actually hands over on was pulled back onto a lyric line
+        // end, and by how much.
+        func finish(_ transition: PlannedTransition) -> PlannedTransition {
+            if trace != nil, let outPoint = transition.plan.outPoint {
+                let origin = candidates.snapOrigin(of: outPoint)
+                _ = note(&trace, .structure, "lyricSnap", true,
+                         (origin ?? outPoint) - outPoint, config.lyricSnapMaxSeconds,
+                         origin.map {
+                             String(format: "out point pulled back %.2f s, from %.2f s to the "
+                                    + "lyric line ending at %.2f s (cap %.1f s)",
+                                    $0 - outPoint, $0, outPoint, config.lyricSnapMaxSeconds)
+                         } ?? (context.outgoingLyricLineEnds.isEmpty
+                               ? "no lyrics for the outgoing track, so nothing snapped"
+                               : String(format: "out point %.2f s stayed put — no line end "
+                                        + "within %.1f s behind it",
+                                        outPoint, config.lyricSnapMaxSeconds)))
+            }
+            return transition
         }
         if let matched {
             trace?.chosenBars = matched.plan.overlapBars
@@ -295,8 +435,8 @@ enum TransitionPlanner {
             // runs over it unchanged (see `StemTechniqueLayer`).
             var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
             style.stemTechnique = matched.stem
-            return PlannedTransition(plan: .beatMatched(matched.plan), style: style,
-                                     rideDB: s.rideDB)
+            return finish(PlannedTransition(plan: .beatMatched(matched.plan), style: style,
+                                            rideDB: s.rideDB))
         }
         let cap: TimeInterval
         switch tier {
@@ -305,6 +445,7 @@ enum TransitionPlanner {
         case .clash: cap = config.clashOverlapCap
         }
         let crossfade = crossfadePlan(outgoing: outgoing, incoming: incoming,
+                                      candidates: candidates.points, inPoint: inChoice.point,
                                       tierCap: cap, tier: tier, stems: stems, config: config)
         // Same composition rule as above: the stem technique never replaces
         // the outro effect or the staged-EQ decision, it sits beneath them.
@@ -317,7 +458,7 @@ enum TransitionPlanner {
         // two decks share, held at a corrected level. A `.gapless` seam has no
         // such window (and `.plain(.gapless)`, the AutoMix-off / iOS path, must
         // stay bit-identical), so every early return above keeps ride 0.
-        return PlannedTransition(plan: crossfade.plan, style: style, rideDB: s.rideDB)
+        return finish(PlannedTransition(plan: crossfade.plan, style: style, rideDB: s.rideDB))
     }
 
     // MARK: - Decision ledger
@@ -424,7 +565,7 @@ enum TransitionPlanner {
         return nil
     }
 
-    /// Phrase boundaries in the outgoing tail that can hold `overlap` and sit
+    /// Out-point candidates in the outgoing tail that can hold `overlap` and sit
     /// *before* any outro fade — the stem search's candidate list.
     ///
     /// This is the beat-matched out-point window rather than the crossfade's
@@ -432,12 +573,12 @@ enum TransitionPlanner {
     /// includes the outro fade, and handing over inside a fade is precisely
     /// what leaves a stem technique with nothing to work on.
     private static func stemCandidates(
-        _ a: TrackAnalysis, overlap: TimeInterval, config: Config
+        _ a: TrackAnalysis, candidates: [TimeInterval], overlap: TimeInterval, config: Config
     ) -> [TimeInterval] {
         let outLimit = a.outroFadeStart ?? a.duration
         let windowStart = max(a.duration * config.tailWindowShare,
                               outLimit - config.tailWindowSeconds)
-        return a.phraseBoundaries.filter {
+        return candidates.filter {
             $0 >= windowStart && $0 <= outLimit && $0 + overlap <= a.duration
         }
     }
@@ -723,6 +864,11 @@ enum TransitionPlanner {
                           Int(outgoing.outroFadeStart ?? outgoing.duration))
         let window = max(1, config.loudnessWindow)
         let tail = mean(outgoing.rmsEnvelope, from: tailEnd - window, length: window)
+        // Deliberately still `introEnd` and not the structural in point: this is
+        // a *gate* input, and the structure layer only ever changes candidates.
+        // Re-anchoring it would move the tier line under every pair whose
+        // segmentation happens to be good, which is exactly the coupling the
+        // "candidates change, gates do not" rule exists to forbid.
         let opening = mean(incoming.rmsEnvelope, from: Int(incoming.introEnd), length: window)
         guard tail > 1e-6, opening > 1e-6 else { return 0 }
         return 20 * log10(tail / opening)
@@ -736,10 +882,253 @@ enum TransitionPlanner {
         return Double(max(0, 1 - dot))
     }
 
+    // MARK: - Structure layer
+    //
+    // Everything below produces *candidates*. Not one line of it decides
+    // anything: the tier gate, the five signals, the bar-upgrade search and the
+    // stem rules run afterwards, unchanged, over whatever this hands them. That
+    // is the whole safety argument for the layer — a mislabelled chorus can move
+    // a hand-over, it can never authorize one that the gates refuse.
+    //
+    // Two sources feed it, and both are optional:
+    //
+    //   * `TrackAnalysis.sections` (v7, `StructureSegmenter`) — empty for every
+    //     older sidecar and for everything the segmenter was unsure about.
+    //   * the outgoing track's lyric line ends, carried in on `PlanContext`.
+    //
+    // With neither, `outPointCandidates` hands back `phraseBoundaries` — the
+    // same array, in the same order — and `inPointChoice` hands back
+    // `introEnd`, so the fallback path is not "equivalent to" the old
+    // behaviour, it *is* the old behaviour.
+
+    /// The out-point candidate list, best first, plus what the console needs to
+    /// narrate where it came from.
+    struct OutPointCandidates {
+        /// Ordered candidates. Callers filter these by their own window rules
+        /// exactly as they used to filter `phraseBoundaries`.
+        var points: [TimeInterval] = []
+        /// How many of `points` came from sections rather than the RMS-scored
+        /// fallback list.
+        var structuralCount = 0
+        /// Where a candidate was pulled back to a lyric line end: snapped time →
+        /// the time it came from.
+        var snaps: [TimeInterval: TimeInterval] = [:]
+        /// Start of the final chorus, when there is one — the climax the guard
+        /// protects.
+        var climaxStart: TimeInterval?
+        /// The forbidden window, and how many candidates fell inside it.
+        var guardWindow: (start: TimeInterval, end: TimeInterval)?
+        var guardRejected = 0
+        /// Every candidate was inside the guard window, so the guard was
+        /// dropped: a transition still has to happen somewhere.
+        var guardFellBack = false
+
+        /// Where `point` sat before its lyric snap, if it was snapped.
+        func snapOrigin(of point: TimeInterval) -> TimeInterval? {
+            snaps.first { abs($0.key - point) < 1e-6 }?.value
+        }
+    }
+
+    /// A chorus, or the electronic music equivalent. Both are "the part the
+    /// listener came for", which is what the ordering and the guard below both
+    /// turn on; `drop` gets no other special treatment here (the drop-aligned
+    /// overlap is P4's business).
+    private static func isClimax(_ kind: TrackAnalysis.Section.Kind) -> Bool {
+        kind == .chorus || kind == .drop
+    }
+
+    /// `a`'s sections, or nil when they are absent or below the planner's own
+    /// confidence re-gate (`structureConfidenceGate`).
+    private static func usableSections(
+        _ a: TrackAnalysis, config: Config
+    ) -> [TrackAnalysis.Section]? {
+        guard !a.sections.isEmpty,
+              a.structureConfidence >= config.structureConfidenceGate
+        else { return nil }
+        return a.sections
+    }
+
+    /// One bar at the track's own tempo, or a flat 4 s when the tempo is not
+    /// trustworthy enough to count bars with (≈ one bar at 120 BPM).
+    private static func barLength(_ a: TrackAnalysis, config: Config) -> TimeInterval {
+        guard a.bpmConfidence >= config.bpmConfidenceThreshold, a.bpm > 0 else { return 4 }
+        return 4 * 60 / a.bpm
+    }
+
+    /// Out-point candidates for the outgoing track, in preference order:
+    ///
+    ///   1. the **end of the final chorus** — the moment the song has said
+    ///      everything it came to say, and the one cut nobody argues with;
+    ///   2. any other chorus end, latest first;
+    ///   3. any other section boundary, latest first — later is less of the song
+    ///      thrown away, and the tail window has already excluded "too early";
+    ///   4. `phraseBoundaries`, untouched and in their own scored order, as the
+    ///      tail of the list. They are not deleted, only outranked: on a track
+    ///      with three sections they are still what a 16-bar overlap ends up
+    ///      landing on.
+    ///
+    /// Then two adjustments, in this order: candidates within a beat of one
+    /// already in the list are dropped (the final chorus's end *is* the outro's
+    /// start *is*, often, a phrase boundary — three names for one moment), and
+    /// each survivor is pulled back to a lyric line end when one sits within
+    /// `lyricSnapMaxSeconds` behind it. Snapping is backward-only on purpose:
+    /// forward would cut into a line the singer has already started.
+    ///
+    /// Finally the climax guard removes anything inside
+    /// `[finalChorusStart − climaxGuardBarsBefore, + climaxGuardBarsAfter)`,
+    /// unless that would leave nothing at all.
+    static func outPointCandidates(
+        _ a: TrackAnalysis, context: PlanContext, config: Config
+    ) -> OutPointCandidates {
+        var result = OutPointCandidates()
+        let sections = config.useStructureOutPoints ? usableSections(a, config: config) : nil
+        let lineEnds = config.lyricSnapMaxSeconds > 0 ? context.outgoingLyricLineEnds : []
+        // Nothing to add and nothing to move: hand back the exact array the
+        // three searches have always filtered, in its exact order.
+        guard sections != nil || !lineEnds.isEmpty else {
+            result.points = a.phraseBoundaries
+            return result
+        }
+
+        let tolerance = a.bpmConfidence >= config.bpmConfidenceThreshold && a.bpm > 0
+            ? 60 / a.bpm : 1.0
+        var candidates: [(time: TimeInterval, structural: Bool)] = []
+        func push(_ t: TimeInterval, structural: Bool) {
+            guard t.isFinite, t > 0 else { return }
+            guard !candidates.contains(where: { abs($0.time - t) <= tolerance }) else { return }
+            candidates.append((t, structural))
+        }
+
+        if let sections {
+            let climaxes = sections.filter { isClimax($0.kind) }
+            if let final = climaxes.last {
+                result.climaxStart = final.start
+                push(final.end, structural: true)
+            }
+            for section in climaxes.dropLast().reversed() { push(section.end, structural: true) }
+            // Every boundary the segmentation drew, latest first. Starts plus
+            // the last section's end covers them all exactly once — sections are
+            // contiguous, so every other end is the next one's start.
+            var boundaries = sections.map(\.start)
+            if let last = sections.last { boundaries.append(last.end) }
+            for t in boundaries.sorted(by: >) { push(t, structural: true) }
+        }
+        for t in a.phraseBoundaries { push(t, structural: false) }
+
+        if !lineEnds.isEmpty {
+            var snapped: [(time: TimeInterval, structural: Bool)] = []
+            for candidate in candidates {
+                guard let end = lastLineEnd(lineEnds, atOrBefore: candidate.time),
+                      candidate.time - end > 1e-3,
+                      candidate.time - end <= config.lyricSnapMaxSeconds
+                else {
+                    snapped.append(candidate)
+                    continue
+                }
+                // Two candidates can collapse onto the same line end; the
+                // better-ranked one is already there.
+                guard !snapped.contains(where: { abs($0.time - end) <= tolerance }) else { continue }
+                result.snaps[end] = candidate.time
+                snapped.append((end, candidate.structural))
+            }
+            candidates = snapped
+        }
+
+        if let climaxStart = result.climaxStart,
+           config.climaxGuardBarsBefore > 0 || config.climaxGuardBarsAfter > 0 {
+            let bar = barLength(a, config: config)
+            let window = (start: climaxStart - Double(config.climaxGuardBarsBefore) * bar,
+                          end: climaxStart + Double(config.climaxGuardBarsAfter) * bar)
+            result.guardWindow = window
+            let kept = candidates.filter { !($0.time >= window.start && $0.time < window.end) }
+            result.guardRejected = candidates.count - kept.count
+            // A hand-over has to happen: if the guard would leave the search
+            // with nothing, it loses. Traced, because "we cut right before the
+            // chorus" then has a reason attached to it.
+            if kept.isEmpty {
+                result.guardFellBack = result.guardRejected > 0
+            } else {
+                candidates = kept
+            }
+        }
+
+        result.points = candidates.map(\.time)
+        result.structuralCount = candidates.filter(\.structural).count
+        return result
+    }
+
+    /// The last entry of an ascending array that is at or before `t`.
+    private static func lastLineEnd(
+        _ ends: [TimeInterval], atOrBefore t: TimeInterval
+    ) -> TimeInterval? {
+        var low = 0, high = ends.count
+        while low < high {
+            let mid = (low + high) / 2
+            if ends[mid] <= t + 1e-6 { low = mid + 1 } else { high = mid }
+        }
+        return low > 0 ? ends[low - 1] : nil
+    }
+
+    /// Where the incoming track is entered, and where that came from.
+    struct InPointChoice {
+        let point: TimeInterval
+        /// The section it was taken from, nil when the choice is `introEnd`.
+        let section: TrackAnalysis.Section?
+        let detail: String
+    }
+
+    /// In point: the start of the first **core** section — the first verse or
+    /// chorus — instead of `introEnd`'s "first second above 25 % of peak".
+    ///
+    /// The two disagree exactly where `introEnd` is weakest (predev §1.2): an a
+    /// cappella opening clears the energy threshold in its first second, and a
+    /// slow electronic build never does until it is already over. "The song
+    /// proper starts here" is a structural question, and structure answers it.
+    /// Section starts are downbeat-snapped by the segmenter, so the downbeat
+    /// mechanics the beat-matched search applies on top are unchanged.
+    ///
+    /// Falls back to `introEnd` when there are no usable sections, when nothing
+    /// is labelled verse or chorus (a through-composed or purely instrumental
+    /// track — `drop` is deliberately not core here; that is P4), or when the
+    /// answer lands outside a sanity window around `introEnd`.
+    static func inPointChoice(_ a: TrackAnalysis, config: Config) -> InPointChoice {
+        func introEnd(_ why: String) -> InPointChoice {
+            InPointChoice(point: a.introEnd, section: nil,
+                          detail: String(format: "intro end %.2f s — %@", a.introEnd, why))
+        }
+        guard config.useStructureInPoint else { return introEnd("structural in point is off") }
+        guard let sections = usableSections(a, config: config) else {
+            return introEnd(a.sections.isEmpty
+                            ? "the incoming track has no sections"
+                            : String(format: "structure confidence %.2f below the %.2f gate",
+                                     a.structureConfidence, config.structureConfidenceGate))
+        }
+        guard let core = sections.first(where: { $0.kind == .verse || $0.kind == .chorus })
+        else { return introEnd("no verse or chorus section to enter on") }
+        let low = a.introEnd - config.structureInPointSlackSeconds
+        let high = a.introEnd + config.structureInPointMaxLeadSeconds
+        guard core.start >= low, core.start <= high else {
+            return introEnd(String(format: "the first %@ starts at %.2f s, outside "
+                                   + "[%.2f s, %.2f s] around the intro end",
+                                   core.kind.rawValue, core.start, low, high))
+        }
+        return InPointChoice(
+            point: core.start, section: core,
+            detail: String(format: "first %@ starts at %.2f s (intro end %.2f s)",
+                           core.kind.rawValue, core.start, a.introEnd))
+    }
+
     // MARK: - Rule 1: beat-matched
 
+    /// - Parameters:
+    ///   - candidates: the ordered out-point candidate list
+    ///     (`outPointCandidates`); `phraseBoundaries` verbatim when the
+    ///     structure layer had nothing to say.
+    ///   - inAnchor: where the incoming track is entered before the downbeat
+    ///     snap below — the first core section's start, or `introEnd`.
     private static func beatMatchedPlan(
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
+        candidates: [TimeInterval], inAnchor: TimeInterval,
         stems: StemAvailability, config: Config,
         trace: inout PlanTrace?
     ) -> (plan: BeatMatchedPlan, stem: StemTechnique?)? {
@@ -781,18 +1170,20 @@ enum TransitionPlanner {
                           config.maxRateDeviation * 100))
         else { return nil }
 
-        // In point: the downbeat aligned with the incoming track's intro end.
-        guard let inPoint = incoming.downbeats.first(where: { $0 >= incoming.introEnd - 0.05 })
+        // In point: the downbeat aligned with the incoming track's entry — the
+        // first core section's start when structure named one, `introEnd`
+        // otherwise. The snap itself is unchanged either way.
+        guard let inPoint = incoming.downbeats.first(where: { $0 >= inAnchor - 0.05 })
                 ?? incoming.downbeats.first
         else {
             _ = note(&trace, .beatMatch, "inPoint", false, nil, nil,
                      String(format: "the incoming track has no downbeat at all "
-                            + "(intro ends at %.2f s)", incoming.introEnd))
+                            + "(entry anchored at %.2f s)", inAnchor))
             return nil
         }
         _ = note(&trace, .beatMatch, "inPoint", true, inPoint, nil,
-                 String(format: "first downbeat past the %.2f s intro sits at %.2f s",
-                        incoming.introEnd, inPoint))
+                 String(format: "first downbeat past the %.2f s entry sits at %.2f s",
+                        inAnchor, inPoint))
 
         let beatDuration = 60.0 / targetBPM
         func overlapDuration(bars: Int) -> TimeInterval { Double(bars) * 4 * beatDuration }
@@ -800,16 +1191,15 @@ enum TransitionPlanner {
             config.maxOverlap,
             config.maxOverlapShare * min(outgoing.duration, incoming.duration))
 
-        // Out point: best-scored phrase boundary before any outro fade that
-        // still leaves room for the overlap. Boundaries are ordered by score,
-        // so restrict candidates to a tail window first — the top-scored
-        // boundary may sit mid-song, and cutting there would skip half the
-        // track.
+        // Out point: best candidate before any outro fade that still leaves
+        // room for the overlap. The list is ordered by preference, not by time,
+        // so restrict it to a tail window first — the best-ranked entry may sit
+        // mid-song, and cutting there would skip half the track.
         let outLimit = outgoing.outroFadeStart ?? outgoing.duration
         let tailWindowStart = max(outgoing.duration * config.tailWindowShare,
                                   outLimit - config.tailWindowSeconds)
         func outPoint(forOverlap overlap: TimeInterval) -> TimeInterval? {
-            outgoing.phraseBoundaries.first {
+            candidates.first {
                 $0 >= tailWindowStart && $0 <= outLimit && $0 + overlap <= outgoing.duration
             }
         }
@@ -827,7 +1217,7 @@ enum TransitionPlanner {
             else { continue }
             guard let op = outPoint(forOverlap: overlap) else {
                 _ = note(&trace, .barUpgrade, "bars\(candidate).outPoint", false, nil, nil,
-                         String(format: "no phrase boundary in [%.1f s, %.1f s] leaves room "
+                         String(format: "no candidate in [%.1f s, %.1f s] leaves room "
                                 + "for a %.2f s overlap",
                                 tailWindowStart, outLimit, overlap))
                 continue
@@ -881,10 +1271,9 @@ enum TransitionPlanner {
             else { return nil }
             guard let op4 = outPoint(forOverlap: overlap4) else {
                 _ = note(&trace, .beatMatch, "outPoint", false, nil, nil,
-                         String(format: "no phrase boundary in [%.1f s, %.1f s] leaves room "
-                                + "for the %.2f s floor (the track has %d boundaries)",
-                                tailWindowStart, outLimit, overlap4,
-                                outgoing.phraseBoundaries.count))
+                         String(format: "no candidate in [%.1f s, %.1f s] leaves room "
+                                + "for the %.2f s floor (the track offers %d)",
+                                tailWindowStart, outLimit, overlap4, candidates.count))
                 return nil
             }
             _ = note(&trace, .beatMatch, "outPoint", true, op4, nil,
@@ -940,7 +1329,8 @@ enum TransitionPlanner {
             guard overlap <= overlapCeiling, inPoint + overlap <= incoming.duration,
                   let choice = stemChoice(
                     outgoing: outgoing, incoming: incoming,
-                    candidates: stemCandidates(outgoing, overlap: overlap, config: config),
+                    candidates: stemCandidates(outgoing, candidates: candidates,
+                                               overlap: overlap, config: config),
                     inPoint: inPoint, overlap: overlap, tier: .compatible, config: config)
             else { continue }
             if candidate > 4 {
@@ -1039,10 +1429,14 @@ enum TransitionPlanner {
 
     private static func crossfadePlan(
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
+        candidates: [TimeInterval], inPoint: TimeInterval,
         tierCap: TimeInterval, tier: CompatibilityTier,
         stems: StemAvailability, config: Config
     ) -> (plan: TransitionPlan, stem: StemTechnique?) {
-        let inPoint = incoming.introEnd
+        // `inPoint` is the structure layer's answer (`inPointChoice`), which is
+        // `introEnd` whenever there is no structure to read — and it is the same
+        // value `intakeCapacity` measures the incoming climb from below, so the
+        // fade length follows the in point rather than drifting from it.
         // Computed, not fixed: the shorter of what the outgoing tail can
         // carry and what the incoming opening can absorb, bounded by the
         // shared ceiling and the compatibility tier's cap.
@@ -1062,13 +1456,13 @@ enum TransitionPlanner {
             // Same tail-window restriction as the beat-matched out point;
             // among the candidates, prefer one where the outgoing vocals
             // have already finished.
-            let candidates = outgoing.phraseBoundaries.filter {
+            let inWindow = candidates.filter {
                 $0 >= outgoing.duration * config.crossfadeOutPointShare
                     && $0 + fade <= outgoing.duration
             }
-            outPoint = candidates.first {
+            outPoint = inWindow.first {
                 (vocalScore(outgoing, from: $0, length: fade) ?? 0) <= config.vocalClashRatio
-            } ?? candidates.first ?? max(0, outgoing.duration - fade)
+            } ?? inWindow.first ?? max(0, outgoing.duration - fade)
         }
         // Stem layer, before the vocal cap: a technique that can hold the
         // outgoing vocal down does not need the overlap shortened, and it
@@ -1077,7 +1471,8 @@ enum TransitionPlanner {
         if stems == .ready,
            let choice = stemChoice(
             outgoing: outgoing, incoming: incoming,
-            candidates: stemCandidates(outgoing, overlap: fade, config: config),
+            candidates: stemCandidates(outgoing, candidates: candidates,
+                                       overlap: fade, config: config),
             inPoint: inPoint, overlap: fade, tier: tier, config: config) {
             return (.crossfade(duration: fade, outPoint: choice.outPoint, inPoint: inPoint),
                     choice.technique)

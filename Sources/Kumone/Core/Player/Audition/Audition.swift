@@ -445,6 +445,15 @@ public enum Audition {
         /// beat-matched": see `PlanTrace`.
         public let planTrace: PlanTrace
 
+        /// Where the chosen out/in point sits in that side's structure —
+        /// "chorus 130–170, +40.0 s in (its end)". Nil when the side has no
+        /// usable sections, which is the normal state for most of a library.
+        public let outPointSection: String?
+        public let inPointSection: String?
+        /// Segmenter confidence per side; 0 means "no structure to act on".
+        public let outgoingStructureConfidence: Double
+        public let incomingStructureConfidence: Double
+
         /// The tier the signals alone produced, before the key gate.
         public let rawTier: String
         /// `name: value` for every knob this decision was made under.
@@ -457,6 +466,24 @@ public enum Audition {
         let incomingAnalysis: TrackAnalysis
         let resolvedConfig: TransitionPlanner.Config
         let signals: TransitionPlanner.Signals
+    }
+
+    /// Which section a cue landed in, and where inside it — the sentence the
+    /// console and the corpus sweep quote next to a moved out point ("it used to
+    /// cut in the second verse, now it cuts where the last chorus ends").
+    private static func sectionContext(
+        _ sections: [TrackAnalysis.Section], at t: TimeInterval?
+    ) -> String? {
+        guard let t, !sections.isEmpty else { return nil }
+        guard let s = sections.last(where: { $0.start <= t + 0.01 }) ?? sections.first
+        else { return nil }
+        // "at its end" is the case the whole structure layer exists to produce,
+        // so it gets said rather than left to arithmetic.
+        let where_: String
+        if abs(t - s.end) < 1 { where_ = "at its end" }
+        else if abs(t - s.start) < 1 { where_ = "at its start" }
+        else { where_ = String(format: "+%.1f s in", t - s.start) }
+        return String(format: "%@ %.0f–%.0f %@", s.kind.rawValue, s.start, s.end, where_)
     }
 
     /// Analyze both tracks, plan the hand-over, and explain the decision.
@@ -485,9 +512,16 @@ public enum Audition {
             && (keyDistance ?? 0) >= config.clashKeyDistance
         let effectiveTier = demoted ? TransitionPlanner.CompatibilityTier.neutral : rawTier
 
+        // The corpus keeps a `.lrc` next to every track, and the app now writes
+        // one next to its cache; both sides therefore hand the planner the same
+        // out-point snap grid, and the console decides what the product decides.
+        let context = TransitionPlanner.PlanContext(
+            outgoingLyricLineEnds: Lyrics.lineEnds(for: outgoingURL))
+
         var trace: PlanTrace? = PlanTrace()
         var planned = TransitionPlanner.plan(outgoing: out, incoming: inc,
-                                             stems: stems, config: config, trace: &trace)
+                                             stems: stems, config: config,
+                                             context: context, trace: &trace)
         let planTrace = trace ?? PlanTrace()
         let plannedStem = planned.style.stemTechnique
         // The same decision without stems, purely so the console can quote the
@@ -497,7 +531,7 @@ public enum Audition {
         var baselineOverlap: TimeInterval?
         if stems == .ready {
             let base = TransitionPlanner.plan(outgoing: out, incoming: inc,
-                                              stems: .none, config: config)
+                                              stems: .none, config: config, context: context)
             baselineOutPoint = base.plan.outPoint
             baselineOverlap = TransitionAutomation.Geometry(plan: base.plan).overlapDuration
         }
@@ -635,6 +669,10 @@ public enum Audition {
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
                                    outVocal: outVocal, inVocal: inVocal, config: config),
             planTrace: planTrace,
+            outPointSection: sectionContext(out.sections, at: outPoint),
+            inPointSection: sectionContext(inc.sections, at: inPoint),
+            outgoingStructureConfidence: out.structureConfidence,
+            incomingStructureConfidence: inc.structureConfidence,
             rawTier: name(of: rawTier),
             config: config.asDictionary,
             planned: planned, outgoingURL: outgoingURL, incomingURL: incomingURL,

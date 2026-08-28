@@ -96,6 +96,40 @@ extension Audition {
             return lines.isEmpty ? nil : lines
         }
 
+        /// A line is assumed to stop being sung no later than this multiple of
+        /// the track's own median line spacing. Without the cap, the line before
+        /// an instrumental break would "end" only when the singer comes back,
+        /// and the whole break would read as one held line — the opposite of
+        /// what a snap target is for.
+        private static let maxLineLengthFactor: TimeInterval = 2
+
+        /// When each line **stops** being sung: the next line's timestamp,
+        /// capped at `maxLineLengthFactor` × the median spacing, and for the
+        /// last line its own timestamp plus that median.
+        ///
+        /// This is the planner's out-point snap grid (predev §2.2): a cut that
+        /// lands here lands on a full stop rather than in the middle of a word.
+        /// Ascending, one entry per line, so a caller can binary-search it.
+        public static func lineEnds(_ lines: [LyricLine]) -> [TimeInterval] {
+            guard let last = lines.last else { return [] }
+            var gaps: [TimeInterval] = []
+            for (a, b) in zip(lines, lines.dropFirst()) where b.time > a.time {
+                gaps.append(b.time - a.time)
+            }
+            // Median, not mean: one 40 s instrumental gap would otherwise set
+            // the length of every line in the song.
+            let median = gaps.isEmpty ? 4 : gaps.sorted()[gaps.count / 2]
+            let cap = maxLineLengthFactor * median
+            var ends = zip(lines, lines.dropFirst()).map { min($1.time, $0.time + cap) }
+            ends.append(last.time + median)
+            return ends
+        }
+
+        /// The same grid straight off a track's `.lrc`; empty when it has none.
+        public static func lineEnds(for track: URL) -> [TimeInterval] {
+            load(for: track).map(lineEnds) ?? []
+        }
+
         /// The last `count` lines — what the outgoing track is still singing
         /// when the hand-over starts.
         public static func tail(_ lines: [LyricLine], count: Int) -> [LyricLine] {

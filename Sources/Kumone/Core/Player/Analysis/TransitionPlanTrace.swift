@@ -34,6 +34,17 @@ public struct PlanGate: Sendable, Equatable {
         case tier
         /// Harmony, which can demote `compatible` but never creates a clash.
         case key
+        /// Where the out/in point *candidates* came from — sections, lyric
+        /// line ends, the climax guard (predev §2.3). Like `.barUpgrade` these
+        /// are never eliminations: they re-order and re-aim a search that then
+        /// runs its own unchanged gates, so nothing recorded here can be the
+        /// reason a pair lost its beat-match.
+        ///
+        /// `passed` on this stage therefore means "nothing went wrong", not
+        /// "structure was used" — falling back to the energy heuristics is the
+        /// designed path for most of the library, not a failure. Which source a
+        /// point came from lives in `value` and `detail`.
+        case structure
         /// The beat-match rule proper: tempo confidence through out point.
         case beatMatch
         /// The 16 / 8-bar upgrade search. These never cost a pair its
@@ -79,6 +90,10 @@ public struct PlanGate: Sendable, Equatable {
         case "overlapCeiling": return "overlap ceiling"
         case "outPoint": return "out point"
         case "incomingRoom": return "incoming room"
+        case "structureCandidates": return "structural candidates"
+        case "lyricSnap": return "lyric snap"
+        case "climaxGuard": return "climax guard"
+        case "inPointSource": return "in-point source"
         default: break
         }
         let parts = id.split(separator: ".")
@@ -140,7 +155,8 @@ public struct PlanTrace: Sendable {
 
     mutating func add(_ gate: PlanGate) {
         gates.append(gate)
-        if !gate.passed, gate.stage != .barUpgrade, blocker == nil { blocker = gate }
+        if !gate.passed, gate.stage != .barUpgrade, gate.stage != .structure,
+           blocker == nil { blocker = gate }
     }
 
     /// Whether every gate outside the bar-upgrade search was cleared.
@@ -150,6 +166,6 @@ public struct PlanTrace: Sendable {
     /// had the tier let it through. Nil when the shadow chain is clean (or
     /// was never run, i.e. the pair reached the beat-match rule for real).
     public var shadowBlocker: PlanGate? {
-        shadowGates.first { !$0.passed && $0.stage != .barUpgrade }
+        shadowGates.first { !$0.passed && $0.stage != .barUpgrade && $0.stage != .structure }
     }
 }

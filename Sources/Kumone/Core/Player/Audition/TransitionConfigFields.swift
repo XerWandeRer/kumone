@@ -196,6 +196,41 @@ extension TransitionPlanner.Config {
               "vocal exchange 的“交接句”最晚可以落在叠加的百分之多少处。"
                   + "太晚入曲的人声还没站稳，出曲这边已经没声音了。",
               0.4, 0.98, 0.01, 2, \.stemExchangeHandoverMax),
+
+        // --- Structure layer. 只在这首歌的分析里带着段落（v7 sidecar、分段器够有把握）
+        // 时才被读到；没有段落的歌整块都不参与判断。
+        boolField("useStructureOutPoints", "structure",
+                  "开 = 出点优先从段落边界里选（末段副歌唱完 > 任意副歌结束 > 任意段落边界），"
+                      + "能量跳变打分的老候选退到最后当兜底；关 = 完全回到今天的行为。",
+                  \.useStructureOutPoints),
+        boolField("useStructureInPoint", "structure",
+                  "开 = 入点取第一个核心段（主歌/副歌）的开始，而不是“第一处不安静的地方”；"
+                      + "清唱开场和慢 build 的电子乐就是靠这一项修好的。关 = 回到 introEnd。",
+                  \.useStructureInPoint),
+        field("structureConfidenceGate", "structure",
+              "对段落划分的把握低于这个数就当作没有段落，出入点全部走老路。"
+                  + "默认与分段器自己的门槛相同（所以默认下这道复查永远不会触发）；"
+                  + "调高 = 只在“非常确定”的歌上按结构选点。",
+              0, 1, 0.01, 2, \.structureConfidenceGate),
+        field("lyricSnapMaxSeconds", "structure",
+              "出点最多可以往前挪多少秒，去落在一句歌词唱完的地方（只往前，绝不往后）。"
+                  + "超过这个距离就原地不动，免得被拖到上一段去。设成 0 = 不吸附歌词。",
+              0, 12, 0.5, 1, \.lyricSnapMaxSeconds),
+        intField("climaxGuardBarsBefore", "structure",
+                 "末段副歌开始前的多少小节之内禁止出点——不在高潮到来前把歌送走。"
+                     + "16 小节约等于常见的“预副歌抬升”整段。设成 0 = 关掉这道守门。"
+                     + "（若守门把候选清空，仍会退回不守门的列表：过渡总得发生。）",
+                 0, 64, \.climaxGuardBarsBefore),
+        intField("climaxGuardBarsAfter", "structure",
+                 "末段副歌开始之后再禁止多少小节。默认 0：正好切在副歌第一拍是合法手势，"
+                     + "要防的是它前面那段蓄力。",
+                 0, 32, \.climaxGuardBarsAfter),
+        field("structureInPointMaxLeadSeconds", "structure",
+              "结构入点最多可以比 introEnd 晚多少秒；再晚就当成段落标错了，退回 introEnd。",
+              5, 180, 1, 0, \.structureInPointMaxLeadSeconds),
+        field("structureInPointSlackSeconds", "structure",
+              "结构入点允许比 introEnd 早多少秒（段落边界吸附到小节线，早一点点是正常的）。",
+              0, 15, 0.5, 1, \.structureInPointSlackSeconds),
     ]
 
     /// This config as `name: value`, in field order.

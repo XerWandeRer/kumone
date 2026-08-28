@@ -943,8 +943,20 @@ final class PlayerService: ObservableObject {
         // (macOS, checkpoint on disk). Without one, `.none` keeps this the
         // byte-identical whole-mix path.
         let stems: StemAvailability = StemSeparation.isAvailable ? .ready : .none
+        // Lyric line ends for the outgoing track, so the planner can pull its
+        // out point back onto a full stop instead of cutting mid-line. The
+        // `.lrc` sits next to the cached audio (written by `LyricsSidecar` on
+        // the prefetch path), so this is a few-KB synchronous read on the main
+        // actor — the same read `VocalExchange.compile` already does at
+        // plan-adjacent time, run once per seam, minutes apart. Off the main
+        // actor it would have to be awaited, which would turn arming into an
+        // async step for no measurable gain. Missing file → empty → the
+        // pre-structure decision, unchanged.
+        let context = TransitionPlanner.PlanContext(
+            outgoingLyricLineEnds: currentLocalURL
+                .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
         return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
-                                      stems: stems, config: plannerConfig)
+                                      stems: stems, config: plannerConfig, context: context)
         #endif
     }
 
