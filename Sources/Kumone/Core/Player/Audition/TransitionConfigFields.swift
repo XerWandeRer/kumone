@@ -238,6 +238,19 @@ extension TransitionPlanner.Config {
               "vocal exchange 的“交接句”最晚可以落在叠加的百分之多少处。"
                   + "太晚入曲的人声还没站稳，出曲这边已经没声音了。",
               0.4, 0.98, 0.01, 2, \.stemExchangeHandoverMax),
+        boolField("twoClockExchange", "stem",
+                  "开 = 人声和伴奏走两个时钟：伴奏在低频交接点 S 换台，人声按歌词另选一个"
+                      + "交接点 L —— L 落在 S 之后就是“唱完才走”（vocalCarryover，出曲人声"
+                      + "骑在入曲伴奏上把这句唱完），落在 S 之前就是“人声先行”"
+                      + "（vocalYield，交接点砸在一个没人唱的小节上）。"
+                      + "关 = 回到只有一个交接点、离叠加正中最近的老编排，逐字段一致。",
+                  \.twoClockExchange),
+        field("vocalCarryWindowSeconds", "stem",
+              "出曲人声最多可以越过低频交接点 S 多少秒去把一句唱完；这个窗口里找得到歌词行末"
+                  + "就是 vocalCarryover，找不到就退成 vocalYield（在 S 之前唱完）。"
+                  + "调大 = 更容易“唱完才走”，但唱得越久出曲推子已经落得越低，"
+                  + "补偿到顶（+6 dB）之后人声还是会跟着推子一起走。",
+              0, 20, 0.5, 1, \.vocalCarryWindowSeconds),
 
         // --- Structure layer. 只在这首歌的分析里带着段落（v7 sidecar、分段器够有把握）
         // 时才被读到；没有段落的歌整块都不参与判断。

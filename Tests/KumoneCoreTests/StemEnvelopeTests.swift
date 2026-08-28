@@ -224,8 +224,13 @@ import Testing
                           style: .plain)
     }
 
-    /// The headline behaviour: the hand-over lands where a lyric line ends,
-    /// picking the end nearest the middle of the overlap.
+    /// The single-clock behaviour, pinned: the hand-over lands where a lyric
+    /// line ends, picking the end nearest the middle of the overlap.
+    ///
+    /// This is what `twoClockExchange = false` still compiles, field for field.
+    /// With the knob on its default the same `.lrc` gives 10 s instead — the
+    /// line-end just past the 6 s floor swap — which is the whole point of the
+    /// two clocks and is pinned separately below.
     @Test func exchangeLandsOnTheLyricLineEndNearestTheMiddle() {
         let lrc = """
         [01:36.00]第一句
@@ -239,7 +244,7 @@ import Testing
             let (technique, compiled) = Audition.VocalExchange.compile(
                 outgoingURL: track, outgoing: a,
                 planned: crossfade(outPoint: 100, overlap: 12),
-                config: .standard)
+                config: twoClockConfig(on: false))
             // Ends inside [100, 112] are 100, 105 and 110; the middle is 106,
             // so 105 wins — the singer finishes 第二句 and hands over.
             #expect(abs(compiled.handover - 5) < 1e-6)
@@ -403,6 +408,270 @@ import Testing
         #expect(e.gainDB(.outgoingVocal, at: 0) == 0)
         #expect(e.gainDB(.outgoingVocal, at: h - 0.01) > 3)
         #expect(e.outgoingVocal.allSatisfy { $0.gainDB <= StemEnvelope.maxGainDB })
+    }
+
+    // MARK: - Two clocks
+
+    // Every case below runs on a 12 s crossfade from 100 s, whose floor swap
+    // `Geometry` puts at S = 6.0 and whose share clamp is [3.6, 10.2]. The
+    // whole point of the feature is that L is chosen against S rather than
+    // against the middle of the overlap, so each test names both.
+
+    private func twoClockConfig(on: Bool = true,
+                                carryWindow: TimeInterval = 8) -> TransitionPlanner.Config {
+        var c = TransitionPlanner.Config.standard
+        c.twoClockExchange = on
+        c.vocalCarryWindowSeconds = carryWindow
+        return c
+    }
+
+    /// Line-ends at 4, 9 and 11 s into the overlap. Only 9 is inside
+    /// `(S, S + carryWindow]` clamped to the share ceiling — so the singer
+    /// carries three seconds past the floor swap and finishes the line there.
+    ///
+    /// The single-clock rule would have taken 4 (nearest the 6 s middle), which
+    /// is the same seam heard as a mix rather than a move: the contrast is the
+    /// feature.
+    private static let carryoverLRC = """
+    [01:40.00]第一句
+    [01:44.00]第二句
+    [01:49.00]第三句
+    [01:51.00]第四句
+    """
+
+    @Test func twoClockCarriesTheVocalPastTheFloorSwap() {
+        withLyrics(Self.carryoverLRC) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (technique, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig())
+
+            #expect(compiled.gesture == .carryover)
+            #expect(abs(compiled.swapOffset - 6) < 1e-6)
+            #expect(abs(compiled.handover - 9) < 1e-6)      // 3 s past the swap
+            #expect(compiled.lyricLine == "第二句")
+            #expect(compiled.source == "lyric")
+            #expect(compiled.clampedFrom == nil)
+            guard case .custom(let e) = technique else {
+                Issue.record("expected a compiled envelope")
+                return
+            }
+            #expect((try? e.validate(overlap: 12)) != nil)
+
+            // The beds keep the *floor* clock: the outgoing bed is already down
+            // at its hand-over level by S and stays there, and the incoming bed
+            // is fully lifted by S because from S on it is the only bed under
+            // the carried singer.
+            #expect(e.gainDB(.outgoingBed, at: 6) <= -7.9)
+            #expect(e.gainDB(.outgoingBed, at: 9) <= -7.9)
+            #expect(e.gainDB(.incomingBed, at: 6) >= 2.9)
+            #expect(e.gainDB(.incomingBed, at: 9) >= 2.9)
+
+            // The vocal keeps its own: still up at the swap, still up two
+            // seconds past it, gone only after L.
+            #expect(e.gainDB(.outgoingVocal, at: 6) >= 0)
+            #expect(e.gainDB(.outgoingVocal, at: 8) >= 0)
+            #expect(e.gainDB(.outgoingVocal, at: 9.8) <= -40)
+        }
+    }
+
+    /// The same `.lrc` as `exchangeLandsOnTheLyricLineEndNearestTheMiddle`,
+    /// which pins the single-clock answer at 5 s: with the two clocks the
+    /// singer instead carries four seconds past the floor swap to finish 第三句.
+    /// One sidecar, one knob, two different musical gestures.
+    @Test func theSameLyricsGiveADifferentHandOverUnderTwoClocks() {
+        let lrc = """
+        [01:36.00]第一句
+        [01:40.00]第二句
+        [01:45.00]第三句
+        [01:50.00]第四句
+        """
+        withLyrics(lrc) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (_, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig())
+            #expect(compiled.gesture == .carryover)
+            #expect(abs(compiled.handover - 10) < 1e-6)
+            #expect(compiled.lyricLine == "第三句")
+        }
+    }
+
+    /// No line-end past the swap: the singer finishes *before* it instead, and
+    /// the floor swap lands on a bar nobody is singing over. Deliberate, named
+    /// and reported — not the accident of a nearest-the-middle pick.
+    @Test func twoClockYieldsWhenNoLineEndsAfterTheSwap() {
+        let lrc = """
+        [01:37.00]第一句
+        [01:41.00]第二句
+        [01:45.00]第三句
+        """
+        withLyrics(lrc) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (_, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig())
+            // Ends inside the overlap are 1 and 5; nothing in (6, 10.2], so the
+            // latest at or before the swap wins.
+            #expect(compiled.gesture == .yield)
+            #expect(abs(compiled.handover - 5) < 1e-6)
+            #expect(compiled.handover <= compiled.swapOffset)
+            #expect(compiled.lyricLine == "第二句")
+            #expect(compiled.incomingDuckWindow == nil)
+            #expect(compiled.carryShortfallDB == 0)
+        }
+    }
+
+    /// A yield compiles the single-clock curves exactly — there is nothing to
+    /// carry across the swap, so there is nothing to reshape.
+    @Test func aYieldCompilesTheSingleClockTemplate() {
+        let lrc = """
+        [01:37.00]第一句
+        [01:41.00]第二句
+        [01:45.00]第三句
+        """
+        withLyrics(lrc) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (_, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig())
+            #expect(compiled.envelope == template(overlap: 12, handover: 5))
+        }
+    }
+
+    /// The knob off is the compile this replaced, curve for curve: same L (the
+    /// line-end nearest the middle, not the one past the swap), same four
+    /// lanes, and no gesture claimed.
+    @Test func twoClockOffIsByteIdenticalToTheSingleClockCompile() {
+        withLyrics(Self.carryoverLRC) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (_, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig(on: false))
+            // Nearest the 6 s middle among {4, 9, 11} is 4 — the old answer,
+            // where the two-clock rule takes 9.
+            #expect(abs(compiled.handover - 4) < 1e-6)
+            #expect(compiled.lyricLine == "第一句")
+            #expect(compiled.gesture == nil)
+            #expect(compiled.incomingDuckWindow == nil)
+            #expect(compiled.envelope == template(overlap: 12, handover: 4))
+        }
+    }
+
+    /// A carry window too short to reach the next line-end falls back to the
+    /// yield, which is the same knob-driven contrast from the other side.
+    @Test func aShortCarryWindowYieldsInstead() {
+        withLyrics(Self.carryoverLRC) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (_, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig(carryWindow: 1))
+            // (6, 7] holds no line-end; the latest at or before 6 is 4.
+            #expect(compiled.gesture == .yield)
+            #expect(abs(compiled.handover - 4) < 1e-6)
+        }
+    }
+
+    /// The compensating envelope is what lets the carried voice survive the
+    /// post-swap fader collapse, and it is capped: never past
+    /// `compensationCeilingDB`, which is `StemEnvelope`'s own maximum, so no
+    /// division by a nearly-gone fader can push a lane out of range.
+    @Test func theCarryCompensationNeverExceedsItsCap() throws {
+        let ceiling = Audition.VocalExchange.compensationCeilingDB
+        #expect(ceiling == StemEnvelope.maxGainDB)
+        for overlap in [8.0, 12.0, 16.0, 30.0] {
+            let plan = TransitionPlan.crossfade(duration: overlap, outPoint: 100, inPoint: 0)
+            let geometry = TransitionAutomation.Geometry(plan: plan)
+            let swap = geometry.swapOffset
+            // Every hand-over the carry rule could legally return, including
+            // ones right up against the share ceiling where the fader is
+            // smallest and the naive 1/fader would blow past the cap.
+            for h in stride(from: swap + 0.2, through: overlap * 0.85, by: 0.3) {
+                let e = Audition.VocalExchange.template(
+                    overlap: overlap, handover: h, plan: plan, style: .plain,
+                    geometry: geometry, carryFrom: swap)
+                try e.validate(overlap: overlap)
+                #expect(e.outgoingVocal.allSatisfy { $0.gainDB <= ceiling + 1e-4 })
+                #expect(e.incomingVocal.allSatisfy { $0.gainDB <= ceiling + 1e-4 })
+                for t in stride(from: 0.0, through: h, by: 0.25) {
+                    #expect(e.gainDB(.outgoingVocal, at: t) <= ceiling + 1e-4)
+                }
+            }
+        }
+    }
+
+    /// The incoming vocal is held down over exactly the stretch the outgoing
+    /// one is borrowing the incoming bed for — `(S, L]` — and is released at L,
+    /// not before and not after.
+    @Test func theIncomingVocalIsDuckedExactlyAcrossTheCarry() {
+        withLyrics(Self.carryoverLRC) { track in
+            let a = analysis(duration: 200,
+                             vocalActivity: [Float](repeating: 0.8, count: 200))
+            let (_, compiled) = Audition.VocalExchange.compile(
+                outgoingURL: track, outgoing: a,
+                planned: crossfade(outPoint: 100, overlap: 12),
+                config: twoClockConfig())
+            let s = compiled.swapOffset, l = compiled.handover
+            #expect(compiled.incomingDuckWindow == s...l)
+            guard let e = compiled.envelope else {
+                Issue.record("expected a compiled envelope")
+                return
+            }
+            // At S it is still fully muted — the explicit breakpoint that makes
+            // the window a window rather than an accident of the ramp.
+            #expect(e.gainDB(.incomingVocal, at: s)
+                    == Audition.VocalExchange.incomingVocalMutedDB)
+            // Across the whole carry it stays at or below the level it is only
+            // allowed to reach *at* the hand-over.
+            for t in stride(from: s, to: l, by: 0.2) {
+                #expect(e.gainDB(.incomingVocal, at: t)
+                        <= Audition.VocalExchange.incomingVocalAtHandoverDB + 1e-4)
+            }
+            // Released at L, and up on its own bed a second later.
+            #expect(e.gainDB(.incomingVocal, at: l)
+                    == Audition.VocalExchange.incomingVocalAtHandoverDB)
+            #expect(e.gainDB(.incomingVocal, at: l + 1.0) >= -0.01)
+        }
+    }
+
+    /// The degradations are untouched by the two clocks: no lyrics means the
+    /// contour, no contour means the duck, and neither claims a gesture it did
+    /// not make.
+    @Test func theDegradationPathClaimsNoGesture() {
+        var contour = [Float](repeating: 0.9, count: 200)
+        contour[107] = 0.05
+        let troughTrack = FileManager.default.temporaryDirectory
+            .appendingPathComponent("two-clock-trough-\(UUID().uuidString).flac")
+        let (_, trough) = Audition.VocalExchange.compile(
+            outgoingURL: troughTrack, outgoing: analysis(duration: 200, vocalActivity: contour),
+            planned: crossfade(outPoint: 100, overlap: 12), config: twoClockConfig())
+        #expect(trough.source == "vocalTrough")
+        #expect(abs(trough.handover - 7) < 1e-6)
+        #expect(trough.gesture == nil)
+        #expect(trough.envelope == template(overlap: 12, handover: 7))
+
+        let blindTrack = FileManager.default.temporaryDirectory
+            .appendingPathComponent("two-clock-blind-\(UUID().uuidString).flac")
+        let (technique, duck) = Audition.VocalExchange.compile(
+            outgoingURL: blindTrack, outgoing: analysis(duration: 200, vocalActivity: []),
+            planned: crossfade(outPoint: 100, overlap: 12), config: twoClockConfig())
+        #expect(technique == .vocalDuck(
+            depthDB: -Float(TransitionPlanner.Config.standard.stemDuckDepthDB)))
+        #expect(duck.source == "duck")
+        #expect(duck.gesture == nil)
+        #expect(duck.envelope == nil)
     }
 
     // MARK: - End to end, on two decks
