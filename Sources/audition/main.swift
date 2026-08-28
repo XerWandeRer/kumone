@@ -61,7 +61,14 @@ usage:
                               [--set name=value,...]
   audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
                   [--state DIR]
+  audition sweep  <corpusDir> [-o report.md] [--set name=value,...]
   audition knobs  [--json]
+
+  sweep     plan every adjacent seam inside each `p<N>-…` playlist twice — once
+            with the structure layer off (the pre-P3 decision) and once with it
+            on — and table the out/in points, the section each landed in, and
+            whether the lyric snap or the climax guard fired. Plans only: no
+            audio is rendered.
 
   --style   force one technique, to hear it in isolation
   --stems   on|off (default off) — tell the planner a vocal separator is
@@ -718,6 +725,151 @@ func runBatch(_ args: Arguments) {
     print("wrote \(docURL.path)")
 }
 
+// MARK: - Structure sweep
+//
+// P3's before/after evidence. The structure layer only ever changes *where* a
+// hand-over lands, never whether one happens, so the question it has to answer
+// is not a histogram of tiers — it is one row per seam: did the out point move,
+// onto what, did the lyric snap fire, did the climax guard fire, and did the
+// plan shape change as a side effect.
+//
+// Both readings come from the same binary and the same cached analyses, a
+// microsecond apart: "old" is this planner with all four structure knobs turned
+// off, which is byte-identical to the pre-P3 decision, and "new" is the shipped
+// defaults. So a difference in the table is the layer and nothing else.
+
+/// The knobs that, all off, reproduce the pre-structure decision exactly.
+let structureOffOverrides: [String: Double] = [
+    "useStructureOutPoints": 0,
+    "useStructureInPoint": 0,
+    "lyricSnapMaxSeconds": 0,
+    "climaxGuardBarsBefore": 0,
+    "climaxGuardBarsAfter": 0,
+]
+
+/// One structure gate's number off a decision's ledger.
+func structureGate(_ d: Audition.Decision, _ id: String) -> PlanGate? {
+    d.planTrace.gates.last { $0.stage == .structure && $0.id == id }
+}
+
+func runSweep(_ args: Arguments) {
+    guard let dirArg = args.positional.first else { fail(usage) }
+    let corpus = url(dirArg)
+    let audioExtensions: Set<String> = ["flac", "mp3", "m4a", "wav", "aiff", "caf", "aac"]
+    let files = ((try? FileManager.default.contentsOfDirectory(
+        at: corpus, includingPropertiesForKeys: nil)) ?? [])
+        .filter { audioExtensions.contains($0.pathExtension.lowercased()) }
+        .filter { !StemService.isStemSidecar($0) }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    guard files.count >= 2 else { fail("need at least two audio files in \(corpus.path)") }
+
+    // The corpus is one flat directory of `p<playlist>-<index>-…` files. Seams
+    // only make sense *inside* a playlist — pairing the last track of one with
+    // the first of the next is a seam no listener will ever hear.
+    var playlists: [String: [URL]] = [:]
+    for file in files {
+        let name = file.lastPathComponent
+        let key = name.split(separator: "-").first.map(String.init) ?? "all"
+        playlists[key, default: []].append(file)
+    }
+    var pairs: [(playlist: String, a: URL, b: URL)] = []
+    for key in playlists.keys.sorted() {
+        let group = playlists[key]!
+        for (a, b) in zip(group, group.dropFirst()) { pairs.append((key, a, b)) }
+    }
+
+    let extra = configOverrides(args)
+    var rows: [String] = []
+    var moved = 0, snapped = 0, guarded = 0, inMoved = 0, shapeChanged = 0
+    var shifts: [Double] = []
+
+    for (index, pair) in pairs.enumerated() {
+        var oldArgs = args
+        oldArgs.flags["set"] = (structureOffOverrides.merging(extra) { a, _ in a })
+            .map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+        let old = decide(oldArgs, a: pair.a, b: pair.b)
+        let new = decide(args, a: pair.a, b: pair.b)
+
+        let outOld = old.outPoint, outNew = new.outPoint
+        let inOld = old.inPoint, inNew = new.inPoint
+        let outShift = (outNew ?? 0) - (outOld ?? 0)
+        if abs(outShift) > 0.01 { moved += 1; shifts.append(outShift) }
+        if abs((inNew ?? 0) - (inOld ?? 0)) > 0.01 { inMoved += 1 }
+        if old.planKind != new.planKind
+            || abs(old.overlapDuration - new.overlapDuration) > 0.01 { shapeChanged += 1 }
+
+        let snap = structureGate(new, "lyricSnap")?.value ?? 0
+        if snap > 0.005 { snapped += 1 }
+        let guardGate = structureGate(new, "climaxGuard")
+        let rejected = Int(guardGate?.value ?? 0)
+        let guardFired = rejected > 0
+        if guardFired { guarded += 1 }
+        let candidates = structureGate(new, "structureCandidates")
+        var guardCell = "—"
+        if guardFired {
+            guardCell = "\(rejected) rejected"
+            // `passed == false` on this gate means every candidate was inside
+            // the window, so the guard gave way rather than block the seam.
+            if guardGate?.passed == false { guardCell += " (stood down)" }
+        }
+
+        let name = "\(pair.playlist) · \(old.outgoingName) → \(old.incomingName)"
+        print("[\(index + 1)/\(pairs.count)] \(name)  "
+              + "out \(optional(outOld)) → \(optional(outNew))"
+              + (abs(outShift) > 0.01 ? String(format: "  (%+.1f s)", outShift) : "  (=)"))
+        rows.append("| \(pair.playlist) | \(old.outgoingName) → \(old.incomingName)"
+                    + " | \(outOld.map(mmss) ?? "—") | \(outNew.map(mmss) ?? "—")"
+                    + " | \(abs(outShift) > 0.01 ? String(format: "%+.1f", outShift) : "=")"
+                    + " | \(new.outPointSection ?? "—")"
+                    + " | \(inOld.map(mmss) ?? "—") | \(inNew.map(mmss) ?? "—")"
+                    + " | \(new.inPointSection ?? "—")"
+                    + " | \(snap > 0.005 ? String(format: "−%.2fs", snap) : "—")"
+                    + " | \(guardCell)"
+                    + " | \(Int(candidates?.value ?? 0))"
+                    + " | \(f(old.outgoingStructureConfidence, 2))"
+                    + "/\(f(new.incomingStructureConfidence, 2))"
+                    + " | \(old.planKind) → \(new.planKind)"
+                    + " | \(f(old.overlapDuration)) → \(f(new.overlapDuration)) s |")
+    }
+
+    var summary = ["## Structure sweep", "",
+                   "Corpus: `\(corpus.path)` · \(pairs.count) seams across "
+                   + "\(playlists.count) playlists · generated "
+                   + ISO8601DateFormatter().string(from: Date()),
+                   "",
+                   "`old` = every structure knob off (byte-identical to the pre-P3 "
+                   + "planner) · `new` = shipped defaults.", ""]
+    summary.append("- out point moved: \(moved)/\(pairs.count)")
+    if !shifts.isEmpty {
+        let sorted = shifts.sorted()
+        summary.append(String(format: "  - shift: min %+.1f s · median %+.1f s · max %+.1f s",
+                              sorted.first!, sorted[sorted.count / 2], sorted.last!))
+    }
+    summary.append("- in point moved: \(inMoved)/\(pairs.count)")
+    summary.append("- lyric snap fired: \(snapped)/\(pairs.count)")
+    summary.append("- climax guard rejected at least one candidate: \(guarded)/\(pairs.count)")
+    summary.append("- plan kind or overlap changed: \(shapeChanged)/\(pairs.count)")
+    summary.append("")
+
+    let document = (summary + [
+        "| playlist | pair | out old | out new | Δ | out section (new) | in old | in new "
+            + "| in section (new) | lyric snap | climax guard | structural candidates "
+            + "| structure conf out/in | plan | overlap |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ] + rows).joined(separator: "\n") + "\n"
+
+    if let out = args.flags["output"] {
+        let docURL = url(out)
+        try? FileManager.default.createDirectory(at: docURL.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        do { try document.write(to: docURL, atomically: true, encoding: .utf8) }
+        catch { fail("could not write \(docURL.path): \(error.localizedDescription)") }
+        print("\nwrote \(docURL.path)")
+    } else {
+        print("\n" + document)
+    }
+}
+
 // MARK: - Entry
 
 let raw = Array(CommandLine.arguments.dropFirst())
@@ -729,6 +881,7 @@ case "plan": runPlan(args)
 case "render": runRender(args)
 case "batch": runBatch(args)
 case "serve": runServe(args)
+case "sweep": runSweep(args)
 case "knobs": runKnobs(args)
 case "-h", "--help", "help": print(usage)
 default: fail("unknown command '\(command)'\n\n" + usage)

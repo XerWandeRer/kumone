@@ -272,11 +272,26 @@ audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                             [--fade N] [--pre N] [--post N] [--set ...]
 audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
                 [--state DIR]
+audition sweep  <corpusDir> [-o report.md] [--set name=value,...]
 audition knobs  [--json]
 ```
 
 `batch` pairs the corpus directory's audio files in filename order (N files →
 N−1 adjacent hand-overs) unless `--pairs` names them explicitly.
+
+### `sweep` — what the structure layer moved
+
+`sweep` plans every adjacent seam *inside* each `p<N>-…` playlist twice from the
+same cached analyses: once with the four structure knobs off — which is
+byte-identical to the pre-structure planner — and once with the shipped
+defaults. It renders no audio, so a whole corpus takes seconds once analysed.
+
+One row per seam: out point old → new and which section the new one landed in,
+in point old → new, how far the lyric snap pulled the out point back, how many
+candidates the climax guard rejected (and whether it had to stand down), how
+many candidates came from sections at all, and the plan kind / overlap on both
+sides. `--set` applies to *both* readings, so a sweep can be run under a moved
+threshold without the two halves disagreeing about anything else.
 
 ### `plan` — the decision, explained
 
