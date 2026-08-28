@@ -253,8 +253,8 @@ import Foundation
     /// `preRoll` seconds, so under a glide it occupies *more* rendered seconds
     /// than that — by exactly the closed-form map.
     @Test func theOfflineRenderWalksTheSameGlide() throws {
-        let outgoing = try TempoRampAudio.sine(hz: 440, seconds: 30, name: "ramp-out")
-        let incoming = try TempoRampAudio.sine(hz: 660, seconds: 30, name: "ramp-in")
+        let outgoing = TempoRampAudio.outgoing
+        let incoming = TempoRampAudio.incoming
 
         // A slowed-down outgoing deck (target < 1), so the stretch is a
         // lengthening and cannot be confused with a rounding error.
@@ -302,8 +302,8 @@ import Foundation
 
     /// …and with the ramp off, the pre-roll is the flat block it always was.
     @Test func theOfflineRenderIsUnchangedWithoutARamp() throws {
-        let outgoing = try TempoRampAudio.sine(hz: 440, seconds: 30, name: "ramp-out")
-        let incoming = try TempoRampAudio.sine(hz: 660, seconds: 30, name: "ramp-in")
+        let outgoing = TempoRampAudio.outgoing
+        let incoming = TempoRampAudio.incoming
         let stepped = BeatMatchedPlan(
             outPoint: 12, inPoint: 0, overlapBars: 4,
             outgoingRate: 0.95, incomingRate: 1.05,
@@ -319,8 +319,16 @@ import Foundation
     }
 }
 
-/// Test tones, shared across the offline cases. Written once per process.
+/// Test tones, shared across the offline cases.
+///
+/// Reached through `static let`, not through a call: the suite's tests run in
+/// parallel, and two of them racing on "does this file exist yet" was a real
+/// flake (one opened the half-written file). Lazy statics are initialized
+/// exactly once, whoever asks first.
 private enum TempoRampAudio {
+    static let outgoing: URL = try! sine(hz: 440, seconds: 30, name: "ramp-out")
+    static let incoming: URL = try! sine(hz: 660, seconds: 30, name: "ramp-in")
+
     static let dir: URL = {
         let d = FileManager.default.temporaryDirectory
             .appendingPathComponent("TempoRamp-\(ProcessInfo.processInfo.processIdentifier)")
