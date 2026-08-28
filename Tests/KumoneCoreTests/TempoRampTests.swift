@@ -142,7 +142,9 @@ import Foundation
         let ramp = TransitionAutomation.TempoRamp(
             start: 0, end: config.rampLeadSeconds,
             target: Float(1 + config.rampMaxRateDeviation))
-        #expect(ramp.slopePerSecond <= 0.005 + 1e-9)
+        // The lead is derived from this bound (0.065 / 0.005 = 13 s), so the
+        // slack is only for `target` making the round trip through Float.
+        #expect(ramp.slopePerSecond <= 0.005 + 1e-6)
         // The release is deliberately *not* held to that bound. Time spent off
         // unity is time spent in the phase vocoder, so the release optimises
         // for getting out fast; it only has to stay slow enough to be a settle

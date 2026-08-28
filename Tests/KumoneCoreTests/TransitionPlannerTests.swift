@@ -378,8 +378,8 @@ import Foundation
     /// before it, and the tier gate reads only the last.
     @Test func theGateReadsWhatBothGainStagesLeftBehind() {
         // A 6 dB local gap with matched masters: the trims have nothing to do,
-        // so the ride is the only thing that closes it — and it can close all
-        // of it, well inside its 4 dB cap once the direction is right.
+        // so the ride is the only thing that closes it — and being a *cut*, it
+        // can close the whole 6 dB rather than clipping at the boost cap.
         let quietTail = [Float](repeating: 0.5 * 0.501, count: 200)  // −6 dB
         let loudOpening = [Float](repeating: 0.5, count: 200)
         let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14)
@@ -392,10 +392,14 @@ import Foundation
         #expect(abs(s.rawLoudnessGapDB - 6) < 0.2)
         #expect(abs(s.trimmedLoudnessGapDB - 6) < 0.2)
         // Stage 3: a quiet outro meeting a hot opening — the incoming deck is
-        // held *down*, so the ride is negative, and it clips at the 4 dB cap.
-        #expect(abs(s.rideDB - -4) < 1e-6)
-        #expect(abs(s.loudnessGapDB - 2) < 0.2)
-        // 6 dB alone would have been a clash; 2 dB is inside the tolerance line.
+        // held *down*, so the ride is negative, and the 6 dB cut cap is deep
+        // enough to take all of it. (It clipped at −4 when both directions
+        // shared the boost cap, leaving 2 dB on the table for the gate.)
+        #expect(s.rideDB < 0)
+        #expect(abs(s.rideDB) >= 5.8 && abs(s.rideDB) <= 6.0 + 1e-6)
+        #expect(s.loudnessGapDB < 0.3)
+        // 6 dB alone would have been a clash; the ride removes essentially all
+        // of it, which is the whole point of judging the residual.
         #expect(TransitionPlanner.tier(of: s) == .compatible)
     }
 
@@ -405,9 +409,10 @@ import Foundation
     @Test func theRideIsCappedAndPeakGuarded() {
         let c = TransitionPlanner.Config.standard
         let roomy = makeAnalysis(peakDBFS: -30)
-        // Cut side: unbounded by peaks, bounded by the cap.
+        // Cut side: unbounded by peaks, bounded by its own — deeper — cap.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: -20, incoming: roomy,
-                                         incomingTrimDB: 0, config: c) == -c.rideMaxDB)
+                                         incomingTrimDB: 0, config: c) == -c.rideMaxCutDB)
+        #expect(c.rideMaxCutDB > c.rideMaxDB, "a cut costs less than a boost, so it may go deeper")
         // Boost side: the cap bites first when there is plenty of headroom.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: 20, incoming: roomy,
                                          incomingTrimDB: 0, config: c) == c.rideMaxDB)
@@ -468,7 +473,7 @@ import Foundation
         let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14)
         let incoming = makeAnalysis(bpm: 120, rmsEnvelope: loudOpening, referenceLoudness: -14)
         let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming)
-        #expect(abs(planned.rideDB - -4) < 1e-6)
+        #expect(planned.rideDB < 0 && abs(planned.rideDB) >= 5.8)
 
         // No analysis at all → gapless → no ride.
         #expect(TransitionPlanner.plan(outgoing: nil, incoming: incoming).rideDB == 0)
@@ -979,11 +984,12 @@ import Foundation
     /// the ledger — so every test here can assert the two agree.
     private func traced(
         outgoing: TrackAnalysis?, incoming: TrackAnalysis?,
-        stems: StemAvailability = .none
+        stems: StemAvailability = .none,
+        config: TransitionPlanner.Config = .standard
     ) -> (planned: PlannedTransition, trace: PlanTrace) {
         var trace: PlanTrace? = PlanTrace()
         let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
-                                             stems: stems, trace: &trace)
+                                             stems: stems, config: config, trace: &trace)
         return (planned, trace!)
     }
 
@@ -1098,11 +1104,17 @@ import Foundation
         // Further out still and the tempo signal demotes the tier first, so
         // the blame moves up the chain rather than down it.
         #expect(blocker(makeAnalysis(bpm: 120), makeAnalysis(bpm: 160)) == "tempoClash")
-        // 100 → 89 is inside the ramped 11.5 % window, but meeting in the
-        // middle bends the slower deck by 6.18 %, past the ±6 % limit. (The
-        // two gates cannot be collapsed into one: the bend is not half the gap
-        // — the deck being sped up pays more than the one being slowed.)
-        #expect(blocker(makeAnalysis(bpm: 100), makeAnalysis(bpm: 89)) == "rateDeviation")
+        // rateDeviation needs the *stepped* regime to be reachable at all: at
+        // the ramped defaults the two caps are consistent, so anything inside
+        // the 11.5 % gap window is inside the 6.5 % bend window too (the worst
+        // case, a maximally slower incoming deck, needs 6.497 %). It is a
+        // safety net there, not a gate — see `rampMaxRateDeviation`. Stepped,
+        // the old lip is still open: 100 → 92 is inside 8 % but bends the
+        // faster deck 4.35 %, past ±4 %.
+        var stepped = TransitionPlanner.Config.standard
+        stepped.tempoRampEnabled = false
+        #expect(traced(outgoing: makeAnalysis(bpm: 100), incoming: makeAnalysis(bpm: 92),
+                       config: stepped).trace.blocker?.id == "rateDeviation")
         // No downbeat to align the incoming track to.
         #expect(blocker(makeAnalysis(bpm: 120),
                         makeAnalysis(bpm: 124, downbeats: [])) == "inPoint")
@@ -1202,7 +1214,7 @@ import Foundation
         #expect(c.neutralTimbreDistance == 0.35)
         #expect(c.clashTimbreDistance == 0.45)
         #expect(c.clashTempoRatio == 0.2)
-        #expect(c.neutralOverlapCap == 6)
+        #expect(c.neutralOverlapCap == 10)
         #expect(c.clashOverlapCap == 2.5)
         #expect(c.keyConfidenceThreshold == 0.5)
         #expect(c.clashKeyDistance == 3)
@@ -1259,7 +1271,10 @@ import Foundation
             Issue.record("expected crossfades")
             return
         }
-        #expect(wide == TransitionPlanner.neutralOverlapCap)
+        // The neutral tier's length is whatever the audio supports up to its
+        // cap (here the incoming intake, 8 s); the clash tier's is the cap.
+        #expect(wide <= TransitionPlanner.neutralOverlapCap)
+        #expect(tight < wide)
         #expect(tight <= strict.clashOverlapCap)
     }
 

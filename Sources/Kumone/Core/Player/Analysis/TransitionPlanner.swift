@@ -54,12 +54,12 @@ enum TransitionPlanner {
         /// (≈ 9 cents/s of pitch) reads as the room breathing rather than as an
         /// event — an order under the ~1 % step that is plainly audible on a
         /// sustained note, and comfortably under a beat-to-beat timing change a
-        /// listener could tap against. At the widened `rampMaxRateDeviation` of
-        /// 6 % that bound sets the lead: 0.06 / 0.005 = 12 s. Smaller bends
+        /// listener could tap against. At the widened `rampMaxRateDeviation`
+        /// that bound sets the lead exactly: 0.065 / 0.005 = 13 s. Smaller bends
         /// glide slower still, since the lead is fixed at the worst case rather
         /// than scaled per pair — being *under* the bound costs nothing, and a
         /// fixed lead is one number to reason about at the seam.
-        var rampLeadSeconds: TimeInterval = 12
+        var rampLeadSeconds: TimeInterval = 13
         /// Seconds over which the incoming deck is let back to 1.0 once it is
         /// the only thing audible.
         ///
@@ -85,12 +85,27 @@ enum TransitionPlanner {
         /// Separate fields rather than new defaults on the old ones so a
         /// listening test can move the gesture and the gate independently, and
         /// so "what did this seam get judged against" is answerable from the
-        /// config alone. 11.5 % apart is the widest gap two decks can close by
-        /// meeting in the middle without either exceeding ±6 %; the pair is
-        /// therefore one decision, not two, and the trace says which of the two
-        /// pairs was in force.
+        /// config alone. 11.5 % apart is roughly the widest gap two decks can
+        /// close by meeting in the middle without either exceeding ~6 %; the
+        /// pair is therefore one decision, not two, and the trace says which of
+        /// the two pairs was in force.
+        ///
+        /// The bend cap is 6.5 rather than 6.0 because the bend is *not* half
+        /// the gap: meeting in the middle costs the deck being sped up more
+        /// than the one being slowed (`(out−f)/2f` against `(f−out)/2out`), so
+        /// a pair inside the gap window can still fail on the faster side by a
+        /// few tenths of a percent. 6.5 % closes that lip — the corpus's one
+        /// near-miss needed 6.48 % — without reaching a bend the glide cannot
+        /// hide.
+        ///
+        /// At these two numbers the pair is exactly consistent and the rate
+        /// gate becomes **unreachable**: the worst case inside an 11.5 % gap is
+        /// a maximally slower incoming deck at `(1−d/2)/(1−d)` = 6.497 %. That
+        /// is deliberate, not an accident to tidy away — `rateDeviation` stays
+        /// as the thing that catches a config where someone has moved one of
+        /// the two and not the other.
         var rampMaxBPMDeltaRatio: Double = 0.115
-        var rampMaxRateDeviation: Double = 0.06
+        var rampMaxRateDeviation: Double = 0.065
 
         /// The BPM-gap cap actually in force, and the rate cap that goes with
         /// it. Read only through this pair, so the two can never disagree
@@ -105,6 +120,23 @@ enum TransitionPlanner {
         /// Deliberately loose: longer 8-bar overlaps are preferred whenever the
         /// energy is anywhere near stable.
         var stableCV: Double = 0.4
+        /// The steadiness bar a window gets when it lies **entirely inside one
+        /// labelled section** of the track it belongs to.
+        ///
+        /// `stableCV` is a proxy, and a crude one: it asks whether the 1 s RMS
+        /// wobbles, because a wobbling window usually means the arrangement
+        /// changes under the blend. But a chorus with a big dynamic shape and a
+        /// verse that drops out for two bars both wobble, and only one of them
+        /// is a place you cannot blend over. The structure layer measures the
+        /// thing the CV was proxying for *directly* — a window inside a single
+        /// section provably does not cross an arrangement change — so where the
+        /// evidence exists, the proxy can be held to a looser bar.
+        ///
+        /// It is a relaxation, never a veto: a window inside one section still
+        /// has to clear 0.5, so a genuinely lurching passage is still refused.
+        /// Tracks with no usable `sections` are judged at `stableCV` exactly as
+        /// they were, which is most of the library.
+        var sectionSteadyCV: Double = 0.5
         /// Hard bounds on any overlap. Between them the length is computed from
         /// the audio: how long the outgoing tail stays steady, and how long the
         /// incoming opening can sit under a fade (see tailCapacity /
@@ -139,7 +171,22 @@ enum TransitionPlanner {
         /// Folded BPM ratio beyond which confident tempos count as clashing.
         var clashTempoRatio: Double = 0.2
         /// Overlap ceilings for the two degraded tiers.
-        var neutralOverlapCap: TimeInterval = 6
+        ///
+        /// The neutral cap was 6 s, and 6 s was a price paid for not trusting
+        /// the cue points. A "quick hand-over" between two songs that are only
+        /// *somewhat* alike is only quick because a longer blend, started
+        /// wherever the energy heuristics happened to point, was as likely to
+        /// land mid-phrase as on one. The structure layer changed that price:
+        /// out points now come from section boundaries and in points from the
+        /// first core section, so a neutral pair's 10 s is 10 s between two
+        /// places that are actually musical edges. The cap still exists — a
+        /// neutral pair does not get the compatible tier's computed length —
+        /// it is just no longer paying for a cue point nobody trusted.
+        ///
+        /// The clash cap is unchanged at 2.5 s. That one is not about cue
+        /// quality: two songs that genuinely fight should have their boundary
+        /// respected, and a better-placed long blend is still a long blend.
+        var neutralOverlapCap: TimeInterval = 10
         var clashOverlapCap: TimeInterval = 2.5
 
         /// Key gate: below this confidence a detected key never influences
@@ -178,12 +225,25 @@ enum TransitionPlanner {
         /// actually hear; see `loudnessGapDB`. Off also means the ride itself
         /// is never applied: both gain stages are the same feature.
         var loudnessCompensation: Bool = true
-        /// How far the transition gain ride may hold the incoming deck off its
-        /// own level during a hand-over, in dB, either direction. 0 turns the
-        /// ride off and puts the loudness gate back on the trim-only residual.
-        /// See `rideDB` for why the ride is one-sided and where the cap comes
-        /// from.
+        /// How far the transition gain ride may **lift** the incoming deck, in
+        /// dB. 0 turns the ride off entirely — both directions — and puts the
+        /// loudness gate back on the trim-only residual. See `rideDB` for why
+        /// the ride is one-sided and where the cap comes from.
         var rideMaxDB: Double = 4
+        /// …and how far it may hold the incoming deck **down**.
+        ///
+        /// Deliberately larger than the boost cap, because the two directions
+        /// are not the same operation. A cut is applied to a deck whose fader
+        /// is still at 0, costs no headroom, adds no artefact, and is released
+        /// while that deck is the only thing playing — the only limit on it is
+        /// that it must not turn a level match into a mix decision. A boost
+        /// pushes a real signal towards its own peak ceiling, which is what
+        /// `boostHeadroomDB` is for, and gains nothing from being deeper.
+        ///
+        /// The tier gate sees the smaller residual automatically, which is the
+        /// point: pairs whose seam is 5–6 dB apart in the direction the ride
+        /// can absorb stop being demoted for a difference the player removes.
+        var rideMaxCutDB: Double = 6
         /// Out-point search window for beat-matched plans: candidates must sit
         /// past `max(duration * tailWindowShare, outLimit - tailWindowSeconds)`.
         var tailWindowSeconds: TimeInterval = 60
@@ -862,15 +922,33 @@ enum TransitionPlanner {
     ///
     /// `trimmedGapDB` is signed the way `rawLoudnessGapDB` is (positive = the
     /// outgoing tail is louder), so adding it to the incoming deck is what
-    /// closes the gap. It is clipped to `±rideMaxDB` — beyond about 4 dB the
-    /// ride stops being a level match and starts being a mix — and a *boost*
-    /// is additionally held to whatever headroom the incoming track's own peak
-    /// leaves after its trim, the same clip guard `LoudnessCompensation` runs.
-    /// Whatever the clips refuse is exactly what the tier gate still sees.
+    /// closes the gap. The two directions are clipped **asymmetrically**,
+    /// because they are not the same operation:
+    ///
+    ///   - A **cut** (`-rideMaxCutDB`, 6 dB) is applied to a deck whose fader
+    ///     is still at 0 when the offset goes on, so there is nothing audible
+    ///     for it to step on; it costs no headroom and introduces no artefact;
+    ///     and it is let go of while that deck is the only thing playing. The
+    ///     only real limit is editorial — far enough down and the ride stops
+    ///     being a level match and starts being a mix decision — which is
+    ///     where 6 dB sits, not where the mechanism gives out.
+    ///   - A **boost** (`+rideMaxDB`, 4 dB) is the direction that costs
+    ///     something. It pushes a real signal towards its own peak ceiling, so
+    ///     it is additionally held to whatever headroom the incoming track's
+    ///     peak leaves after its trim — the same clip guard
+    ///     `LoudnessCompensation` runs — and the old reasoning stands
+    ///     unchanged: past ~4 dB a lift is an arrangement choice.
+    ///
+    /// Whatever the clips refuse is exactly what the tier gate still sees, so
+    /// widening the cut side does not hide anything from the gate; it moves
+    /// real dB out of the residual and lets the gate judge what is left.
     ///
     /// Zero — and so bit-identical to the pre-ride player — when compensation
     /// is off (this is the same gain-compensation family the user's one switch
     /// governs), when `rideMaxDB` is 0, or when the gap is already closed.
+    /// `rideMaxDB` at 0 disables the ride in **both** directions: it is the
+    /// feature's off switch, and a config that could still cut would be a
+    /// surprising reading of "no ride".
     static func rideDB(
         forTrimmedGapDB trimmedGapDB: Double, incoming: TrackAnalysis?,
         incomingTrimDB: Double, config: Config
@@ -878,8 +956,9 @@ enum TransitionPlanner {
         guard config.loudnessCompensation, config.rideMaxDB > 0 else { return 0 }
         guard trimmedGapDB.isFinite else { return 0 }
         if trimmedGapDB < 0 {
-            // Hold the incoming deck down; a cut is always safe.
-            return max(trimmedGapDB, -config.rideMaxDB)
+            // Hold the incoming deck down; a cut is always safe, and gets the
+            // deeper of the two caps.
+            return max(trimmedGapDB, -config.rideMaxCutDB)
         }
         let headroom = LoudnessCompensation.boostHeadroomDB(
             for: incoming, afterTrimDB: incomingTrimDB)
@@ -1347,22 +1426,22 @@ enum TransitionPlanner {
                               inPoint, overlap, incoming.duration))
             else { continue }
             guard note(&trace, .barUpgrade, "bars\(candidate).stableOut",
-                       isStable(outgoing.rmsEnvelope, from: op, length: overlap,
-                                cv: config.stableCV),
+                       isStable(outgoing, outgoing.rmsEnvelope, from: op, length: overlap,
+                                cv: config.stableCV, config: config),
                        energyCV(outgoing.rmsEnvelope, from: op, length: overlap),
-                       config.stableCV,
-                       String(format: "outgoing energy CV %@ against a %.2f steadiness bar",
-                              cvText(outgoing.rmsEnvelope, from: op, length: overlap),
-                              config.stableCV))
+                       steadyBar(outgoing, from: op, length: overlap,
+                                 base: config.stableCV, config: config),
+                       "outgoing " + steadyText(outgoing, from: op, length: overlap,
+                                                base: config.stableCV, config: config))
             else { continue }
             guard note(&trace, .barUpgrade, "bars\(candidate).stableIn",
-                       isStable(incoming.rmsEnvelope, from: inPoint, length: overlap,
-                                cv: config.stableCV),
+                       isStable(incoming, incoming.rmsEnvelope, from: inPoint,
+                                length: overlap, cv: config.stableCV, config: config),
                        energyCV(incoming.rmsEnvelope, from: inPoint, length: overlap),
-                       config.stableCV,
-                       String(format: "incoming energy CV %@ against a %.2f steadiness bar",
-                              cvText(incoming.rmsEnvelope, from: inPoint, length: overlap),
-                              config.stableCV))
+                       steadyBar(incoming, from: inPoint, length: overlap,
+                                 base: config.stableCV, config: config),
+                       "incoming " + steadyText(incoming, from: inPoint, length: overlap,
+                                                base: config.stableCV, config: config))
             else { continue }
             guard note(&trace, .barUpgrade, "bars\(candidate).vocals",
                        !vocalsClash(outgoing: outgoing, outPoint: op,
@@ -1458,15 +1537,47 @@ enum TransitionPlanner {
                     inPoint: inPoint, overlap: overlap, tier: .compatible, config: config)
             else { continue }
             if candidate > 4 {
-                guard isStable(outgoing.rmsEnvelope, from: choice.outPoint, length: overlap,
-                               cv: config.stableCV),
-                      isStable(incoming.rmsEnvelope, from: inPoint, length: overlap,
-                               cv: config.stableCV)
+                guard isStable(outgoing, outgoing.rmsEnvelope, from: choice.outPoint,
+                               length: overlap, cv: config.stableCV, config: config),
+                      isStable(incoming, incoming.rmsEnvelope, from: inPoint,
+                               length: overlap, cv: config.stableCV, config: config)
                 else { continue }
             }
             return (made(bars: candidate, outPoint: choice.outPoint), choice.technique)
         }
         return (plain, nil)
+    }
+
+    /// The steadiness bar that applies to one window of one track: the looser
+    /// `sectionSteadyCV` when the window sits wholly inside a single labelled
+    /// section, `base` otherwise.
+    ///
+    /// Nil `a` — every caller that judges a window with no analysis to hand —
+    /// and every track without usable sections take `base`, so the whole
+    /// section rule is unreachable for them and their decisions are what they
+    /// were before it existed.
+    private static func steadyBar(
+        _ a: TrackAnalysis?, from: TimeInterval, length: TimeInterval,
+        base: Double, config: Config
+    ) -> Double {
+        guard let a, let sections = usableSections(a, config: config) else { return base }
+        // A hair of slack at each end: section bounds are snapped to downbeats
+        // and the window is derived from a bar count, so a window that fills a
+        // section exactly can miss by a rounding error.
+        let inside = sections.contains {
+            from >= $0.start - 0.05 && from + length <= $0.end + 0.05
+        }
+        return inside ? Swift.max(base, config.sectionSteadyCV) : base
+    }
+
+    /// Whether a window is steady, at whichever bar `steadyBar` says applies.
+    /// The trace-facing companion is `steadyText`, which quotes both numbers.
+    private static func isStable(
+        _ a: TrackAnalysis?, _ envelope: [Float], from: TimeInterval,
+        length: TimeInterval, cv: Double, config: Config
+    ) -> Bool {
+        isStable(envelope, from: from, length: length,
+                 cv: steadyBar(a, from: from, length: length, base: cv, config: config))
     }
 
     /// Whether the 1s RMS envelope is steady over [from, from+length).
@@ -1512,6 +1623,21 @@ enum TransitionPlanner {
         v.map { String(format: "%.2f", $0) } ?? "—"
     }
 
+    /// The steadiness comparison in words, naming the bar that actually
+    /// applied and — when it is the looser one — why. Without the "why" a
+    /// reader of the ledger sees two different numbers on two different seams
+    /// and no way to tell which rule they are looking at.
+    private static func steadyText(
+        _ a: TrackAnalysis?, from: TimeInterval, length: TimeInterval,
+        base: Double, config: Config
+    ) -> String {
+        let bar = steadyBar(a, from: from, length: length, base: base, config: config)
+        let envelope = a?.rmsEnvelope ?? []
+        return String(format: "energy CV %@ against a %.2f steadiness bar%@",
+                      cvText(envelope, from: from, length: length), bar,
+                      bar > base ? " (single-section window)" : "")
+    }
+
     /// How many tail seconds of the outgoing track can sit under a fade:
     /// the whole outro when the track fades itself out, otherwise the
     /// longest energy-steady window ending at the tail.
@@ -1523,8 +1649,8 @@ enum TransitionPlanner {
         for len in stride(from: Int(config.maxOverlap), through: 3, by: -1) {
             let start = env.count - len
             guard start >= 0 else { continue }
-            if isStable(env, from: TimeInterval(start), length: TimeInterval(len),
-                        cv: config.tailStableCV) {
+            if isStable(a, env, from: TimeInterval(start), length: TimeInterval(len),
+                        cv: config.tailStableCV, config: config) {
                 return TimeInterval(len)
             }
         }
