@@ -49,6 +49,9 @@ public struct KumoneApp: App {
 
                 Button("随机播放") { player.toggleShuffle() }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
+                Button("AutoMix 顺序") { player.toggleAutoMixOrder() }
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
+                    .disabled(!player.autoMixOrderAvailable)
                 Button("循环模式") { player.cycleRepeatMode() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
 
