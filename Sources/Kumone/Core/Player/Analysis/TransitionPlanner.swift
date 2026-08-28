@@ -30,7 +30,7 @@ enum TransitionPlanner {
         /// Coefficient of variation below which an RMS slice counts as steady.
         /// Deliberately loose: longer 8-bar overlaps are preferred whenever the
         /// energy is anywhere near stable.
-        var stableCV: Double = 0.3
+        var stableCV: Double = 0.4
         /// Hard bounds on any overlap. Between them the length is computed from
         /// the audio: how long the outgoing tail stays steady, and how long the
         /// incoming opening can sit under a fade (see tailCapacity /
@@ -43,7 +43,7 @@ enum TransitionPlanner {
         var tailStableCV: Double = 0.35
 
         /// Loudness gap (dB) between the outgoing tail and the incoming opening.
-        var neutralLoudnessDB: Double = 3.0
+        var neutralLoudnessDB: Double = 4.5
         var clashLoudnessDB: Double = 6.5
         /// Cosine distance between the tracks' timbre fingerprints
         /// (level-removed log-mel shape, so the distance is one minus a shape
@@ -60,7 +60,7 @@ enum TransitionPlanner {
         /// above the neutral line and 1 above the clash line. (The old
         /// fingerprint put all 15 between 0.001 and 0.032: this gate had never
         /// once fired.)
-        var neutralTimbreDistance: Double = 0.25
+        var neutralTimbreDistance: Double = 0.35
         var clashTimbreDistance: Double = 0.45
         /// Folded BPM ratio beyond which confident tempos count as clashing.
         var clashTempoRatio: Double = 0.2
@@ -422,7 +422,7 @@ enum TransitionPlanner {
         guard case .crossfade(let duration, _, _) = plan else { return .plain }
         switch tier {
         case .clash:
-            guard outgoing.bpmConfidence >= config.keyConfidenceThreshold, outgoing.bpm > 0
+            guard outgoing.bpmConfidence >= config.bpmConfidenceThreshold, outgoing.bpm > 0
             else { return .plain }
             // Dotted eighth of the outgoing tempo — the classic echo-out tail.
             let delay = min(max(config.echoBeatFraction * 60 / outgoing.bpm,

@@ -1077,9 +1077,9 @@ import Foundation
         #expect(c.minOverlap == TransitionPlanner.minOverlap)
         #expect(c.maxOverlapShare == TransitionPlanner.maxOverlapShare)
         #expect(c.tailStableCV == TransitionPlanner.tailStableCV)
-        #expect(c.neutralLoudnessDB == 3.0)
+        #expect(c.neutralLoudnessDB == 4.5)
         #expect(c.clashLoudnessDB == 6.5)
-        #expect(c.neutralTimbreDistance == 0.25)
+        #expect(c.neutralTimbreDistance == 0.35)
         #expect(c.clashTimbreDistance == 0.45)
         #expect(c.clashTempoRatio == 0.2)
         #expect(c.neutralOverlapCap == 6)
@@ -1102,7 +1102,7 @@ import Foundation
 
     /// Omitting `config:` must be indistinguishable from passing `.standard`.
     @Test func omittingConfigIsTheStandardConfig() {
-        let outgoing = makeAnalysis(melProfile: Self.profile(distance: 0.3))
+        let outgoing = makeAnalysis(melProfile: Self.profile(distance: 0.4))
         let incoming = makeAnalysis()
         let implicit = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming)
         let explicit = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,

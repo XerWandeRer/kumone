@@ -312,10 +312,12 @@ import Foundation
         #expect(noiseTones > TransitionPlanner.clashTimbreDistance, "noise/tones \(noiseTones)")
         #expect(tonesKicks > TransitionPlanner.clashTimbreDistance, "tones/kicks \(tonesKicks)")
         // Noise against kicks is the near pair — the kick train carries a
-        // noise floor and broadband clicks — but it still clears the neutral
-        // line, where the old fingerprint put every pair below 0.04.
+        // noise floor and broadband clicks. Assert a fixed sanity floor
+        // rather than the tunable neutral line (which was recalibrated to
+        // real-corpus percentiles): the point is that the fingerprint
+        // separates them at all, where the old one put every pair below 0.04.
         let noiseKicks = timbreDistance(noise.melProfile, kicks.melProfile)
-        #expect(noiseKicks > TransitionPlanner.neutralTimbreDistance, "noise/kicks \(noiseKicks)")
+        #expect(noiseKicks > 0.2, "noise/kicks \(noiseKicks)")
         print(String(format: "[timbre] noise/tones %.3f, tones/kicks %.3f, noise/kicks %.3f",
                      noiseTones, tonesKicks, noiseKicks))
     }

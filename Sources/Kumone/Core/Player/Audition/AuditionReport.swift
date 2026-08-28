@@ -928,14 +928,14 @@ extension Audition {
         } else {
             switch d.tier {
             case "clash":
-                reason = d.outgoingBPMConfidence >= c.keyConfidenceThreshold
+                reason = d.outgoingBPMConfidence >= c.bpmConfidenceThreshold
                     && d.outgoingBPM > 0
                     ? String(format: "差异很大，而出曲 %.1f BPM 的拍子数得准，"
                              + "所以让它在拍点上停住，留一串 %.0f 毫秒的回声散场。",
                              d.outgoingBPM, (style.echoDelayTime ?? 0) * 1000)
                     : String(format: "差异很大，但出曲的拍子只有 %.2f 的把握（要 %.2f 以上），"
                              + "回声接不到点上，改成普通淡出。",
-                             d.outgoingBPMConfidence, c.keyConfidenceThreshold)
+                             d.outgoingBPMConfidence, c.bpmConfidenceThreshold)
             case "neutral":
                 reason = d.outgoingAnalysis.outroFadeStart == nil
                     ? "一般般的一对，出曲自己没有淡出结尾，"
