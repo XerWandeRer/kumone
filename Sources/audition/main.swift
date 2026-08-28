@@ -363,6 +363,21 @@ func runRender(_ args: Arguments) {
                 stemLine += "\n    hand-over at +\(f(x.handover, 2))s into the overlap"
                     + " (\(f(x.handoverAbsolute, 2))s in the outgoing track), from \(x.source)"
                     + (x.lyricLine.map { ": “\($0)”" } ?? "")
+                // The other clock, and which side of it the voice landed on —
+                // A/B-ing single- against two-clock is unreadable without it.
+                if let gesture = x.gesture {
+                    stemLine += "\n    \(gesture.rawValue) (\(gesture.chineseLabel)):"
+                        + " floor swaps at +\(f(x.swapOffset, 2))s, voice at"
+                        + " +\(f(x.handover, 2))s (\(f(x.handover - x.swapOffset, 2))s"
+                        + " \(x.handover > x.swapOffset ? "after" : "before") it)"
+                    if let window = x.incomingDuckWindow {
+                        stemLine += "\n    incoming vocal ducked across"
+                            + " (\(f(window.lowerBound, 2))s, \(f(window.upperBound, 2))s]"
+                            + (x.carryShortfallDB < -0.05
+                               ? ", carry loses \(f(-Double(x.carryShortfallDB), 1)) dB at the end"
+                               : ", carried at full level throughout")
+                    }
+                }
             }
         }
         // The hand-over's gain ride, envelope and all — the render carries the
