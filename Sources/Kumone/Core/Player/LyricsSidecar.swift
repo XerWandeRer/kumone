@@ -61,6 +61,13 @@ enum LyricsSidecar {
     /// has never asked for the words (only the *playing* track's lyrics are
     /// loaded). One small JSON call per prefetched track.
     static func fetchAndWrite(trackID: Int, for audio: URL) async {
+        // A sidecar already on disk is this track's words from a previous
+        // session — skip the network round-trip rather than re-fetching the
+        // same body every prefetch. (Lyrics for a published track are as good
+        // as immutable; an edit upstream is picked up whenever the audio is
+        // re-cached.)
+        guard !FileManager.default.fileExists(
+            atPath: Audition.Lyrics.sidecarURL(for: audio).path) else { return }
         guard let response = try? await NeteaseAPI.lyric(id: trackID) else { return }
         write(response.lrc?.lyric, for: audio)
     }
