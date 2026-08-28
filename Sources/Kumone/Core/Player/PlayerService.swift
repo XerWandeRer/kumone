@@ -903,11 +903,17 @@ final class PlayerService: ObservableObject {
                                      outPoint: max(duration - fade, duration * 0.6),
                                      inPoint: 0))
         }
-        // `stems: .none` — the app ships no separator, so the planner stays on
-        // the whole-mix rules. Stem techniques are auditioned offline only
-        // (`audition --stems on`); wiring a provider in here is S3's job.
+        // EXPERIMENTAL daytime-listening build: stem-aware planning plus a
+        // forced 15 s overlap floor, so long blends can be judged in real
+        // playback. The engine approximates stem techniques with a mid-band
+        // duck (TransitionAutomation.stemApproxDuckDB) — real stem audio
+        // arrives with S3's pre-render path. Revert to `stems: .none` with
+        // the plain `plannerConfig` for a shipping build.
+        var cfg = plannerConfig
+        cfg.minOverlap = 15
+        cfg.vocalClashFadeCap = 15
         return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
-                                      stems: .none, config: plannerConfig)
+                                      stems: .ready, config: cfg)
         #endif
     }
 
