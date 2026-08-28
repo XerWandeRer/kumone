@@ -42,6 +42,175 @@ import Foundation
         }
     }
 
+    // MARK: - Dominant-deck law
+
+    /// A long staged beat-matched blend, with the law on and off. 30 s and a
+    /// swap at 15 s is the shape a listener reported the trough in.
+    private var longStaged: TransitionPlan {
+        .beatMatched(BeatMatchedPlan(
+            outPoint: 200, inPoint: 0, overlapBars: 16,
+            outgoingRate: 0.99, incomingRate: 1.02,
+            bassSwapOffset: 15, overlapDuration: 30))
+    }
+
+    private var dominantStyle: TransitionStyle {
+        var s = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+        s.dominantDeck = true
+        return s
+    }
+
+    /// The shape, stated as the rule it exists to enforce: **one deck owns the
+    /// floor at every instant**. Before the swap that is the outgoing deck,
+    /// after it the incoming one, and at no point are both backed off at once.
+    @Test func theDominantDeckOwnsTheFloorThroughout() {
+        let geometry = TransitionAutomation.Geometry(plan: longStaged)
+        let swapAt = geometry.swapOffset
+        for step in 0...300 {
+            let t = 30 * Double(step) / 300
+            let f = frame(longStaged, dominantStyle, t)
+            if t < swapAt - 0.05 {
+                // The outgoing deck is still the dominant one: full level bar
+                // the courtesy dip, which is under a dB.
+                #expect(f.outgoing.fader >= TransitionAutomation.dominantCourtesyLevel - 0.001,
+                        "outgoing dipped to \(f.outgoing.fader) at t=\(t), before the swap")
+                #expect(f.incoming.fader <= 1.0001)
+            }
+            // Somebody is always near full: the trough this law removes was
+            // both decks at 0.707 for seconds at a time.
+            #expect(max(f.outgoing.fader, f.incoming.fader) > 0.82,
+                    "no dominant deck at t=\(t): out \(f.outgoing.fader), in \(f.incoming.fader)")
+        }
+    }
+
+    /// The incoming deck climbs, waits under the outgoing one at the plateau,
+    /// and arrives at unity exactly where the low end changes hands.
+    @Test func theIncomingDeckWaitsAtThePlateauAndArrivesAtTheSwap() {
+        let geometry = TransitionAutomation.Geometry(plan: longStaged)
+        let swapAt = geometry.swapOffset
+        let riseEnd = swapAt * TimeInterval(TransitionAutomation.dominantRiseShare)
+        let plateau = dominantStyle.preSwapPlateau
+
+        #expect(frame(longStaged, dominantStyle, 0).incoming.fader == 0)
+        // At the top of the climb: at the plateau, not past it.
+        let atRise = frame(longStaged, dominantStyle, riseEnd).incoming.fader
+        #expect(abs(atRise - plateau) < 0.01, "plateau not reached at \(riseEnd): \(atRise)")
+        // Waiting: still near the plateau a moment later, not still climbing.
+        let waiting = frame(longStaged, dominantStyle, riseEnd + 0.5).incoming.fader
+        #expect(waiting >= plateau - 0.01 && waiting < plateau + 0.06,
+                "not a plateau at \(riseEnd + 0.5): \(waiting)")
+        // Unity at the swap, where the EQ hands it the low end.
+        #expect(abs(frame(longStaged, dominantStyle, swapAt).incoming.fader - 1) < 0.005)
+        #expect(abs(frame(longStaged, dominantStyle, 30).incoming.fader - 1) < 0.005)
+    }
+
+    /// The outgoing deck leaves *after* the swap, over what is left of the
+    /// overlap, and reaches silence at the end — so every downstream invariant
+    /// that keys off the endpoints still holds.
+    @Test func theOutgoingDeckLeavesOnlyAfterTheSwap() {
+        let geometry = TransitionAutomation.Geometry(plan: longStaged)
+        let swapAt = geometry.swapOffset
+        #expect(abs(frame(longStaged, dominantStyle, 0).outgoing.fader - 1) < 0.001)
+        #expect(abs(frame(longStaged, dominantStyle, swapAt).outgoing.fader
+                    - TransitionAutomation.dominantCourtesyLevel) < 0.005)
+        // Monotonically down after the swap, to zero.
+        var previous = Float.greatestFiniteMagnitude
+        for step in 0...100 {
+            let t = swapAt + (30 - swapAt) * Double(step) / 100
+            let level = frame(longStaged, dominantStyle, t).outgoing.fader
+            #expect(level <= previous + 0.001, "outgoing rose again at t=\(t)")
+            previous = level
+        }
+        #expect(frame(longStaged, dominantStyle, 30).outgoing.fader < 0.001)
+    }
+
+    /// Both curves are continuous — the engine writes them at 50 Hz and a step
+    /// is a click. Checked as a bound on the per-tick move at the two joints
+    /// the law is built from (the top of the climb, and the swap).
+    @Test func theDominantCurvesNeverStep() {
+        let tick = 1.0 / 50
+        var lastOut = frame(longStaged, dominantStyle, 0).outgoing.fader
+        var lastIn = frame(longStaged, dominantStyle, 0).incoming.fader
+        var t = tick
+        while t <= 30 {
+            let f = frame(longStaged, dominantStyle, t)
+            #expect(abs(f.outgoing.fader - lastOut) < 0.02,
+                    "outgoing stepped \(lastOut) → \(f.outgoing.fader) at t=\(t)")
+            #expect(abs(f.incoming.fader - lastIn) < 0.02,
+                    "incoming stepped \(lastIn) → \(f.incoming.fader) at t=\(t)")
+            lastOut = f.outgoing.fader
+            lastIn = f.incoming.fader
+            t += tick
+        }
+    }
+
+    /// The trough, measured: the old law puts the *sum* of the two faders at
+    /// its lowest in the middle of the blend, which is where the listener
+    /// heard the mix collapse. The new law never lets it fall that far.
+    @Test func theNewLawRemovesTheMidBlendTrough() {
+        var symmetric = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+        symmetric.dominantDeck = false
+        let geometry = TransitionAutomation.Geometry(plan: longStaged)
+        let swapAt = geometry.swapOffset
+
+        // Around the swap, where the staged EQ has both decks spectrally
+        // halved, the old law backs both of them off to 0.707.
+        let old = frame(longStaged, symmetric, swapAt)
+        #expect(abs(old.outgoing.fader - 0.7071) < 0.01)
+        #expect(abs(old.incoming.fader - 0.7071) < 0.01)
+        #expect(max(old.outgoing.fader, old.incoming.fader) < 0.72,
+                "the old law really does leave nobody in charge at the swap")
+
+        let new = frame(longStaged, dominantStyle, swapAt)
+        #expect(new.incoming.fader > 0.99, "the new law hands the floor over whole")
+    }
+
+    /// Knob off — and every hand-over that is not a staged beat-match — keeps
+    /// the symmetric curves exactly, to the last bit.
+    @Test func theLawIsOffForEverythingItWasNotAskedFor() {
+        var symmetric = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+        symmetric.dominantDeck = false
+        var stagedCrossfade = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+        stagedCrossfade.dominantDeck = true          // asked for, but not a beat-match
+        var unstaged = TransitionStyle(outroEffect: .fade, stagedEQ: false)
+        unstaged.dominantDeck = true                 // asked for, but not staged
+
+        for step in 0...200 {
+            let t = 30 * Double(step) / 200
+            let progress = Float(min(1, t / 30))
+            let expectedOut = cos(progress * .pi / 2)
+            let expectedIn = sin(progress * .pi / 2)
+
+            // The knob off.
+            let off = frame(longStaged, symmetric, t)
+            #expect(off.outgoing.fader == expectedOut)
+            #expect(off.incoming.fader == expectedIn)
+            // Staged, dominant asked for — but a crossfade, which has no beat
+            // grid and therefore no meaningful swap point to hold up to.
+            let cf = TransitionPlan.crossfade(duration: 30, outPoint: 200, inPoint: 0)
+            let crossfaded = frame(cf, stagedCrossfade, t)
+            #expect(crossfaded.outgoing.fader == expectedOut)
+            #expect(crossfaded.incoming.fader == expectedIn)
+            // Beat-matched, dominant asked for — but not staged, so it is the
+            // legacy single-low-shelf hand-over and keeps its own curves.
+            let legacy = frame(longStaged, unstaged, t)
+            #expect(legacy.outgoing.fader == expectedOut)
+            #expect(legacy.incoming.fader == expectedIn)
+        }
+    }
+
+    /// `.plain` is the regression floor: it never opts in, so its faders are
+    /// bit-identical to what they were before the law existed.
+    @Test func plainStyleFadersAreUntouched() {
+        #expect(TransitionStyle.plain.dominantDeck == false)
+        for step in 0...100 {
+            let t = 8 * Double(step) / 100
+            let f = frame(beatMatched, .plain, t)
+            let progress = Float(min(1, t / 8))
+            #expect(f.outgoing.fader == cos(progress * .pi / 2))
+            #expect(f.incoming.fader == sin(progress * .pi / 2))
+        }
+    }
+
     @Test func equalPowerMidpointIsMinusThreeDB() {
         let f = frame(crossfade, .plain, 2)  // exactly half of a 4s overlap
         #expect(abs(f.outgoing.fader - 0.7071) < 0.001, "outgoing: \(f.outgoing.fader)")

@@ -136,6 +136,16 @@ extension TransitionPlanner.Config {
         field("rampMaxRateDeviation", "beatmatch",
               "开了 tempoRampEnabled 时生效的单曲变速上限（替代 maxRateDeviation）。",
               0, 0.2, 0.002, 3, \.rampMaxRateDeviation),
+        boolField("dominantDeckBlend", "beatmatch",
+                  "开 = 长的对拍叠加里始终只有一首歌“坐镇”：出曲先稳住不动，入曲在它下面（被切掉低频）"
+                      + "先升上来待命，到低频交接那一刻才接过场子，然后出曲才退场。"
+                      + "关 = 两条推子对称交叉（老行为）——那样在 30 秒叠加的正中间两边都只有 −3 dB、"
+                      + "而且各自只占半个频谱，中段会明显变虚，就是“强—弱—强”那个坑。",
+                  \.dominantDeckBlend),
+        field("preSwapPlateau", "beatmatch",
+              "交接之前，入曲先升到多高待命（推子 0–1）。太低 = 新歌还没“立住”就被交了场子，"
+                  + "像剪切；太高 = 顶到出曲头上，两边抢。同时也是余量旋钮：真要削峰就削它。",
+              0.5, 1, 0.01, 2, \.preSwapPlateau),
         field("stableCV", "beatmatch",
               "要叠满 8 或 16 小节，两首歌这段的音量起伏得多平稳。调大 = 更宽松，更容易拿到长叠加。",
               0.05, 1, 0.01, 2, \.stableCV),

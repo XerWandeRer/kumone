@@ -134,7 +134,11 @@ func explain(_ d: Audition.Decision) -> String {
                  + "   trim \(f(d.outgoingTrimDB)) / \(f(d.incomingTrimDB)) dB"
                  + "  (raw gap \(f(d.rawLoudnessGapDB)) dB)")
     lines.append("  gain ride     \(f(d.rideDB)) dB on the incoming deck"
-                 + "   [cap ±\(f(th("rideMaxDB"), 1)),"
+                 // The two caps are not the same number any more, so quoting
+                 // one of them as "±" would misreport whichever direction this
+                 // seam actually took.
+                 + "   [cut cap \(f(-th("rideMaxCutDB"), 1)),"
+                 + " boost cap +\(f(th("rideMaxDB"), 1)),"
                  + " released over \(f(d.rideReleaseSeconds, 1))s]"
                  + "  \(f(d.rawLoudnessGapDB)) → \(f(d.trimmedLoudnessGapDB))"
                  + " → \(f(d.loudnessGapDB)) dB")

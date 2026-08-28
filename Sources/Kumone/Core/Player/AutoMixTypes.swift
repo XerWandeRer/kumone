@@ -118,6 +118,21 @@ struct TransitionStyle: Sendable, Equatable {
     /// knows the outgoing tempo. Nil → the engine derives its own (beat
     /// grid on beat-matched plans, otherwise a fixed 250 ms).
     var echoDelayTime: TimeInterval? = nil
+
+    /// **Dominant-deck fader law** for a staged beat-matched blend: one deck
+    /// owns the floor at every instant, instead of both meeting at −3 dB in
+    /// the middle. Read only when `stagedEQ` is on and the plan is
+    /// `.beatMatched`; see `TransitionAutomation.frame`.
+    ///
+    /// Defaulted **off** on the struct rather than on the planner, so every
+    /// hand-written style — `.plain`, the console's overrides, every fixture
+    /// in the tests — keeps the symmetric curves it has always had, and only a
+    /// plan the planner built with `dominantDeckBlend` on asks for the new law.
+    var dominantDeck: Bool = false
+    /// Where the incoming deck waits under the outgoing one before the swap,
+    /// as a fader level. See `TransitionPlanner.Config.preSwapPlateau` for
+    /// where the number comes from.
+    var preSwapPlateau: Float = 0.85
     /// A technique that needs the outgoing track split into vocal and
     /// accompaniment stems. `nil` — the default, and everything the planner
     /// emits today — means the hand-over works on the whole mix, exactly as

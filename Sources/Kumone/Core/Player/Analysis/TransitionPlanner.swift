@@ -107,6 +107,35 @@ enum TransitionPlanner {
         var rampMaxBPMDeltaRatio: Double = 0.115
         var rampMaxRateDeviation: Double = 0.065
 
+        // --- Dominant-deck blend.
+
+        /// Keep exactly one deck owning the floor across a **staged
+        /// beat-matched** blend, instead of crossing both faders symmetrically.
+        ///
+        /// The symmetric law and the staged EQ were designed separately and
+        /// fight each other over a long overlap: at the swap both decks sit at
+        /// −3 dB *and* each holds only part of the spectrum, so the middle of a
+        /// 30 s blend is audibly weaker than either side of it — the
+        /// strong-weak-strong trough a listener reported. Off restores the
+        /// symmetric curves exactly; nothing else about the hand-over changes
+        /// either way. See `TransitionAutomation.dominantDeckFaders`.
+        var dominantDeckBlend: Bool = true
+        /// Where the incoming deck waits, as a fader level, while it sits under
+        /// the outgoing one before the swap.
+        ///
+        /// High enough that the new track is established and audibly present
+        /// before it is handed the low end — the point of the law — and low
+        /// enough to stay under the outgoing deck, which is still the dominant
+        /// one until the swap. 0.85 is −1.4 dB.
+        ///
+        /// It is also the headroom knob: if the sum ever clipped, this is what
+        /// comes down. Measured on the offline renders of two real seams at the
+        /// shipped trims and ride, the player-path peak across swap ± 2 s is
+        /// −3.37 and −4.23 dBFS — about 2 dB hotter than the symmetric law,
+        /// which is exactly the level it was throwing away — so 0.85 stands
+        /// with three dB to spare. See `TransitionAutomation.dominantDeckFaders`.
+        var preSwapPlateau: Double = 0.85
+
         /// The BPM-gap cap actually in force, and the rate cap that goes with
         /// it. Read only through this pair, so the two can never disagree
         /// about which regime a decision was made under.
@@ -579,6 +608,13 @@ enum TransitionPlanner {
             // runs over it unchanged (see `StemTechniqueLayer`).
             var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
             style.stemTechnique = matched.stem
+            // The one place the dominant-deck law is asked for: a staged
+            // hand-over long enough to have a middle to collapse in. A staged
+            // *crossfade* keeps the symmetric curves — it has no beat grid, so
+            // its swap point is a guess rather than a downbeat, and holding one
+            // deck up to it would be holding it up to nothing in particular.
+            style.dominantDeck = config.dominantDeckBlend
+            style.preSwapPlateau = Float(config.preSwapPlateau)
             return finish(PlannedTransition(plan: .beatMatched(matched.plan), style: style,
                                             rideDB: s.rideDB))
         }
