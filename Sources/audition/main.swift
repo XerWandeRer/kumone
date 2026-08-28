@@ -61,7 +61,8 @@ usage:
                               [--set name=value,...]
   audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
                   [--state DIR]
-  audition sweep  <corpusDir> [-o report.md] [--mode structure|tempo] [--set name=value,...]
+  audition sweep  <corpusDir> [-o report.md] [--mode structure|tempo|gates]
+                  [--set name=value,...]
   audition knobs  [--json]
 
   sweep     plan every adjacent seam inside each `p<N>-…` playlist twice — once
@@ -71,8 +72,12 @@ usage:
             decision) vs on — out/in points, the section each landed in, and
             whether the lyric snap or the climax guard fired.
             --mode tempo: `tempoRampEnabled=0` (the ±8 %/±4 % stepped gate) vs
-            on (±11.5 %/±6 % with the glide) — which seams are newly
+            on (±11.5 %/±6.5 % with the glide) — which seams are newly
             beat-matched, and what each deck bends to get there.
+            --mode gates: the four loosened admission gates (ride cut cap,
+            neutral overlap cap, single-section steadiness bar, ramped bend
+            cap) at their old values vs the shipped ones — which seams changed
+            tier/plan/length, and which single knob is responsible for each.
 
   --style   force one technique, to hear it in isolation
   --stems   on|off (default off) — tell the planner a vocal separator is
@@ -765,6 +770,17 @@ func beatMatchGate(_ d: Audition.Decision, _ id: String) -> PlanGate? {
 /// come back and the plan carries no ramp fields.
 let tempoRampOffOverrides: [String: Double] = ["tempoRampEnabled": 0]
 
+/// The four admission gates that were loosened together, each at the value it
+/// held before. Applied all at once they reproduce the tighter planner; applied
+/// one at a time they are what lets a changed seam be *attributed* to one of
+/// them rather than to "the release".
+let tightGateOverrides: [(knob: String, was: Double, label: String)] = [
+    ("rideMaxCutDB", 4, "ride"),
+    ("neutralOverlapCap", 6, "cap"),
+    ("sectionSteadyCV", 0.4, "CV"),
+    ("rampMaxRateDeviation", 0.06, "rate"),
+]
+
 /// P4's before/after evidence, and the mirror image of the structure sweep
 /// above: the tempo ramp only ever changes *whether* a seam can be beat-matched
 /// at all (a wider gate the glide pays for), so the question is one row per
@@ -859,6 +875,108 @@ func runTempoSweep(_ args: Arguments, pairs: [(playlist: String, a: URL, b: URL)
     emitSweep(document, args)
 }
 
+/// The four-gate counterfactual. `old` is every loosened gate back at its
+/// previous value, `new` is the shipped defaults — and for each seam that
+/// changed, the knobs are re-tightened **one at a time** to find which one was
+/// actually responsible.
+///
+/// Attribution by single-knob revert rather than by reading the trace: several
+/// of these gates feed each other (a deeper ride changes the tier, which
+/// changes the overlap cap that applies, which changes the length the
+/// steadiness bar is asked about), so "which gate's number moved" is not the
+/// same question as "which knob caused this". Reverting one and re-planning
+/// answers the second one directly.
+func runGateSweep(_ args: Arguments, pairs: [(playlist: String, a: URL, b: URL)],
+                  corpus: URL, playlists: Int) {
+    let extra = configOverrides(args)
+    func spec(_ overrides: [String: Double]) -> String {
+        overrides.merging(extra) { a, _ in a }
+            .map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+    }
+    let allTight = Dictionary(uniqueKeysWithValues:
+        tightGateOverrides.map { ($0.knob, $0.was) })
+
+    var rows: [String] = []
+    var changed = 0
+    var byKnob: [String: Int] = [:]
+    var tierChanged = 0, kindChanged = 0
+
+    for (index, pair) in pairs.enumerated() {
+        var oldArgs = args
+        oldArgs.flags["set"] = spec(allTight)
+        let old = decide(oldArgs, a: pair.a, b: pair.b)
+        let new = decide(args, a: pair.a, b: pair.b)
+
+        let movedTier = old.tier != new.tier
+        let movedKind = old.planKind != new.planKind
+        let movedLength = abs(old.overlapDuration - new.overlapDuration) > 0.01
+        guard movedTier || movedKind || movedLength else { continue }
+        changed += 1
+        if movedTier { tierChanged += 1 }
+        if movedKind { kindChanged += 1 }
+
+        // Which single knob, put back, undoes the change?
+        var culprits: [String] = []
+        for gate in tightGateOverrides {
+            var probeArgs = args
+            probeArgs.flags["set"] = spec([gate.knob: gate.was])
+            let probe = decide(probeArgs, a: pair.a, b: pair.b)
+            if probe.tier == old.tier && probe.planKind == old.planKind
+                && abs(probe.overlapDuration - old.overlapDuration) <= 0.01 {
+                culprits.append(gate.label)
+            }
+        }
+        // No single revert reproduces the old decision: the gates combined.
+        let attribution = culprits.isEmpty ? "combined" : culprits.joined(separator: "+")
+        for label in (culprits.isEmpty ? ["combined"] : culprits) {
+            byKnob[label, default: 0] += 1
+        }
+
+        print("[\(index + 1)/\(pairs.count)] \(pair.playlist) · \(old.outgoingName) → "
+              + "\(old.incomingName)  \(old.tier)→\(new.tier)  "
+              + "\(old.planKind)→\(new.planKind)  "
+              + String(format: "%.2f→%.2f s", old.overlapDuration, new.overlapDuration)
+              + "  [\(attribution)]")
+        rows.append("| \(pair.playlist) | \(old.outgoingName) → \(old.incomingName)"
+                    + " | \(old.tier) → \(new.tier)"
+                    + " | \(old.planKind) → \(new.planKind)"
+                    + " | \(f(old.overlapDuration)) → \(f(new.overlapDuration)) s"
+                    + " | \(f(old.rideDB, 1)) → \(f(new.rideDB, 1)) dB"
+                    + " | \(f(old.loudnessGapDB, 1)) → \(f(new.loudnessGapDB, 1)) dB"
+                    + " | **\(attribution)** |")
+    }
+
+    var summary = ["## Admission-gate sweep", "",
+                   "Corpus: `\(corpus.path)` · \(pairs.count) seams across \(playlists) "
+                   + "playlists · generated "
+                   + ISO8601DateFormatter().string(from: Date()),
+                   "",
+                   "`old` = all four gates at their previous values ("
+                   + tightGateOverrides.map { "`\($0.knob)`=\(f($0.was, 3))" }
+                       .joined(separator: ", ")
+                   + ") · `new` = shipped defaults.",
+                   "",
+                   "Attribution is by single-knob revert: a seam is credited to "
+                   + "every knob that, put back on its own, restores the old decision. "
+                   + "`combined` means no single revert does — the gates only move it "
+                   + "together.", ""]
+    summary.append("- seams whose decision changed: \(changed)/\(pairs.count)")
+    summary.append("  - tier changed: \(tierChanged) · plan kind changed: \(kindChanged)")
+    if !byKnob.isEmpty {
+        summary.append("  - attributed to: "
+                       + byKnob.sorted { $0.value > $1.value }
+                           .map { "`\($0.key)` ×\($0.value)" }.joined(separator: ", "))
+    }
+    summary.append("")
+
+    let document = (summary + [
+        "| playlist | pair | tier | plan | overlap | ride | residual gap | knob |",
+        "|---|---|---|---|---|---|---|---|",
+    ] + (rows.isEmpty ? ["| — | *no seam changed* | | | | | | |"] : rows))
+        .joined(separator: "\n") + "\n"
+    emitSweep(document, args)
+}
+
 func emitSweep(_ document: String, _ args: Arguments) {
     if let out = args.flags["output"] {
         let docURL = url(out)
@@ -905,7 +1023,10 @@ func runSweep(_ args: Arguments) {
     case "tempo":
         runTempoSweep(args, pairs: pairs, corpus: corpus, playlists: playlists.count)
         return
-    case let other: fail("unknown --mode '\(other)'; expected structure|tempo")
+    case "gates":
+        runGateSweep(args, pairs: pairs, corpus: corpus, playlists: playlists.count)
+        return
+    case let other: fail("unknown --mode '\(other)'; expected structure|tempo|gates")
     }
 
     let extra = configOverrides(args)
