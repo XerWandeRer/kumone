@@ -204,7 +204,8 @@ extension TransitionPlanner.Config {
                       + "能量跳变打分的老候选退到最后当兜底；关 = 完全回到今天的行为。",
                   \.useStructureOutPoints),
         boolField("useStructureInPoint", "structure",
-                  "开 = 入点取第一个核心段（主歌/副歌）的开始，而不是“第一处不安静的地方”；"
+                  "开 = 入点取第一个核心段（第一个既不是 intro 也不是 outro 的段落）的开始，"
+                      + "而不是“第一处不安静的地方”；"
                       + "清唱开场和慢 build 的电子乐就是靠这一项修好的。关 = 回到 introEnd。",
                   \.useStructureInPoint),
         field("structureConfidenceGate", "structure",

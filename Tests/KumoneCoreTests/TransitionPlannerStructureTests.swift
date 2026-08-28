@@ -140,6 +140,29 @@ import Foundation
             .points.contains(110))
     }
 
+    /// The climax the guard protects is whichever chorus **or drop** starts
+    /// last, so an electronic track whose big moment is labelled `drop` gets the
+    /// same eight bars of anticipation protected as a pop chorus does. (p6 1→2's
+    /// shape in the corpus sweep: a final `drop` at 190 s.)
+    @Test func theClimaxGuardProtectsADropAsWellAsAChorus() {
+        let electronic = [section(.intro, 0, 20), section(.drop, 20, 60, repetition: 3),
+                          section(.verse, 60, 130), section(.bridge, 130, 160),
+                          section(.drop, 160, 190, repetition: 3),
+                          section(.outro, 190, 200)]
+        // 16 bars at 120 BPM = 32 s → the window is [128 s, 160 s).
+        let a = makeAnalysis(phraseBoundaries: [140, 175], sections: electronic)
+        let guarded = TransitionPlanner.outPointCandidates(
+            a, context: .none, config: .standard)
+        #expect(guarded.climaxStart == 160)
+        #expect(guarded.guardWindow?.start == 128)
+        #expect(!guarded.points.contains(140))   // the run-up to the drop
+        #expect(!guarded.points.contains(130))   // …and the bridge boundary in it
+        #expect(guarded.points.contains(175))
+        #expect(!guarded.guardFellBack)
+        // The final drop's end still leads the list — it is the climax finishing.
+        #expect(guarded.points.first == 190)
+    }
+
     /// A transition still has to happen: when the guard would leave the search
     /// with nothing at all, the guard is the thing that gives way.
     @Test func theClimaxGuardStandsDownWhenItWouldEmptyTheList() {
@@ -244,15 +267,54 @@ import Foundation
         #expect((expected ?? 0) < 22)
     }
 
-    /// A mislabelled "first verse" a minute and a half in must not skip that
-    /// much of the song: outside the sanity clamp the planner takes `introEnd`.
-    @Test func aFarAwayFirstCoreSectionFallsBackToIntroEnd() {
-        let mislabelled = [section(.intro, 0, 100), section(.verse, 100, 160),
+    /// The corpus's actual failure mode: the segmenter calls the first sung
+    /// section `bridge` (its catch-all for a cluster that occurs once), and
+    /// "first verse or chorus" then walks past it into the second chorus, fifty
+    /// seconds in. Core is anything that is not the intro and not the outro.
+    @Test func aLeadingBridgeCountsAsCore() {
+        let bridgeFirst = [section(.intro, 0, 18), section(.bridge, 18, 50),
+                           section(.chorus, 50, 80, repetition: 2),
+                           section(.verse, 80, 120), section(.chorus, 120, 160, repetition: 2),
                            section(.outro, 160, 200)]
         let planned = TransitionPlanner.plan(
             outgoing: makeAnalysis(bpm: 100),
-            incoming: makeAnalysis(bpm: 160, sections: mislabelled))
-        #expect(inPoint(of: planned.plan) == 2)   // introEnd, not 100
+            incoming: makeAnalysis(bpm: 160, sections: bridgeFirst))
+        #expect(inPoint(of: planned.plan) == 18)   // not the chorus at 50 s
+    }
+
+    /// …and a leading `drop` is core for the same reason: it is the song, not
+    /// the intro. (Aligning the overlap to it is P4; this is only the anchor.)
+    @Test func aLeadingDropCountsAsCore() {
+        let electronic = [section(.intro, 0, 24), section(.drop, 24, 60, repetition: 3),
+                          section(.verse, 60, 120), section(.drop, 120, 170, repetition: 3),
+                          section(.outro, 170, 200)]
+        let planned = TransitionPlanner.plan(
+            outgoing: makeAnalysis(bpm: 100),
+            incoming: makeAnalysis(bpm: 160, sections: electronic))
+        #expect(inPoint(of: planned.plan) == 24)
+    }
+
+    /// A mislabelled "first core section" past the clamp must not skip that much
+    /// of the song: outside `[introEnd − 2 s, introEnd + 30 s]` the planner takes
+    /// `introEnd`. 40 s is the case the first corpus sweep let through at the old
+    /// 60 s lead.
+    @Test func aFarAwayFirstCoreSectionFallsBackToIntroEnd() {
+        for coreStart in [40.0, 100.0] {
+            let mislabelled = [section(.intro, 0, coreStart),
+                               section(.verse, coreStart, coreStart + 60),
+                               section(.outro, coreStart + 60, 200)]
+            let planned = TransitionPlanner.plan(
+                outgoing: makeAnalysis(bpm: 100),
+                incoming: makeAnalysis(bpm: 160, sections: mislabelled))
+            #expect(inPoint(of: planned.plan) == 2)
+        }
+        // Just inside the clamp it is taken.
+        let honest = [section(.intro, 0, 31), section(.verse, 31, 120),
+                      section(.outro, 120, 200)]
+        let planned = TransitionPlanner.plan(
+            outgoing: makeAnalysis(bpm: 100),
+            incoming: makeAnalysis(bpm: 160, sections: honest))
+        #expect(inPoint(of: planned.plan) == 31)
     }
 
     /// Below the planner's own confidence re-gate the sections are ignored on

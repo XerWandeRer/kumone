@@ -182,9 +182,11 @@ enum TransitionPlanner {
         /// stem) back on the bare boundary list, which is what makes a listening
         /// test able to revert this one behaviour on its own.
         var useStructureOutPoints: Bool = true
-        /// Take the in point from the first *core* section (verse or chorus)
-        /// instead of `introEnd`'s "first second above 25 % of peak". Off
-        /// restores `introEnd` everywhere, `intakeCapacity`'s anchor included.
+        /// Take the in point from the first *core* section — the first one that
+        /// is neither intro- nor outro-kind — instead of `introEnd`'s "first
+        /// second above 25 % of peak". Off restores `introEnd` everywhere,
+        /// `intakeCapacity`'s anchor included. See `inPointChoice` for why core
+        /// is defined by exclusion.
         var useStructureInPoint: Bool = true
         /// Confidence a track's `sections` must carry before the planner will
         /// take points from them.
@@ -219,13 +221,21 @@ enum TransitionPlanner {
         /// bars of anticipation before it that must not be cut.
         var climaxGuardBarsAfter: Int = 0
         /// Sanity clamp on the structural in point, against `introEnd`: a
-        /// mislabelled "first verse" two minutes in must not skip a third of the
-        /// song. The back slack exists because a section boundary snapped to a
-        /// downbeat can legitimately sit a hair before the energy threshold
+        /// mislabelled "first core section" a minute in must not skip a third of
+        /// the song. The back slack exists because a section boundary snapped to
+        /// a downbeat can legitimately sit a hair before the energy threshold
         /// `introEnd` found; outside either bound the planner falls back to
         /// `introEnd` and says so in the trace.
+        ///
+        /// The lead was 60 s in the first corpus sweep and 30 s is defence in
+        /// depth after it: a real intro that `introEnd` misses runs 10–25 s
+        /// (the corpus's longest honest one is 32 s of build), so past 30 s the
+        /// far more likely explanation is a mislabelled section than a very
+        /// patient song — and the cost of being wrong is asymmetric, since a
+        /// wrong fallback loses a slightly better in point while a wrong section
+        /// silently eats a verse.
         var structureInPointSlackSeconds: TimeInterval = 2
-        var structureInPointMaxLeadSeconds: TimeInterval = 60
+        var structureInPointMaxLeadSeconds: TimeInterval = 30
 
         static let standard = Config()
     }
@@ -930,11 +940,24 @@ enum TransitionPlanner {
     }
 
     /// A chorus, or the electronic music equivalent. Both are "the part the
-    /// listener came for", which is what the ordering and the guard below both
-    /// turn on; `drop` gets no other special treatment here (the drop-aligned
-    /// overlap is P4's business).
+    /// listener came for", which is what the candidate ordering and the climax
+    /// guard both turn on — so an electronic track whose climax is labelled
+    /// `drop` is protected exactly as a pop chorus is, and the guard has no
+    /// genre-shaped blind spot. `drop` gets no *other* special treatment here:
+    /// aligning the overlap's end to a drop is P4's business.
     private static func isClimax(_ kind: TrackAnalysis.Section.Kind) -> Bool {
         kind == .chorus || kind == .drop
+    }
+
+    /// The climax the guard protects: whichever chorus-or-drop **starts last**.
+    /// Deliberately by `start` rather than by array position — sections arrive
+    /// in time order today, and a guard window derived from the wrong section
+    /// would silently protect the wrong eight bars if that ever stopped being
+    /// true.
+    private static func finalClimax(
+        _ sections: [TrackAnalysis.Section]
+    ) -> TrackAnalysis.Section? {
+        sections.filter { isClimax($0.kind) }.max { $0.start < $1.start }
     }
 
     /// `a`'s sections, or nil when they are absent or below the planner's own
@@ -1001,7 +1024,8 @@ enum TransitionPlanner {
 
         if let sections {
             let climaxes = sections.filter { isClimax($0.kind) }
-            if let final = climaxes.last {
+                .sorted { $0.start < $1.start }
+            if let final = finalClimax(sections) {
                 result.climaxStart = final.start
                 push(final.end, structural: true)
             }
@@ -1077,8 +1101,9 @@ enum TransitionPlanner {
         let detail: String
     }
 
-    /// In point: the start of the first **core** section — the first verse or
-    /// chorus — instead of `introEnd`'s "first second above 25 % of peak".
+    /// In point: the start of the first **core** section — the first section
+    /// that is neither intro-kind nor outro-kind — instead of `introEnd`'s
+    /// "first second above 25 % of peak".
     ///
     /// The two disagree exactly where `introEnd` is weakest (predev §1.2): an a
     /// cappella opening clears the energy threshold in its first second, and a
@@ -1087,10 +1112,18 @@ enum TransitionPlanner {
     /// Section starts are downbeat-snapped by the segmenter, so the downbeat
     /// mechanics the beat-matched search applies on top are unchanged.
     ///
-    /// Falls back to `introEnd` when there are no usable sections, when nothing
-    /// is labelled verse or chorus (a through-composed or purely instrumental
-    /// track — `drop` is deliberately not core here; that is P4), or when the
-    /// answer lands outside a sanity window around `introEnd`.
+    /// **Core is defined by exclusion, not by a list**, and that is the whole
+    /// lesson of the first corpus sweep. `bridge` is the segmenter's catch-all
+    /// for a cluster that happens once, so a first verse that never repeats
+    /// verbatim — the ordinary case in rap and in through-composed pop — comes
+    /// back labelled `bridge`. Asking for "the first verse or chorus" then
+    /// walked straight past it to the *second* chorus and entered the song
+    /// fifty seconds in. Anything that is not the intro and not the outro is the
+    /// song, whatever the label on it says.
+    ///
+    /// Falls back to `introEnd` when there are no usable sections, when every
+    /// section is intro- or outro-kind, or when the answer lands outside a
+    /// sanity window around `introEnd`.
     static func inPointChoice(_ a: TrackAnalysis, config: Config) -> InPointChoice {
         func introEnd(_ why: String) -> InPointChoice {
             InPointChoice(point: a.introEnd, section: nil,
@@ -1103,8 +1136,8 @@ enum TransitionPlanner {
                             : String(format: "structure confidence %.2f below the %.2f gate",
                                      a.structureConfidence, config.structureConfidenceGate))
         }
-        guard let core = sections.first(where: { $0.kind == .verse || $0.kind == .chorus })
-        else { return introEnd("no verse or chorus section to enter on") }
+        guard let core = sections.first(where: { $0.kind != .intro && $0.kind != .outro })
+        else { return introEnd("every section is an intro or an outro") }
         let low = a.introEnd - config.structureInPointSlackSeconds
         let high = a.introEnd + config.structureInPointMaxLeadSeconds
         guard core.start >= low, core.start <= high else {
