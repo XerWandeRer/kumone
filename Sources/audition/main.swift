@@ -63,7 +63,28 @@ usage:
                   [--state DIR]
   audition sweep  <corpusDir> [-o report.md] [--mode structure|tempo|gates]
                   [--set name=value,...]
+  audition order  <cacheOrCorpusDir> [-o report.md] [--window 4] [--limit N]
+                  [--candidates 6] [--low-dir DIR] [--set ...] [--order-set ...]
   audition knobs  [--json]
+
+  order     run the AutoMix queue-reorder greedy over a directory of locally
+            cached, already analyzed tracks and table what it did to the tier
+            distribution: original order vs `greedy W=<window>` (only the next
+            W listed entries are in the pool) vs `greedy (all cached)` (every
+            remaining track is, which is what a fully cached playlist gives the
+            selector). Offline and read-only — it never analyzes and never hits
+            the network, so a file without an `.analysis.json` sidecar is
+            skipped. Point it straight at ~/Library/Caches/Kumone/Audio.
+            --window      pool size for the windowed schedule (default 4)
+            --limit       use only the first N tracks of each group
+            --candidates  rows per pick in the candidate table (default 6)
+            --low-dir     a directory of low-bitrate copies of the same tracks,
+                          matched by track ID; enables the low-vs-playback tier
+                          agreement check. Without it the check runs on any
+                          track the corpus itself holds at two quality levels,
+                          and is skipped when there are none.
+            --order-set   queue-order weights, e.g. --order-set agingEpsilon=0.5
+                          (`audition knobs` lists them under "queue order")
 
   sweep     plan every adjacent seam inside each `p<N>-…` playlist twice — once
             with a layer off and once with it on — and table what moved. Plans
@@ -291,6 +312,17 @@ func runKnobs(_ args: Arguments) {
             group = field.group
             print("\n[\(group)]")
         }
+        let name = field.name.padding(toLength: max(26, field.name.count + 2),
+                                      withPad: " ", startingAt: 0)
+        print("  \(name)\(f(field.standard, field.digits))"
+              + "   [\(f(field.min, field.digits))…\(f(field.max, field.digits))]")
+        print("      \(field.blurb)")
+    }
+    // The queue-reorder weights are a second config, moved by `--order-set`
+    // rather than `--set`, so they get their own group rather than being
+    // silently mixed into the planner's.
+    print("\n[queue order]  (--order-set)")
+    for field in Audition.queueOrderFields {
         let name = field.name.padding(toLength: max(26, field.name.count + 2),
                                       withPad: " ", startingAt: 0)
         print("  \(name)\(f(field.standard, field.digits))"
@@ -1130,6 +1162,267 @@ func runSweep(_ args: Arguments) {
     emitSweep(document, args)
 }
 
+// MARK: - order
+
+/// Quality levels the app can serve, cheapest first — the same ladder
+/// `AudioQuality` spells, kept here as strings because a cache file name is
+/// the only place the CLI ever meets one.
+let qualityLadder = ["standard", "higher", "exhigh", "lossless", "hires",
+                     "jyeffect", "sky", "jymaster"]
+
+/// `<trackID>-<level>-<source>.<ext>` — the app's cache naming. Nil for a file
+/// that does not follow it (a hand-made corpus), which simply opts that file
+/// out of the low-bitrate comparison.
+func cacheKeyParts(_ url: URL) -> (trackID: String, level: String)? {
+    let stem = url.deletingPathExtension().lastPathComponent
+    let parts = stem.split(separator: "-", maxSplits: 2, omittingEmptySubsequences: false)
+    guard parts.count == 3, !parts[0].isEmpty, parts[0].allSatisfy(\.isNumber) else { return nil }
+    return (String(parts[0]), String(parts[1]))
+}
+
+func levelRank(_ level: String) -> Int {
+    qualityLadder.firstIndex(of: level) ?? qualityLadder.count
+}
+
+/// Audio in a directory that already has a usable analysis sidecar.
+///
+/// `order` is an offline, read-only tool: it never analyzes and never touches
+/// the network, so a file without a sidecar is simply not material. That is
+/// what lets it be pointed straight at the live cache.
+func analyzedCorpus(_ dir: URL) -> [URL] {
+    let audioExtensions: Set<String> = ["flac", "mp3", "m4a", "wav", "aiff", "caf", "aac"]
+    return ((try? FileManager.default.contentsOfDirectory(
+        at: dir, includingPropertiesForKeys: nil)) ?? [])
+        .filter { audioExtensions.contains($0.pathExtension.lowercased()) }
+        .filter { !StemService.isStemSidecar($0) }
+        .filter { Audition.hasCachedAnalysis(for: $0) }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+}
+
+/// Split a corpus into playlists the way `sweep` does (`p<N>-…`), or hand back
+/// one group when the names carry no playlist marker — the live cache does not.
+func orderGroups(_ files: [URL]) -> [(name: String, files: [URL])] {
+    var groups: [String: [URL]] = [:]
+    for file in files {
+        let head = file.lastPathComponent.split(separator: "-").first.map(String.init) ?? ""
+        let isPlaylistMarker = head.count > 1 && head.hasPrefix("p")
+            && head.dropFirst().allSatisfy(\.isNumber)
+        groups[isPlaylistMarker ? head : "all", default: []].append(file)
+    }
+    return groups.keys.sorted().map { ($0, groups[$0]!) }
+}
+
+func tierBar(_ schedule: Audition.OrderSchedule) -> String {
+    guard schedule.pairs > 0 else { return "—" }
+    let counts = schedule.tierCounts
+    return Audition.orderTierLabels.reversed().compactMap { label -> String? in
+        guard let n = counts[label], n > 0 else { return nil }
+        return "\(label) \(n)"
+    }.joined(separator: " · ")
+}
+
+func orderShare(_ part: Int, _ whole: Int) -> Double {
+    whole == 0 ? 0 : 100 * Double(part) / Double(whole)
+}
+
+func runOrder(_ args: Arguments) {
+    guard let dirArg = args.positional.first else { fail(usage) }
+    let corpus = url(dirArg)
+    let all = analyzedCorpus(corpus)
+    guard all.count >= 2 else {
+        fail("need at least two analyzed tracks in \(corpus.path) (found \(all.count)); "
+             + "`order` never analyzes — it reads `.analysis.json` sidecars")
+    }
+
+    // A cache holds several quality levels of the same track. The schedule is
+    // built from the *best* level present per track; the extra copies are the
+    // material for the low-bitrate agreement check further down.
+    var byTrack: [String: [(level: String, url: URL)]] = [:]
+    var unkeyed: [URL] = []
+    for file in all {
+        if let parts = cacheKeyParts(file) {
+            byTrack[parts.trackID, default: []].append((parts.level, file))
+        } else {
+            unkeyed.append(file)
+        }
+    }
+    var playback: [URL] = unkeyed
+    var lowQuality: [String: URL] = [:]
+    for (_, entries) in byTrack {
+        let sorted = entries.sorted { levelRank($0.level) < levelRank($1.level) }
+        let best = sorted.last!.url
+        playback.append(best)
+        if sorted.count > 1 { lowQuality[best.path] = sorted.first!.url }
+    }
+    // An explicit second directory of low-bitrate copies, matched by track ID.
+    if let lowArg = args.flags["low-dir"] {
+        var lowByTrack: [String: URL] = [:]
+        for file in analyzedCorpus(url(lowArg)) {
+            guard let parts = cacheKeyParts(file) else { continue }
+            lowByTrack[parts.trackID] = file
+        }
+        for file in playback {
+            guard let parts = cacheKeyParts(file),
+                  let low = lowByTrack[parts.trackID] else { continue }
+            lowQuality[file.path] = low
+        }
+    }
+    playback.sort { $0.lastPathComponent < $1.lastPathComponent }
+
+    let window = args.double("window").map { Int($0) } ?? 4
+    let limit = args.double("limit").map { Int($0) }
+    let candidateLimit = args.double("candidates").map { Int($0) } ?? 6
+    let extra = configOverrides(args)
+    let orderOverrides = orderConfigOverrides(args)
+
+    var sections: [String] = []
+    var totals: [(label: String, pairs: Int, beatMatched: Int)] = []
+    var rows: [String] = []
+
+    for group in orderGroups(playback) {
+        var files = group.files
+        if let limit, files.count > limit { files = Array(files.prefix(limit)) }
+        guard files.count >= 2 else { continue }
+        print("\n## \(group.name) — \(files.count) analyzed tracks")
+
+        let schedules: [Audition.OrderSchedule]
+        do {
+            schedules = [
+                try Audition.orderBaseline(files: files, config: extra),
+                try Audition.order(files: files, window: window, config: extra,
+                                   orderConfig: orderOverrides, candidateLimit: candidateLimit),
+                try Audition.order(files: files, window: nil, config: extra,
+                                   orderConfig: orderOverrides, candidateLimit: candidateLimit),
+            ]
+        } catch {
+            fail("\(group.name): \(error.localizedDescription)")
+        }
+
+        for schedule in schedules {
+            print("  " + schedule.label.padding(toLength: 22, withPad: " ", startingAt: 0)
+                  + String(format: "  beatMatched %d/%d (%.0f %%)   ",
+                           schedule.beatMatched, schedule.pairs,
+                           orderShare(schedule.beatMatched, schedule.pairs))
+                  + tierBar(schedule))
+            totals.append((schedule.label, schedule.pairs, schedule.beatMatched))
+            rows.append("| \(group.name) | \(schedule.label) | \(schedule.beatMatched)"
+                        + "/\(schedule.pairs) | \(tierBar(schedule)) |")
+        }
+
+        sections.append("### \(group.name)\n")
+        for schedule in schedules {
+            sections.append("**\(schedule.label)** — beatMatched \(schedule.beatMatched)"
+                            + "/\(schedule.pairs) · \(tierBar(schedule))\n")
+            sections.append(schedule.names.enumerated().map { i, name in
+                "\(i + 1). \(name)"
+                    + (i < schedule.tiers.count ? "  →  _\(schedule.tiers[i])_" : "")
+            }.joined(separator: "\n") + "\n")
+        }
+        // The pick table for the schedule that had the whole cache to choose
+        // from — the one whose candidate list is worth reading.
+        if let greedy = schedules.last, !greedy.steps.isEmpty {
+            sections.append("<details><summary>candidate scores (\(greedy.label))</summary>\n")
+            sections.append("| seam | candidate | tier | tempo | key | style | energy "
+                            + "| aging | same artist | total |")
+            sections.append("|---|---|---|---|---|---|---|---|---|---|")
+            for step in greedy.steps {
+                for c in step.candidates {
+                    sections.append("| \(step.position). \(step.from) → | "
+                                    + (c.chosen ? "**\(c.name)**" : c.name)
+                                    + " | \(c.tier) | \(f(c.tempoAffinity)) | \(f(c.keyAffinity))"
+                                    + " | \(f(c.styleAffinity)) | \(f(c.energyContinuity))"
+                                    + " | \(f(c.aging)) | \(f(c.sameArtistPenalty))"
+                                    + " | \(f(c.total)) |")
+                }
+            }
+            sections.append("\n</details>\n")
+        }
+    }
+
+    // Low-bitrate agreement (predev §2.2 and its risk row): only when the
+    // corpus actually holds both levels of the same track. Skipped — loudly —
+    // when it does not; that is a fact about the inputs, not a failure.
+    var agreementLines: [String]
+    if lowQuality.isEmpty {
+        agreementLines = ["Low-bitrate tier agreement: **skipped** — no track in this corpus has "
+                          + "both a low-bitrate and a playback-quality analysis. Point "
+                          + "`--low-dir` at a directory of low-bitrate copies to measure it."]
+        print("\nlow-bitrate tier agreement: skipped (no dual-level tracks in the corpus)")
+    } else {
+        do {
+            let agreement = try Audition.orderTierAgreement(
+                files: playback, lowQuality: lowQuality, config: extra)
+            let share = orderShare(agreement.agreed, agreement.pairs)
+            agreementLines = [String(
+                format: "Low-bitrate tier agreement: **%d/%d** (%.0f %%) of adjacent pairs get "
+                    + "the same tier from the low-bitrate analysis as from the playback file.",
+                agreement.agreed, agreement.pairs, share)]
+            print(String(format: "\nlow-bitrate tier agreement: %d/%d (%.0f %%)",
+                         agreement.agreed, agreement.pairs, share))
+            if !agreement.disagreements.isEmpty {
+                agreementLines.append("")
+                agreementLines += agreement.disagreements.map { "- \($0)" }
+            }
+        } catch {
+            agreementLines = ["Low-bitrate tier agreement: failed — "
+                              + error.localizedDescription]
+        }
+    }
+
+    var summary = ["## Queue order", "",
+                   "Corpus: `\(corpus.path)` · \(playback.count) analyzed tracks · generated "
+                   + ISO8601DateFormatter().string(from: Date()),
+                   "",
+                   "`original order` walks the files as listed (filename order — for a live "
+                   + "cache that is track-ID order, i.e. arbitrary with respect to the music, "
+                   + "which is the point). `greedy W=\(window)` sees only the next \(window) "
+                   + "listed entries at each pick; `greedy (all cached)` sees every remaining "
+                   + "track, which is what a fully cached playlist really offers the selector.",
+                   ""]
+    var byLabel: [String: (pairs: Int, beatMatched: Int)] = [:]
+    var labelOrder: [String] = []
+    for t in totals {
+        if byLabel[t.label] == nil { labelOrder.append(t.label) }
+        byLabel[t.label, default: (0, 0)].pairs += t.pairs
+        byLabel[t.label, default: (0, 0)].beatMatched += t.beatMatched
+    }
+    summary.append("| schedule | beat-matched pairs | share |")
+    summary.append("|---|---|---|")
+    for label in labelOrder {
+        let t = byLabel[label]!
+        summary.append(String(format: "| %@ | %d/%d | %.0f %% |", label, t.beatMatched,
+                              t.pairs, orderShare(t.beatMatched, t.pairs)))
+    }
+    summary.append("")
+    summary += agreementLines
+    summary.append("")
+
+    let document = (summary
+                    + ["| playlist | schedule | beat-matched | tiers |", "|---|---|---|---|"]
+                    + rows + [""] + sections).joined(separator: "\n") + "\n"
+    emitSweep(document, args)
+}
+
+/// `--order-set name=value,…` — the queue-order weights, kept apart from
+/// `--set` so a sweep can move the planner and the scorer independently.
+func orderConfigOverrides(_ args: Arguments) -> [String: Double] {
+    guard let spec = args.flags["order-set"], spec != "true" else { return [:] }
+    let known = Set(Audition.queueOrderFields.map(\.name))
+    var out: [String: Double] = [:]
+    for entry in spec.split(separator: ",") {
+        let kv = entry.split(separator: "=", maxSplits: 1)
+        guard kv.count == 2, let value = Double(kv[1]) else {
+            fail("bad --order-set entry '\(entry)', expected name=value")
+        }
+        let name = String(kv[0])
+        guard known.contains(name) else {
+            fail("unknown queue-order knob '\(name)'; run `audition knobs` for the list")
+        }
+        out[name] = value
+    }
+    return out
+}
+
 // MARK: - Entry
 
 let raw = Array(CommandLine.arguments.dropFirst())
@@ -1142,6 +1435,7 @@ case "render": runRender(args)
 case "batch": runBatch(args)
 case "serve": runServe(args)
 case "sweep": runSweep(args)
+case "order": runOrder(args)
 case "knobs": runKnobs(args)
 case "-h", "--help", "help": print(usage)
 default: fail("unknown command '\(command)'\n\n" + usage)

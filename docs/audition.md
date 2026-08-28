@@ -273,11 +273,46 @@ audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
 audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
                 [--state DIR]
 audition sweep  <corpusDir> [-o report.md] [--set name=value,...]
+audition order  <cacheOrCorpusDir> [-o report.md] [--window 4] [--limit N]
+                [--candidates 6] [--low-dir DIR] [--set ...] [--order-set ...]
 audition knobs  [--json]
 ```
 
 `batch` pairs the corpus directory's audio files in filename order (N files →
 N−1 adjacent hand-overs) unless `--pairs` names them explicitly.
+
+### `order` — what reordering the queue is worth
+
+The acceptance tool for the AutoMix queue-reorder mode
+(`docs/automix-queue-predev.md` §2.5): before deciding whether the mode sounds
+better, decide whether it can even *reach* better transitions. `order` runs the
+selector's own greedy — the same `QueueOrderScorer` the player picks with,
+scoring each candidate by running `TransitionPlanner.plan` on it — over a
+directory of locally cached, already analyzed tracks, and tables three
+schedules:
+
+- **original order** — the files as listed. For the live cache that is track-ID
+  order, i.e. arbitrary with respect to the music, which is the baseline this
+  whole feature is measured against.
+- **greedy W=`--window`** — at each pick, only the next W entries of the
+  remaining list are in the pool. This is the worst case: nothing is cached
+  ahead, so the choice is only ever between the next few.
+- **greedy (all cached)** — every remaining track is in the pool, which is what
+  a playlist whose audio is already on disk really offers the selector.
+
+It is offline and read-only: it never analyzes, never writes and never touches
+the network, so a file without an `.analysis.json` sidecar is simply skipped —
+which is what lets it be pointed straight at `~/Library/Caches/Kumone/Audio`.
+The report carries the full play order per schedule (every track appears in all
+three: losing a round only ages a candidate, it never eliminates one) and a
+per-pick candidate table with the score broken into its terms.
+
+`--low-dir` points at a directory of low-bitrate copies of the same tracks,
+matched by track ID, and turns on the check predev §2.2 asks for: how often the
+tier read off a low-bitrate analysis — which is all the *scorer* ever sees —
+matches the one read off the playback file the *plan* is built on. Without it
+the check runs on any track the corpus itself holds at two quality levels, and
+says so when there are none.
 
 ### `sweep` — what the structure layer moved
 

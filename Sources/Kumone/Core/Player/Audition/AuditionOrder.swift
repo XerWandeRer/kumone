@@ -1,0 +1,281 @@
+import Foundation
+
+// The offline face of the queue-reorder mode (docs/automix-queue-predev.md
+// §2.5): run the greedy schedule over a set of locally cached, already
+// analyzed tracks and report what it did to the tier distribution.
+//
+// This exists so "how much is reordering actually worth" is answered by a
+// number before it is answered by an ear (predev §5.1). It drives
+// `QueueOrderScorer` — the same pure functions `QueueOrderSelector` picks
+// with — through `TransitionPlanner`, so nothing here is a model of the
+// player: it *is* the player's decision, run offline.
+//
+// Public because `Sources/audition` lives outside the module and every
+// internal type (`TrackAnalysis`, `TransitionPlanner`, `QueueOrderScore`) has
+// to be flattened into strings and Doubles to cross that line anyway.
+
+extension Audition {
+
+    /// Tier names worst-to-best, so the console can table them in a fixed
+    /// order without knowing the enum.
+    public static let orderTierLabels: [String] = TransitionTier.allCases
+        .sorted()
+        .map(\.label)
+
+    /// The queue-order weights as a tuning surface, alongside the planner's
+    /// own `configFields` — same shape, so the console and the CLI can render
+    /// both from one loop.
+    public struct QueueOrderField: Sendable {
+        public let name: String
+        public let blurb: String
+        public let min: Double
+        public let max: Double
+        public let step: Double
+        public let digits: Int
+        public let standard: Double
+    }
+
+    public static let queueOrderFields: [QueueOrderField] = QueueOrderConfig.fields.map {
+        QueueOrderField(name: $0.name, blurb: $0.blurb, min: $0.min, max: $0.max,
+                        step: $0.step, digits: $0.digits, standard: $0.read(.standard))
+    }
+
+    /// One candidate as it was scored at one pick.
+    public struct OrderCandidate: Sendable {
+        public let name: String
+        public let tier: String
+        public let tempoAffinity: Double
+        public let keyAffinity: Double
+        public let styleAffinity: Double
+        public let energyContinuity: Double
+        public let aging: Double
+        public let sameArtistPenalty: Double
+        public let total: Double
+        public let lostRounds: Int
+        /// This is the one the greedy took.
+        public let chosen: Bool
+    }
+
+    /// One decision: what was playing, what the pool held, what won.
+    public struct OrderStep: Sendable {
+        /// 1-based position of the seam in the schedule.
+        public let position: Int
+        public let from: String
+        public let to: String
+        public let tier: String
+        public let poolSize: Int
+        /// Best first. Capped by the caller's `candidateLimit`.
+        public let candidates: [OrderCandidate]
+    }
+
+    /// A complete play order plus the tiers of its adjacent pairs.
+    public struct OrderSchedule: Sendable {
+        public let label: String
+        /// Track names in play order.
+        public let names: [String]
+        /// Tier of each adjacent pair; `names.count - 1` entries.
+        public let tiers: [String]
+        /// Empty for a schedule that was not produced by the greedy.
+        public let steps: [OrderStep]
+
+        public var pairs: Int { tiers.count }
+        public var beatMatched: Int {
+            tiers.filter { $0 == TransitionTier.beatMatched.label
+                || $0 == TransitionTier.rampedBeatMatched.label }.count
+        }
+        /// How many pairs landed in each tier, keyed by `orderTierLabels`.
+        public var tierCounts: [String: Int] {
+            tiers.reduce(into: [:]) { $0[$1, default: 0] += 1 }
+        }
+    }
+
+    /// How often the tier read off a **low-bitrate** analysis matches the one
+    /// read off the playback-quality file (predev §2.2 / §4's risk row).
+    ///
+    /// The scoring terms are all shift-invariant, so this should be high; the
+    /// pairs it is *not* high on are the pairs sitting on a gate line, and the
+    /// point of measuring is to know how many of those there are.
+    public struct OrderTierAgreement: Sendable {
+        public let pairs: Int
+        public let agreed: Int
+        /// "A → B: beatMatched (playback) vs crossfade (low)".
+        public let disagreements: [String]
+    }
+
+    // MARK: - Schedules
+
+    /// The tiers of the adjacent pairs in the order the files were given —
+    /// the baseline every reordering is judged against.
+    public static func orderBaseline(
+        files: [URL], config: [String: Double] = [:], label: String = "original order"
+    ) throws -> OrderSchedule {
+        let plannerConfig = TransitionPlanner.Config.standard(overriding: config)
+        var analyses: [TrackAnalysis] = []
+        for file in files { analyses.append(try analysis(of: file)) }
+        var tiers: [String] = []
+        for i in 0..<max(0, files.count - 1) {
+            let planned = planned(analyses[i], analyses[i + 1],
+                                  outgoingURL: files[i], config: plannerConfig)
+            tiers.append(TransitionTier(planned).label)
+        }
+        return OrderSchedule(label: label, names: files.map(displayName),
+                             tiers: tiers, steps: [])
+    }
+
+    /// The sliding-window greedy of predev §2.2, run to the end of the list.
+    ///
+    /// - Parameter window: how many of the remaining queue's *listed* entries
+    ///   are in the pool. `nil` means every remaining track is — which is what
+    ///   a fully cached playlist really gives the selector, since a track with
+    ///   an analysis sidecar on disk joins the pool for free.
+    /// - Parameter artists: `url.path → artist`, for the same-artist penalty.
+    ///   Absent entries simply never trip it.
+    public static func order(
+        files: [URL],
+        window: Int?,
+        config: [String: Double] = [:],
+        orderConfig: [String: Double] = [:],
+        artists: [String: String] = [:],
+        candidateLimit: Int = 6,
+        label: String? = nil
+    ) throws -> OrderSchedule {
+        let plannerConfig = TransitionPlanner.Config.standard(overriding: config)
+        let queueConfig = QueueOrderConfig.standard(overriding: orderConfig)
+        guard files.count >= 2 else {
+            return OrderSchedule(label: label ?? "greedy", names: files.map(displayName),
+                                 tiers: [], steps: [])
+        }
+        var analyses: [String: TrackAnalysis] = [:]
+        for file in files { analyses[file.path] = try analysis(of: file) }
+
+        var current = files[0]
+        var remaining = Array(files.dropFirst())
+        /// How many picks each candidate has been passed over for.
+        var lostRounds: [String: Int] = [:]
+        var names = [displayName(current)]
+        var tiers: [String] = []
+        var steps: [OrderStep] = []
+
+        while !remaining.isEmpty {
+            // Pool: the next `window` listed entries, plus — offline, where
+            // every file on disk is by definition cached and analyzed — the
+            // whole remainder when no window was asked for.
+            let pool = window.map { Array(remaining.prefix(max(1, $0))) } ?? remaining
+            let outgoing = analyses[current.path]
+            let outgoingArtist = artists[current.path]
+            let lineEnds = Lyrics.lineEnds(for: current)
+
+            var scored: [(url: URL, score: QueueOrderScore)] = []
+            for candidate in pool {
+                let incoming = analyses[candidate.path]
+                let planned = TransitionPlanner.plan(
+                    outgoing: outgoing, incoming: incoming, stems: .none,
+                    config: plannerConfig,
+                    context: .init(outgoingLyricLineEnds: lineEnds))
+                let sharesArtist = outgoingArtist != nil
+                    && outgoingArtist == artists[candidate.path]
+                scored.append((candidate, QueueOrderScorer.score(
+                    outgoing: outgoing, incoming: incoming, planned: planned,
+                    lostRounds: lostRounds[candidate.path] ?? 0,
+                    sharesArtist: sharesArtist,
+                    config: queueConfig, plannerConfig: plannerConfig)))
+            }
+            // Ties break on list order, which is the pool's own order — so a
+            // pool where nothing distinguishes the candidates reproduces the
+            // listed sequence exactly.
+            guard let bestIndex = scored.indices.max(by: {
+                scored[$0].score.total < scored[$1].score.total
+            }) else { break }
+            let winner = scored[bestIndex]
+
+            let ranked = scored.enumerated()
+                .sorted { $0.element.score.total > $1.element.score.total }
+                .prefix(candidateLimit)
+                .map { entry in
+                    OrderCandidate(
+                        name: displayName(entry.element.url),
+                        tier: entry.element.score.tier.label,
+                        tempoAffinity: entry.element.score.tempoAffinity,
+                        keyAffinity: entry.element.score.keyAffinity,
+                        styleAffinity: entry.element.score.styleAffinity,
+                        energyContinuity: entry.element.score.energyContinuity,
+                        aging: entry.element.score.aging,
+                        sameArtistPenalty: entry.element.score.sameArtistPenalty,
+                        total: entry.element.score.total,
+                        lostRounds: lostRounds[entry.element.url.path] ?? 0,
+                        chosen: entry.offset == bestIndex)
+                }
+            steps.append(OrderStep(
+                position: steps.count + 1,
+                from: displayName(current), to: displayName(winner.url),
+                tier: winner.score.tier.label,
+                poolSize: pool.count, candidates: Array(ranked)))
+
+            // Everyone else in the pool ages; tracks that were never offered a
+            // seat do not, or a long queue's tail would arrive pre-aged.
+            for entry in scored where entry.url.path != winner.url.path {
+                lostRounds[entry.url.path, default: 0] += 1
+            }
+            lostRounds[winner.url.path] = nil
+
+            names.append(displayName(winner.url))
+            tiers.append(winner.score.tier.label)
+            remaining.removeAll { $0.path == winner.url.path }
+            current = winner.url
+        }
+
+        return OrderSchedule(
+            label: label ?? (window.map { "greedy W=\($0)" } ?? "greedy (all cached)"),
+            names: names, tiers: tiers, steps: steps)
+    }
+
+    // MARK: - Low-bitrate agreement
+
+    /// Plan each adjacent pair of `files` twice — once from the playback-quality
+    /// analyses, once from the low-bitrate ones — and count how often the tier
+    /// came out the same.
+    ///
+    /// - Parameter lowQuality: `playbackURL.path → low-bitrate URL`. A pair
+    ///   with no low-bitrate counterpart on either side is skipped, so a corpus
+    ///   with none at all reports zero pairs rather than failing.
+    public static func orderTierAgreement(
+        files: [URL], lowQuality: [String: URL], config: [String: Double] = [:]
+    ) throws -> OrderTierAgreement {
+        let plannerConfig = TransitionPlanner.Config.standard(overriding: config)
+        var pairs = 0, agreed = 0
+        var disagreements: [String] = []
+        for i in 0..<max(0, files.count - 1) {
+            let a = files[i], b = files[i + 1]
+            guard let lowA = lowQuality[a.path], let lowB = lowQuality[b.path] else { continue }
+            let high = TransitionTier(planned(try analysis(of: a), try analysis(of: b),
+                                              outgoingURL: a, config: plannerConfig))
+            // The low-bitrate side is scored on its own file's lyric sidecar,
+            // exactly as the selector would see it.
+            let low = TransitionTier(planned(try analysis(of: lowA), try analysis(of: lowB),
+                                             outgoingURL: lowA, config: plannerConfig))
+            pairs += 1
+            if high == low {
+                agreed += 1
+            } else {
+                disagreements.append("\(displayName(a)) → \(displayName(b)): "
+                                     + "\(high.label) (playback) vs \(low.label) (low)")
+            }
+        }
+        return OrderTierAgreement(pairs: pairs, agreed: agreed, disagreements: disagreements)
+    }
+
+    // MARK: - Helpers
+
+    private static func planned(
+        _ a: TrackAnalysis, _ b: TrackAnalysis,
+        outgoingURL: URL, config: TransitionPlanner.Config
+    ) -> PlannedTransition {
+        TransitionPlanner.plan(
+            outgoing: a, incoming: b, stems: .none, config: config,
+            context: .init(outgoingLyricLineEnds: Lyrics.lineEnds(for: outgoingURL)))
+    }
+
+    private static func displayName(_ url: URL) -> String {
+        url.deletingPathExtension().lastPathComponent
+    }
+}
