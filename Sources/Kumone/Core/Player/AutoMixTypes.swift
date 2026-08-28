@@ -15,7 +15,32 @@ enum Deck: String, Sendable {
 /// persisted as a sidecar next to the cached audio (spec §4).
 struct TrackAnalysis: Codable, Sendable {
     /// Bump when the algorithm changes; stale sidecars are re-analyzed.
-    static let currentVersion = 6
+    static let currentVersion = 7
+
+    /// One structural span of the track — what a listener would call the intro,
+    /// a verse, the chorus (predev §2.1). Produced by `StructureSegmenter` from
+    /// a beat-synchronous self-similarity matrix; empty whenever the analyzer is
+    /// not confident enough to be worth acting on, so every consumer must have a
+    /// path that works without it.
+    struct Section: Codable, Sendable, Equatable {
+        enum Kind: String, Codable, Sendable {
+            case intro, verse, chorus, bridge, drop, outro
+        }
+
+        /// Snapped to a downbeat (both ends), so a cue taken from a boundary
+        /// lands on the bar line.
+        var start: TimeInterval
+        var end: TimeInterval
+        var kind: Kind
+        /// How many sections share this one's cluster — a chorus repeats, a
+        /// bridge does not. 1 means "this passage happens once".
+        var repetition: Int
+        /// Section-mean RMS over the track's peak RMS.
+        var energy: Float
+        /// Section-mean `vocalActivity` over the whole-track mean; 1 is an
+        /// average-density passage, 0 an instrumental one.
+        var vocalDensity: Float
+    }
 
     let version: Int
     let bpm: Double
@@ -60,6 +85,16 @@ struct TrackAnalysis: Codable, Sendable {
     /// Sample peak of the 22.05 kHz mono analysis signal, in dBFS. Only used to
     /// keep a compensation *boost* from clipping; nil for a silent track.
     var peakDBFS: Double? = nil
+    /// Contiguous structural sections covering the track, in time order (v7).
+    /// **Empty is the normal, expected state** for anything the segmenter is not
+    /// sure about (see `structureConfidence`), for tracks under ~64 beats, and
+    /// for every sidecar written before v7 — consumers fall back to the energy
+    /// heuristics (`phraseBoundaries`, `introEnd`, `outroFadeStart`).
+    var sections: [Section] = []
+    /// 0–1 confidence in `sections`: novelty-peak significance blended with how
+    /// far apart the section clusters ended up. Below the segmenter's own gate
+    /// the sections are dropped entirely and this is what they were dropped for.
+    var structureConfidence: Double = 0
 }
 
 /// Expressive styling for a transition — the technique vocabulary the
