@@ -27,6 +27,68 @@ enum TransitionPlanner {
         var bpmConfidenceThreshold: Double = 0.6
         var maxBPMDeltaRatio: Double = 0.08
         var maxRateDeviation: Double = 0.04
+
+        // --- Tempo ramp.
+        //
+        // A DJ does not *step* a deck onto a matched tempo, they glide into it
+        // and back out of it. The two caps above are what a step costs: past
+        // about ±4 % the move announces itself, so a pair 10 % apart had to be
+        // refused and handed a plain crossfade instead. The glide moves the
+        // audible quantity from "how far the rate jumped" to "how fast the rate
+        // is changing", and that is a number the lead below can buy down.
+        //
+        // The whole block is coupled to `tempoRampEnabled` on purpose: with it
+        // off, the two caps above apply, the plan carries no ramp fields, and
+        // every path downstream — planner, engine, offline render — is what it
+        // was. So a listening test can isolate the gesture from the widening.
+
+        /// Glide into and out of the matched tempo instead of stepping. Off
+        /// also puts `maxBPMDeltaRatio` / `maxRateDeviation` back in charge.
+        var tempoRampEnabled: Bool = true
+        /// Seconds of the outgoing track over which its deck glides onto the
+        /// matched rate, finishing one `TransitionAutomation.segmentHandoff`
+        /// before the out point.
+        ///
+        /// **Where 12 comes from.** What gives a tempo move away is its slope,
+        /// not its size: a steady drift under roughly 0.5 % of rate per second
+        /// (≈ 9 cents/s of pitch) reads as the room breathing rather than as an
+        /// event — an order under the ~1 % step that is plainly audible on a
+        /// sustained note, and comfortably under a beat-to-beat timing change a
+        /// listener could tap against. At the widened `rampMaxRateDeviation` of
+        /// 6 % that bound sets the lead: 0.06 / 0.005 = 12 s. Smaller bends
+        /// glide slower still, since the lead is fixed at the worst case rather
+        /// than scaled per pair — being *under* the bound costs nothing, and a
+        /// fixed lead is one number to reason about at the seam.
+        var rampLeadSeconds: TimeInterval = 12
+        /// Seconds over which the incoming deck is let back to 1.0 once it is
+        /// the only thing audible. The same gesture as `rideDB`'s release, for
+        /// the same reason — nobody should notice it happening — and sized
+        /// like it: 6 % over 8 s is 0.75 %/s, a touch brisker than the glide in
+        /// because there is no second deck left to beat against, so a small
+        /// residual drift has nothing to drift *relative to*.
+        var rampReleaseSeconds: TimeInterval = 8
+        /// The beat-match caps that apply **instead** of `maxBPMDeltaRatio` /
+        /// `maxRateDeviation` while `tempoRampEnabled` is on.
+        ///
+        /// Separate fields rather than new defaults on the old ones so a
+        /// listening test can move the gesture and the gate independently, and
+        /// so "what did this seam get judged against" is answerable from the
+        /// config alone. 11.5 % apart is the widest gap two decks can close by
+        /// meeting in the middle without either exceeding ±6 %; the pair is
+        /// therefore one decision, not two, and the trace says which of the two
+        /// pairs was in force.
+        var rampMaxBPMDeltaRatio: Double = 0.115
+        var rampMaxRateDeviation: Double = 0.06
+
+        /// The BPM-gap cap actually in force, and the rate cap that goes with
+        /// it. Read only through this pair, so the two can never disagree
+        /// about which regime a decision was made under.
+        var beatMatchBPMDeltaCap: Double {
+            tempoRampEnabled ? rampMaxBPMDeltaRatio : maxBPMDeltaRatio
+        }
+        var beatMatchRateCap: Double {
+            tempoRampEnabled ? rampMaxRateDeviation : maxRateDeviation
+        }
         /// Coefficient of variation below which an RMS slice counts as steady.
         /// Deliberately loose: longer 8-bar overlaps are preferred whenever the
         /// energy is anywhere near stable.
@@ -1181,26 +1243,35 @@ enum TransitionPlanner {
             .map { incoming.bpm * $0 }
             .min { abs($0 - outgoing.bpm) < abs($1 - outgoing.bpm) }!
         let bpmDelta = abs(foldedBPM - outgoing.bpm) / outgoing.bpm
-        guard note(&trace, .beatMatch, "bpmDelta", bpmDelta <= config.maxBPMDeltaRatio,
-                   bpmDelta, config.maxBPMDeltaRatio,
+        // Which regime this seam is being judged under — the glide's wider caps
+        // or the step's — said out loud in both gates below, because "why was
+        // this pair beat-matched" and "why was that one not" is otherwise a
+        // question about a config field nobody was looking at.
+        let bpmCap = config.beatMatchBPMDeltaCap
+        let rateCap = config.beatMatchRateCap
+        let regime = config.tempoRampEnabled
+            ? String(format: "ramped (%.1f s glide)", config.rampLeadSeconds)
+            : "stepped"
+        guard note(&trace, .beatMatch, "bpmDelta", bpmDelta <= bpmCap,
+                   bpmDelta, bpmCap,
                    String(format: "%.1f → %.1f BPM (folded %.1f), %.1f %% apart "
-                          + "against a %.1f %% beat-match window",
+                          + "against a %.1f %% beat-match window (%@)",
                           outgoing.bpm, incoming.bpm, foldedBPM,
-                          bpmDelta * 100, config.maxBPMDeltaRatio * 100))
+                          bpmDelta * 100, bpmCap * 100, regime))
         else { return nil }
 
-        // Meet in the middle; each deck bends at most ±4%.
+        // Meet in the middle; how far each deck may bend is the regime's cap.
         let targetBPM = (outgoing.bpm + foldedBPM) / 2
         let outgoingRate = targetBPM / outgoing.bpm
         let incomingRate = targetBPM / foldedBPM
         guard note(&trace, .beatMatch, "rateDeviation",
-                   abs(outgoingRate - 1) <= config.maxRateDeviation + 1e-9
-                       && abs(incomingRate - 1) <= config.maxRateDeviation + 1e-9,
+                   abs(outgoingRate - 1) <= rateCap + 1e-9
+                       && abs(incomingRate - 1) <= rateCap + 1e-9,
                    Swift.max(abs(outgoingRate - 1), abs(incomingRate - 1)),
-                   config.maxRateDeviation,
-                   String(format: "decks bend %.2f %% / %.2f %% against a ±%.1f %% limit",
+                   rateCap,
+                   String(format: "decks bend %.2f %% / %.2f %% against a ±%.1f %% limit (%@)",
                           (outgoingRate - 1) * 100, (incomingRate - 1) * 100,
-                          config.maxRateDeviation * 100))
+                          rateCap * 100, regime))
         else { return nil }
 
         // In point: the downbeat aligned with the incoming track's entry — the
@@ -1344,7 +1415,15 @@ enum TransitionPlanner {
                 outgoingRate: Float(outgoingRate),
                 incomingRate: Float(incomingRate),
                 bassSwapOffset: overlap / 2,
-                overlapDuration: overlap)
+                overlapDuration: overlap,
+                // Carried on the plan rather than looked up from a config by
+                // the engine: the plan is the one thing that survives the
+                // plan → engine → offline-render path and the armed-plan
+                // re-plan comparison, so this is where "was this seam planned
+                // to glide, and how far ahead" has to live. Zero — a plan made
+                // with the knob off — is read everywhere as the old step.
+                rampLeadSeconds: config.tempoRampEnabled ? config.rampLeadSeconds : 0,
+                rampReleaseSeconds: config.tempoRampEnabled ? config.rampReleaseSeconds : 0)
         }
         let plain = made(bars: bars, outPoint: outPoint)
         guard stems == .ready else { return (plain, nil) }

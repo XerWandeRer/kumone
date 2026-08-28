@@ -469,14 +469,30 @@ struct BeatMatchedPlan: Sendable {
     /// First downbeat of the incoming track to align to `outPoint`.
     let inPoint: TimeInterval
     let overlapBars: Int
-    /// Playback-rate nudges (≤ ±4% each) so the grids line up; the incoming
-    /// deck ramps back to 1.0 after the overlap.
+    /// Playback-rate nudges so the grids line up; the incoming deck is let
+    /// back to 1.0 after the overlap. How far each may bend is the planner's
+    /// `maxRateDeviation` (step) or `rampMaxRateDeviation` (glide).
     let outgoingRate: Float
     let incomingRate: Float
     /// Seconds into the overlap where the low end swaps decks.
     let bassSwapOffset: TimeInterval
     /// Total overlap length in seconds at the blended tempo.
     let overlapDuration: TimeInterval
+
+    // --- Tempo ramp (`TransitionPlanner.Config.tempoRampEnabled`). Both are 0
+    // on a plan made with the ramp off, and 0 is what every path reads as "the
+    // old step behaviour" — so a plan built before these fields existed, or by
+    // a config with the knob down, decides and sounds exactly as it did.
+
+    /// Seconds of the **outgoing track's own timeline** over which its deck
+    /// glides 1.0 → `outgoingRate` before the seam. The glide is anchored so
+    /// that it *finishes* one `TransitionAutomation.segmentHandoff` before
+    /// `outPoint`; see `TransitionAutomation.tempoRamp`.
+    var rampLeadSeconds: TimeInterval = 0
+    /// Seconds over which the incoming deck is let back from `incomingRate` to
+    /// 1.0 once it is the only thing audible. 0 → the legacy
+    /// `TransitionAutomation.rateRestoreDuration`.
+    var rampReleaseSeconds: TimeInterval = 0
 }
 
 extension TransitionPlan {

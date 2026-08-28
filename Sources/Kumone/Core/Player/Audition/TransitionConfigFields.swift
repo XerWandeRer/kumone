@@ -109,6 +109,27 @@ extension TransitionPlanner.Config {
         field("maxRateDeviation", "beatmatch",
               "为了对上拍子，每首歌最多允许被拉快/放慢多少。调大 = 更多曲子对得上，但音色开始走味。",
               0, 0.2, 0.002, 3, \.maxRateDeviation),
+        boolField("tempoRampEnabled", "beatmatch",
+                  "开 = 变速不再是“一脚踩上去”，而是提前一段慢慢滑上去、交接完再慢慢滑回来"
+                      + "（真人 DJ 的手法）；此时上面两条线让位给 rampMaxBPMDeltaRatio / "
+                      + "rampMaxRateDeviation 这两条更宽的线。关 = 回到上线前的老行为，"
+                      + "老的两条线重新生效。",
+                  \.tempoRampEnabled),
+        field("rampLeadSeconds", "beatmatch",
+              "提前多少秒开始把出曲的速度滑到对拍速度（滑行在出点前 0.5 秒结束）。"
+                  + "调大 = 变速更慢更听不出来，但出曲更早就已经不是原速了。"
+                  + "默认 12 秒 = 6% 的变速按每秒 0.5% 的可听阈算出来的。",
+              2, 30, 0.5, 1, \.rampLeadSeconds),
+        field("rampReleaseSeconds", "beatmatch",
+              "叠加结束、只剩入曲在响之后，用多少秒把它的速度放回原速。跟音量 ride 的收手是同一种动作。",
+              1, 20, 0.5, 1, \.rampReleaseSeconds),
+        field("rampMaxBPMDeltaRatio", "beatmatch",
+              "开了 tempoRampEnabled 时生效的速度差上限（替代 maxBPMDeltaRatio）。"
+                  + "滑行让更大的变速听不出来，所以这条线可以放宽。",
+              0, 0.5, 0.005, 3, \.rampMaxBPMDeltaRatio),
+        field("rampMaxRateDeviation", "beatmatch",
+              "开了 tempoRampEnabled 时生效的单曲变速上限（替代 maxRateDeviation）。",
+              0, 0.2, 0.002, 3, \.rampMaxRateDeviation),
         field("stableCV", "beatmatch",
               "要叠满 8 或 16 小节，两首歌这段的音量起伏得多平稳。调大 = 更宽松，更容易拿到长叠加。",
               0.05, 1, 0.01, 2, \.stableCV),

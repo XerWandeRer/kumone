@@ -1092,14 +1092,17 @@ import Foundation
         #expect(blocker(makeAnalysis(bpm: 120, confidence: 0.3),
                         makeAnalysis(bpm: 120, confidence: 0.3)) == "bpmConfidence")
         // 120 → 135 is inside the 20 % clash line, so the tier stays
-        // compatible, but 12.5 % is well past the 8 % beat-match window.
+        // compatible, but 12.5 % is past the beat-match window even with the
+        // tempo ramp's widened 11.5 %.
         #expect(blocker(makeAnalysis(bpm: 120), makeAnalysis(bpm: 135)) == "bpmDelta")
         // Further out still and the tempo signal demotes the tier first, so
         // the blame moves up the chain rather than down it.
         #expect(blocker(makeAnalysis(bpm: 120), makeAnalysis(bpm: 160)) == "tempoClash")
-        // 100 → 92 is inside the 8 % window, but meeting in the middle bends
-        // the slower deck by 4.35 %, past the ±4 % limit.
-        #expect(blocker(makeAnalysis(bpm: 100), makeAnalysis(bpm: 92)) == "rateDeviation")
+        // 100 → 89 is inside the ramped 11.5 % window, but meeting in the
+        // middle bends the slower deck by 6.18 %, past the ±6 % limit. (The
+        // two gates cannot be collapsed into one: the bend is not half the gap
+        // — the deck being sped up pays more than the one being slowed.)
+        #expect(blocker(makeAnalysis(bpm: 100), makeAnalysis(bpm: 89)) == "rateDeviation")
         // No downbeat to align the incoming track to.
         #expect(blocker(makeAnalysis(bpm: 120),
                         makeAnalysis(bpm: 124, downbeats: [])) == "inPoint")
@@ -1166,10 +1169,11 @@ import Foundation
             Issue.record("expected a numeric blocker")
             return
         }
-        // 120 → 135 is a 12.5 % gap against an 8 % window.
+        // 120 → 135 is a 12.5 % gap against the window actually in force —
+        // the tempo ramp's 11.5 % at the shipped defaults.
         #expect(margin > 0)
         #expect(abs((blocker.value ?? 0) - 0.125) < 0.001)
-        #expect(blocker.threshold == TransitionPlanner.maxBPMDeltaRatio)
+        #expect(blocker.threshold == TransitionPlanner.Config.standard.beatMatchBPMDeltaCap)
 
         // A confidence gate misses from below, so its margin is negative.
         let shy = traced(outgoing: makeAnalysis(bpm: 120, confidence: 0.3),
@@ -1263,17 +1267,29 @@ import Foundation
     /// gate through — the knob reaches the beat-matching path too.
     @Test func wideningTheBeatMatchWindowAdmitsAPair() {
         let outgoing = makeAnalysis(bpm: 120)
-        let incoming = makeAnalysis(bpm: 132)     // 10 % apart: over the 8 % line
+        // 12 % apart: over the shipped line even with the tempo ramp's
+        // widened 11.5 %.
+        let incoming = makeAnalysis(bpm: 134.4)
         guard case .crossfade = planOnly(outgoing: outgoing, incoming: incoming) else {
-            Issue.record("expected a crossfade at the shipped 8 % window")
+            Issue.record("expected a crossfade at the shipped window")
             return
         }
         var loose = TransitionPlanner.Config.standard
-        loose.maxBPMDeltaRatio = 0.12
-        loose.maxRateDeviation = 0.06
+        loose.rampMaxBPMDeltaRatio = 0.14
+        loose.rampMaxRateDeviation = 0.08
         guard case .beatMatched = TransitionPlanner
                 .plan(outgoing: outgoing, incoming: incoming, config: loose).plan else {
-            Issue.record("expected a beat-match once the window opens to 12 %")
+            Issue.record("expected a beat-match once the window opens to 14 %")
+            return
+        }
+        // …and the same widening applied to the *stepped* caps does nothing
+        // while the ramp is on, which is the coupling stated out loud.
+        var looseStep = TransitionPlanner.Config.standard
+        looseStep.maxBPMDeltaRatio = 0.14
+        looseStep.maxRateDeviation = 0.08
+        guard case .crossfade = TransitionPlanner
+                .plan(outgoing: outgoing, incoming: incoming, config: looseStep).plan else {
+            Issue.record("the stepped caps must be inert while the ramp is on")
             return
         }
     }
