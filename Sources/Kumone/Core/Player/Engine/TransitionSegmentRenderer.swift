@@ -25,7 +25,14 @@ enum TransitionSegmentRenderer {
     /// level for a moment and crossfading between them. Half a second is long
     /// enough to hide the engine's tick granularity and short enough that the
     /// extra material costs nothing to render.
-    static let handoff: TimeInterval = 0.5
+    ///
+    /// **Segments never carry a tempo ramp, by construction.** The head window
+    /// is exactly the outgoing source span `[outPoint − handoff, outPoint]`,
+    /// and `TransitionAutomation.tempoRamp` anchors every glide to *finish* at
+    /// `outPoint − segmentHandoff` — the same instant. So the segment's whole
+    /// pre-roll sits in the flat, fully-bent stretch, is rendered at a constant
+    /// `outgoingRate`, and is byte-identical to what the deck is playing there.
+    static let handoff: TimeInterval = TransitionAutomation.segmentHandoff
 
     /// Longest hand-over worth pre-rendering. Separation is ~1× realtime per
     /// side; an overlap beyond this would not finish inside the lead time the
@@ -88,6 +95,10 @@ enum TransitionSegmentRenderer {
         var options = OfflineTransitionRenderer.Options()
         options.preRoll = handoff
         options.postRoll = handoff
+        // The head window *is* the ramp's flat tail (see `handoff`), so the
+        // renderer must not stretch the pre-roll back over the glide: that
+        // would put audio the deck never plays into the identity crossfade.
+        options.extendPreRollForTempoRamp = false
         options.outgoingTrimDB = request.outgoingTrimDB
         options.incomingTrimDB = request.incomingTrimDB
         options.rideDB = planned.rideDB
@@ -116,7 +127,11 @@ enum TransitionSegmentRenderer {
         return TransitionSegment(
             buffer: buffer, signature: signature, duration: duration,
             outgoingStart: mix.outgoing.first?.source ?? 0,
-            handoffIn: mix.overlapStart, handoffOut: handoff,
+            handoffIn: mix.overlapStart,
+            // The head window on the *song's* clock: the render started the
+            // outgoing deck here and pumped until it reached the out point.
+            handoffInSource: signature.outPoint - (mix.outgoing.first?.source ?? 0),
+            handoffOut: handoff,
             midpointOffset: min(midpoint, duration),
             incomingRideDB: mix.rideDBAtEnd,
             outgoing: mix.outgoing, incoming: mix.incoming)

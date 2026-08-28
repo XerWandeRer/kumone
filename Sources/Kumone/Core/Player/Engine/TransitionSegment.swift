@@ -67,6 +67,17 @@ struct TransitionSegment: @unchecked Sendable {
     /// track exactly as the deck is playing it, so the deck can be crossfaded
     /// out over identical material instead of cut.
     let handoffIn: TimeInterval
+    /// The same head window measured on the **outgoing track's own clock**
+    /// rather than the segment's.
+    ///
+    /// The two are the same number whenever the deck plays that window at rate
+    /// 1 — every plan without a tempo ramp, which is why one field used to do
+    /// both jobs. Under a ramp the deck is already bent to `outgoingRate`
+    /// there, so the same audio is a *shorter* stretch of the song than it is
+    /// of the segment, and `spliceStart` — a position on the song — has to be
+    /// measured in these. Nil, the default, means "the same", which is what
+    /// every unramped segment is.
+    var handoffInSource: TimeInterval? = nil
     /// Tail window: the segment closes with this many seconds of the incoming
     /// track exactly as the deck will play it, for the same reason.
     let handoffOut: TimeInterval
@@ -81,9 +92,13 @@ struct TransitionSegment: @unchecked Sendable {
     let outgoing: [OfflineTransitionRenderer.TimelinePoint]
     let incoming: [OfflineTransitionRenderer.TimelinePoint]
 
+    /// Head window measured on the outgoing song, which is what every position
+    /// comparison against a deck's playhead needs.
+    var headSourceSpan: TimeInterval { handoffInSource ?? handoffIn }
+
     /// Outgoing-track position where the segment takes over from the deck —
     /// one head window before the plan's out point, by construction.
-    var spliceStart: TimeInterval { signature.outPoint - handoffIn }
+    var spliceStart: TimeInterval { signature.outPoint - headSourceSpan }
 
     /// Seconds into the segment where the incoming deck takes over.
     var handoffOutStart: TimeInterval { max(0, duration - handoffOut) }

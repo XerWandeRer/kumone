@@ -48,8 +48,110 @@ enum TransitionAutomation {
     static let echoCutGainDB: Float = -60
     /// How long the tail is allowed to ring after the overlap ends.
     static let echoTailDuration: TimeInterval = 1.4
-    /// How long a beat-matched incoming deck takes to ramp back to rate 1.0.
+    /// How long a beat-matched incoming deck takes to ramp back to rate 1.0
+    /// when the plan carries no `rampReleaseSeconds` of its own.
     static let rateRestoreDuration: TimeInterval = 1.5
+
+    /// How much audio a pre-rendered `TransitionSegment` duplicates at each end
+    /// so the swap between deck and segment can be an identity crossfade.
+    ///
+    /// It lives here, next to the curves, rather than in the renderer that
+    /// spends it, because the *tempo ramp* is defined against it: the glide
+    /// has to be finished this far before the out point, or the deck and the
+    /// (constant-rate) segment head would be playing the same source at two
+    /// different speeds and the identity crossfade would comb-filter instead of
+    /// cancelling. `TransitionSegmentRenderer.handoff` is this number.
+    static let segmentHandoff: TimeInterval = 0.5
+
+    // MARK: - Tempo ramp
+
+    /// The outgoing deck's pre-seam tempo glide, as pure geometry.
+    ///
+    /// **Why it is a function of the outgoing track's source position, not of
+    /// wall time.** Everything that has to agree about this curve — the engine's
+    /// wait tick, the offline renderer's pre-roll, the segment head invariant —
+    /// knows where the outgoing deck is *in its own song*; only one of them
+    /// (the engine) also has a wall clock, and that clock is exactly what the
+    /// glide is bending. Anchoring on source position makes the curve
+    /// pause-proof, seek-proof and tick-jitter-proof for free: a deck that
+    /// resumes at position s resumes at rate r(s), whatever happened in
+    /// between. It also keeps the seam itself exact — the overlap fires when
+    /// the outgoing deck's *source* position reaches `outPoint`, a downbeat in
+    /// its own timeline, which no amount of bending before it can move.
+    ///
+    /// The wall-clock consequence is then a consequence, not an input: with
+    /// ds/dt = r(s) the deck takes ∫ ds/r(s) seconds to cross the ramp, which
+    /// is closed-form for a linear r (see `wallSeconds(from:to:)`).
+    struct TempoRamp: Equatable, Sendable {
+        /// Outgoing source position where the glide leaves 1.0…
+        let start: TimeInterval
+        /// …and where it arrives at `target`, one `segmentHandoff` before the
+        /// out point. From here to the seam the deck is at a constant bent
+        /// rate, which is what a pre-rendered segment's head is rendered at.
+        let end: TimeInterval
+        let target: Float
+
+        var leadSeconds: TimeInterval { end - start }
+
+        /// Rate at outgoing source position `s`.
+        ///
+        /// Linear in the rate, not smoothstepped, and deliberately: what a
+        /// listener detects is the *rate of rate change* (a glide at constant
+        /// slope reads as one steady drift and disappears into the music,
+        /// while a smoothstep's mid-curve slope is 1.5× the mean and its ends
+        /// are flat — the same total bend with a worse worst case). Linear
+        /// also makes the position↔time map closed-form, which is what lets
+        /// the offline renderer land on the out point exactly.
+        func rate(at s: TimeInterval) -> Float {
+            guard end > start else { return s >= end ? target : 1 }
+            let u = Float(Swift.min(1, Swift.max(0, (s - start) / (end - start))))
+            return 1 + (target - 1) * u
+        }
+
+        /// The worst-case slope of the glide, in fraction-of-rate per **wall**
+        /// second — the number the lead is chosen against. |target − 1| / lead,
+        /// times r for the wall/source conversion, which is within 6 % of 1.
+        var slopePerSecond: Double {
+            guard leadSeconds > 0 else { return .infinity }
+            return abs(Double(target) - 1) / leadSeconds
+        }
+
+        /// Wall seconds the outgoing deck spends crossing source `[a, b]`.
+        ///
+        /// ∫ ds / r(s), split into the flat run-in (r = 1), the glide, and the
+        /// flat run-out (r = target). Over the glide r is linear in s, so
+        /// ∫ ds/r = lead · ln(target) / (target − 1).
+        func wallSeconds(from a: TimeInterval, to b: TimeInterval) -> TimeInterval {
+            guard b > a else { return 0 }
+            let t = Double(target)
+            var total = Swift.max(0, Swift.min(b, start) - Swift.min(a, start))
+            let rampA = Swift.min(Swift.max(a, start), end)
+            let rampB = Swift.min(Swift.max(b, start), end)
+            if rampB > rampA, leadSeconds > 0 {
+                // Antiderivative of 1/(1 + (t−1)·(s−start)/lead).
+                let k = (t - 1) / leadSeconds
+                if abs(k) < 1e-12 {
+                    total += rampB - rampA
+                } else {
+                    total += (log(1 + k * (rampB - start)) - log(1 + k * (rampA - start))) / k
+                }
+            }
+            total += Swift.max(0, b - Swift.max(a, end)) / t
+            return total
+        }
+    }
+
+    /// The tempo ramp a plan implies, or nil when it implies none — a plan made
+    /// with `tempoRampEnabled` off, a crossfade, or a beat-match whose outgoing
+    /// deck is not bent at all. Nil is the pre-ramp behaviour everywhere.
+    static func tempoRamp(for plan: TransitionPlan) -> TempoRamp? {
+        guard case .beatMatched(let p) = plan,
+              p.rampLeadSeconds > 0,
+              abs(p.outgoingRate - 1) > 0.0005
+        else { return nil }
+        let end = p.outPoint - segmentHandoff
+        return TempoRamp(start: end - p.rampLeadSeconds, end: end, target: p.outgoingRate)
+    }
 
     /// How fast a transition gain ride (`PlannedTransition.rideDB`) is let go
     /// of once the overlap is over, in dB per second.
@@ -236,13 +338,24 @@ enum TransitionAutomation {
             f.midpointReached = progress >= 0.5
             if case .beatMatched(let p) = plan {
                 f.incoming.rate = p.incomingRate
-                // Ease the outgoing deck onto its matched rate over the first
-                // quarter of the overlap (capped at 1 s).
-                let rampIn = min(1.0, duration * 0.25)
-                if t < rampIn {
-                    f.outgoing.rate = 1 + (p.outgoingRate - 1) * Float(t / rampIn)
-                } else {
+                if p.rampLeadSeconds > 0 {
+                    // The pre-seam glide already landed the deck on its matched
+                    // rate a `segmentHandoff` before the out point, so the whole
+                    // overlap is flat. This is not just tidiness: the in-overlap
+                    // ease below runs the outgoing deck at the *wrong* tempo for
+                    // its first second, which is a beat-phase error of a few
+                    // milliseconds right where the two grids are supposed to be
+                    // locked. The ramp removes it.
                     f.outgoing.rate = p.outgoingRate
+                } else {
+                    // Ease the outgoing deck onto its matched rate over the first
+                    // quarter of the overlap (capped at 1 s).
+                    let rampIn = min(1.0, duration * 0.25)
+                    if t < rampIn {
+                        f.outgoing.rate = 1 + (p.outgoingRate - 1) * Float(t / rampIn)
+                    } else {
+                        f.outgoing.rate = p.outgoingRate
+                    }
                 }
                 f.midpointReached = t >= (style.stagedEQ
                                           ? geometry.swapOffset
@@ -350,11 +463,23 @@ enum TransitionAutomation {
         var isDone: Bool { rateRestoreDone && echoTailDone }
     }
 
+    /// How long the incoming deck's rate release takes. The plan's own
+    /// `rampReleaseSeconds` when it has one — the release is the back half of
+    /// the ramp gesture and is let go of at the same unhurried pace the ride
+    /// is — and the legacy 1.5 s otherwise, which is every plan made with the
+    /// ramp off.
+    static func rateReleaseDuration(_ plan: TransitionPlan) -> TimeInterval {
+        guard case .beatMatched(let p) = plan, p.rampReleaseSeconds > 0 else {
+            return rateRestoreDuration
+        }
+        return p.rampReleaseSeconds
+    }
+
     static func settleFrame(plan: TransitionPlan, restoringRate: Bool,
                             echoTailRinging: Bool, elapsed: TimeInterval) -> SettleFrame {
         var s = SettleFrame()
         if restoringRate, case .beatMatched(let p) = plan {
-            let progress = Float(min(1, elapsed / rateRestoreDuration))
+            let progress = Float(min(1, elapsed / rateReleaseDuration(plan)))
             s.incomingRate = p.incomingRate + (1 - p.incomingRate) * progress
             if progress >= 1 {
                 s.incomingRate = 1

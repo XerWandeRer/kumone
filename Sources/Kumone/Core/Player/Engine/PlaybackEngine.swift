@@ -283,6 +283,21 @@ final class PlaybackEngine: @unchecked Sendable {
         /// settling phase decays.
         var echoTailRinging = false
         var restoringRate = false
+        /// The pre-seam tempo glide has started bending the outgoing deck.
+        /// The one thing a `.waiting` transition ever writes to a deck, and
+        /// therefore the one thing every path that drops a `.waiting` plan has
+        /// to take back — see `endTempoRampLocked`.
+        var rampActive = false
+        /// Outgoing source position the glide actually started from.
+        ///
+        /// Normally within a tick of the plan's `TempoRamp.start`. It is
+        /// captured rather than assumed so that a plan armed *late* — the
+        /// playhead already inside the ramp window, which a seek or a
+        /// just-in-time re-plan can do — glides from wherever it really is
+        /// instead of stepping onto the middle of the curve. Arming later
+        /// simply makes the glide steeper, and arming at the very end makes it
+        /// the step it always used to be.
+        var rampFrom: TimeInterval?
 
         /// Timing landmarks of the plan (overlap length, swap point, echo stop
         /// point); computed once, shared with the offline renderer.
@@ -829,6 +844,10 @@ final class PlaybackEngine: @unchecked Sendable {
     func replaceTransitionPlan(_ planned: PlannedTransition) {
         queue.async {
             guard let tr = self.transition, tr.phase == .waiting else { return }
+            // The new plan carries its own glide (or none); the old one's is
+            // handed back rather than inherited by a state that was not built
+            // for it.
+            self.endTempoRampLocked(tr)
             let resolved = self.resolvePlanLocked(planned, from: self.deckStates[tr.from]!)
             let state = TransitionState(plan: resolved.plan, style: resolved.style,
                                         from: tr.from, to: tr.to)
@@ -1424,6 +1443,12 @@ final class PlaybackEngine: @unchecked Sendable {
             disarmSegmentLocked()
         }
         guard tr.phase == .waiting else { return }
+        // The glide is a function of where the playhead is; the playhead just
+        // moved. Hand the rate back before re-resolving — if the new position
+        // is still inside the ramp window the fresh state re-enters the glide
+        // from there on its next tick, and if it is not, the deck is simply
+        // back at unity where it belongs.
+        endTempoRampLocked(tr)
         let resolved = resolvePlanLocked(
             PlannedTransition(plan: tr.plan, style: tr.style, rideDB: tr.rideDB),
             from: deckStates[deck]!)
@@ -1505,6 +1530,10 @@ final class PlaybackEngine: @unchecked Sendable {
         case .crossfade, .beatMatched:
             guard let outPoint = tr.plan.outPoint else { return }
             let position = livePositionLocked(from)
+            // Before anything else reads the rate: the glide owns it from here
+            // to the seam, and everything below converts source seconds to wall
+            // seconds with it.
+            updateTempoRampLocked(tr, position: position)
             let rate = Double(max(from.timePitch.rate, 0.01))
             if let segment = tr.segment {
                 // A pre-rendered hand-over starts one head window early, and on
@@ -1519,17 +1548,72 @@ final class PlaybackEngine: @unchecked Sendable {
                 // overlap below carry this hand-over.
                 tr.segment = nil
             }
-            adjustWaitTimerLocked(remaining: (outPoint - position) / rate)
-            if position + transitionTimerInterval / 2 >= outPoint {
+            adjustWaitTimerLocked(remaining: (outPoint - position) / rate,
+                                  ramping: tr.rampActive)
+            if position + transitionTimerInterval * rate / 2 >= outPoint {
                 beginOverlapLocked(tr)
             }
         }
     }
 
+    // MARK: - Pre-seam tempo ramp (locked)
+
+    /// Glide the outgoing deck onto its matched rate before the seam.
+    ///
+    /// **Why this cannot move the seam.** The overlap fires on
+    /// `livePositionLocked(from) >= outPoint`, and that position is the
+    /// outgoing deck's *source* time — the player node sits upstream of the
+    /// time-pitch unit, so its sample clock counts source frames pulled, not
+    /// wall time. `outPoint` is a downbeat in the outgoing song's own timeline
+    /// and `inPoint` a downbeat in the incoming one; bending the speed at which
+    /// the deck walks its timeline changes when in the *room* it arrives, never
+    /// where in the *song*. So the incoming downbeat still lands on the
+    /// outgoing downbeat, exactly as it did, and the glide needs no correction
+    /// term at all. `TransitionAutomation.TempoRamp` is a function of the same
+    /// source position for the same reason.
+    ///
+    /// What the ramp *does* fix is a phase error that was already there: the
+    /// deck used to arrive at the seam at rate 1 and ease onto its matched rate
+    /// over the overlap's first second, i.e. play the first bar at the wrong
+    /// tempo. Now it arrives already bent, a `segmentHandoff` early.
+    private func updateTempoRampLocked(_ tr: TransitionState, position: TimeInterval) {
+        guard let ramp = TransitionAutomation.tempoRamp(for: tr.plan) else { return }
+        guard position >= ramp.start else { return }
+        let from = deckStates[tr.from]!
+        // Anchor on first entry, and never past the end — a glide with no room
+        // left is a step, which is exactly what this seam used to be.
+        let anchor = tr.rampFrom ?? Swift.min(position, ramp.end)
+        tr.rampFrom = anchor
+        tr.rampActive = true
+        let bent = TransitionAutomation.TempoRamp(
+            start: anchor, end: ramp.end, target: ramp.target)
+        from.timePitch.rate = bent.rate(at: position)
+    }
+
+    /// Put the outgoing deck back at unity if the glide had started bending it.
+    ///
+    /// A `.waiting` transition touches exactly one parameter of one deck, so
+    /// this is the whole of "undo a pending hand-over". Every path that drops,
+    /// re-resolves or cancels a waiting plan calls it; `beginOverlapLocked`
+    /// does not, because there the overlap automation takes the rate over on
+    /// its very first tick.
+    private func endTempoRampLocked(_ tr: TransitionState) {
+        guard tr.rampActive else { return }
+        tr.rampActive = false
+        tr.rampFrom = nil
+        deckStates[tr.from]?.timePitch.rate = 1
+    }
+
     /// The wait can span minutes; idle at the slow tick and only switch to
     /// the 50 Hz ramp tick for the final approach.
-    private func adjustWaitTimerLocked(remaining: TimeInterval) {
-        startTransitionTimerLocked(interval: remaining > 2 ? slowTickInterval : tickInterval)
+    ///
+    /// A running tempo glide also demands the fast tick, for the whole of its
+    /// lead rather than the last two seconds: at the slow tick a 0.5 %/s glide
+    /// would advance in 0.125 % steps, about 2 cents each, which on a sustained
+    /// note is a staircase rather than a drift. At 50 Hz the step is 0.01 %.
+    private func adjustWaitTimerLocked(remaining: TimeInterval, ramping: Bool = false) {
+        startTransitionTimerLocked(
+            interval: (ramping || remaining <= 2) ? tickInterval : slowTickInterval)
     }
 
     /// Undo an armed gapless hand-over (incoming deck scheduled on the host
@@ -1618,6 +1702,10 @@ final class PlaybackEngine: @unchecked Sendable {
         startNodeIfNeededLocked(to)
         tr.phase = .overlapping
         tr.elapsed = 0
+        // The overlap automation writes the outgoing rate from here on (flat at
+        // `outgoingRate` for a ramped plan, since the glide has already landed
+        // it there), so the ramp has nothing left to hand back.
+        tr.rampActive = false
         startTransitionTimerLocked(interval: tickInterval)
     }
 
@@ -1648,12 +1736,28 @@ final class PlaybackEngine: @unchecked Sendable {
         let sampleRate = graphFormat.sampleRate
         let frame = AVAudioFramePosition(
             ((segment.spliceStart - from.startOffset) * sampleRate).rounded())
+        let now = mach_absolute_time()
         guard frame >= 0, from.player.isPlaying,
               let start = from.player.nodeTime(
                 forPlayerTime: AVAudioTime(sampleTime: frame, atRate: sampleRate)),
               start.isHostTimeValid,
-              start.hostTime > mach_absolute_time()
+              start.hostTime > now
         else { return false }
+
+        // `nodeTime(forPlayerTime:)` extrapolates at the player node's own
+        // sample rate, i.e. it assumes one source frame takes 1/sr of wall
+        // time. A deck the tempo glide has bent is emitting those frames
+        // `1/rate` times slower, so the splice would land up to ~6 % of the arm
+        // lead early. Stretch the interval by the rate rather than trust it.
+        // Exactly the same host time when the deck is at unity — every plan
+        // without a ramp.
+        var startTime = start
+        let deckRate = Double(from.timePitch.rate)
+        if abs(deckRate - 1) > 0.001 {
+            let ahead = AVAudioTime.seconds(forHostTime: start.hostTime &- now)
+            startTime = AVAudioTime(
+                hostTime: now &+ AVAudioTime.hostTime(forSeconds: ahead / deckRate))
+        }
 
         ensureEngineRunningLocked()
         segmentState.generation += 1
@@ -1664,7 +1768,7 @@ final class PlaybackEngine: @unchecked Sendable {
         // second duplicates what the outgoing deck is already playing.
         segmentState.player.volume = 0
         segmentState.faderRequest = 0
-        segmentState.player.play(at: start)
+        segmentState.player.play(at: startTime)
         tr.phase = .segmentArmed
         startTransitionTimerLocked(interval: tickInterval)
         return true
@@ -1684,7 +1788,9 @@ final class PlaybackEngine: @unchecked Sendable {
             return
         }
         let position = livePositionLocked(deckStates[tr.from]!)
-        if position > segment.spliceStart + segment.handoffIn + 0.5 {
+        // `position` is on the outgoing song's clock, so the head window has to
+        // be measured there too (they differ under a tempo ramp).
+        if position > segment.spliceStart + segment.headSourceSpan + 0.5 {
             disarmSegmentLocked()
             tr.segment = nil
         }
@@ -2076,7 +2182,9 @@ final class PlaybackEngine: @unchecked Sendable {
                 finishOverlapLocked(tr)
             } else {
                 // The out point was never reached (plan beyond the file end):
-                // behave like a plain natural finish.
+                // behave like a plain natural finish. The deck is spent, but it
+                // is reused, so the glide comes off it here too.
+                endTempoRampLocked(tr)
                 transition = nil
                 stopTransitionTimerLocked()
                 from.isPlaying = false
@@ -2093,11 +2201,15 @@ final class PlaybackEngine: @unchecked Sendable {
         let to = deckStates[tr.to]!
         switch tr.phase {
         case .waiting:
-            break
+            // Nothing audible has changed decks, but the tempo glide may
+            // already have the outgoing deck off unity: hand it back.
+            endTempoRampLocked(tr)
         case .segmentArmed:
             // Nothing has been handed over yet; take the segment back off the
-            // clock and leave the outgoing deck exactly as it is.
+            // clock and leave the outgoing deck exactly as it is — bar the
+            // tempo glide, which is this transition's doing and goes with it.
             parkSegmentLocked()
+            endTempoRampLocked(tr)
         case .segmentPlaying:
             abortSegmentLocked(tr)
         case .armed, .overlapping:

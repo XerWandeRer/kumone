@@ -65,6 +65,16 @@ enum OfflineTransitionRenderer {
         /// audio the deck can play itself.
         var stretchPostRollForRideRelease = true
 
+        /// Whether the pre-roll is stretched so a plan's **tempo ramp** starts
+        /// inside the render (`TransitionAutomation.tempoRamp`).
+        ///
+        /// True — the default — is what auditioning wants, for the same reason
+        /// as the ride: the glide is the thing being judged, so the file has to
+        /// contain it. `TransitionSegmentRenderer` sets it false, because its
+        /// pre-roll is deliberately the ramp's flat tail and nothing else; see
+        /// `TransitionSegmentRenderer.handoff`.
+        var extendPreRollForTempoRamp = true
+
         /// Loudness the finished file is normalized to before it is written, or
         /// nil to write it at its natural level.
         ///
@@ -254,7 +264,7 @@ enum OfflineTransitionRenderer {
         // How long the post-overlap settling phase runs, if at all.
         var settleDuration: TimeInterval = 0
         if case .beatMatched(let p) = planned.plan, abs(p.incomingRate - 1) > 0.001 {
-            settleDuration = TransitionAutomation.rateRestoreDuration
+            settleDuration = TransitionAutomation.rateReleaseDuration(planned.plan)
         }
         if planned.style.outroEffect == .echoOut, geometry.overlapDuration > 0 {
             settleDuration = max(settleDuration, TransitionAutomation.echoTailDuration)
@@ -388,7 +398,19 @@ enum OfflineTransitionRenderer {
             written += inBuffer.frameLength
             advance(inBuffer.frameLength, outgoingRate: 0, incomingRate: 1)
         } else {
-            let outStart = max(0, (outPoint ?? 0) - options.preRoll)
+            // A plan with a tempo ramp needs the whole glide inside the render,
+            // or the file opens on an outgoing deck already halfway bent —
+            // which is the one thing the audition is there to listen to.
+            let tempoRamp = TransitionAutomation.tempoRamp(for: planned.plan)
+            var preRollRequest = options.preRoll
+            if let tempoRamp, options.extendPreRollForTempoRamp {
+                preRollRequest = max(preRollRequest,
+                                     (outPoint ?? 0) - tempoRamp.start + 1)
+            }
+            let outStart = max(0, (outPoint ?? 0) - preRollRequest)
+            // Pre-roll is measured on the *outgoing song's* clock — the deck
+            // plays from `outStart` until it reaches the out point, however
+            // long the glide makes that take in rendered time.
             let preRoll = (outPoint ?? 0) - outStart
             let inPoint: TimeInterval
             switch planned.plan {
@@ -457,11 +479,40 @@ enum OfflineTransitionRenderer {
             from.schedule(outBuffer)
             from.setFader(1)
             from.player.play()
-            let preRollFrames = AVAudioFrameCount((preRoll * sampleRate).rounded())
-            try pump(preRollFrames)
-            written += preRollFrames
-            advance(preRollFrames, outgoingRate: 1, incomingRate: 0)
-            overlapStart = preRoll
+            if let tempoRamp {
+                // The engine's wait tick, offline: the deck's rate is a
+                // function of where it is in its own song, and the pre-roll
+                // runs until that position reaches the out point. So the
+                // *source* span is fixed at `preRoll` and the rendered span is
+                // whatever ∫ ds/r(s) works out to — longer when the deck is
+                // being slowed down, shorter when it is being sped up. One
+                // copy of the curve, one arrival point, no forked geometry.
+                var pumped: AVAudioFrameCount = 0
+                let target = outPoint ?? 0
+                let tickSeconds = Double(tickFrames) / sampleRate
+                while outgoingSource < target - 1e-9 {
+                    let rate = tempoRamp.rate(at: outgoingSource)
+                    from.timePitch.rate = rate
+                    // Clamp the last chunk so the pre-roll lands *on* the out
+                    // point rather than a tick past it.
+                    let seconds = min(tickSeconds,
+                                      (target - outgoingSource) / Double(rate))
+                    let frames = AVAudioFrameCount(max(1, (seconds * sampleRate).rounded()))
+                    try pump(frames)
+                    written += frames
+                    pumped += frames
+                    advance(frames, outgoingRate: Double(rate), incomingRate: 0)
+                    mark()
+                }
+                from.timePitch.rate = tempoRamp.target
+                overlapStart = Double(pumped) / sampleRate
+            } else {
+                let preRollFrames = AVAudioFrameCount((preRoll * sampleRate).rounded())
+                try pump(preRollFrames)
+                written += preRollFrames
+                advance(preRollFrames, outgoingRate: 1, incomingRate: 0)
+                overlapStart = preRoll
+            }
 
             // --- Overlap: `beginOverlapLocked`'s priming, then the ramps.
             to.schedule(inBuffer)

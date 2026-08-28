@@ -1539,4 +1539,145 @@ struct PlaybackEngineSmokeTests {
             }
         }
     }
+
+    // MARK: - Tempo ramp
+
+    /// A plan carrying a pre-seam tempo glide, end to end on a real graph: the
+    /// outgoing deck sits at unity before the ramp window, drifts across it,
+    /// arrives fully bent, and the incoming deck is let back to unity
+    /// afterwards over the plan's own release rather than the legacy 1.5 s.
+    ///
+    /// The bend here (−10 %) is far past anything the planner would ask for —
+    /// the point is a signal the sampler cannot mistake for jitter, not a
+    /// realistic seam.
+    @Test func aTempoRampedTransitionGlidesInAndCompletes() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome {
+            var beforeRamp: Float?
+            var midRamp: Float?
+            var atSeam: Float?
+            var releasing: Float?
+            var completed = false
+            var deckB: PlaybackEngine.DeckEffectSnapshot?
+        }
+        // Ramp window is [outPoint − handoff − lead, outPoint − handoff]
+        // = [2.7, 4.7] on the outgoing track's own clock.
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.90, incomingRate: 1.05,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 2))
+
+        let result = withWatchdog("tempoRamp", timeout: 45) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            let log = EventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return o }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 2.0)
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+
+            // Still short of the ramp window (position ≈ 2.3).
+            Thread.sleep(forTimeInterval: 0.3)
+            o.beforeRamp = engine.effectSnapshot(of: .a).rate
+            // Inside it (position ≈ 3.2, a quarter of the way across).
+            Thread.sleep(forTimeInterval: 0.9)
+            o.midRamp = engine.effectSnapshot(of: .a).rate
+            // Past its end (position ≈ 4.9), fully bent and holding.
+            _ = pollPosition(engine, deck: .a, past: 4.85, timeout: 6)
+            o.atSeam = engine.effectSnapshot(of: .a).rate
+
+            o.completed = log.wait(timeout: 15) {
+                if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                return false
+            }
+            // Half a second into a 2 s release: on its way back, not home.
+            Thread.sleep(forTimeInterval: 0.5)
+            o.releasing = engine.effectSnapshot(of: .b).rate
+            let deadline = Date().addingTimeInterval(6)
+            while Date() < deadline, engine.hasPendingTransition {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            o.deckB = engine.effectSnapshot(of: .b)
+            return o
+        }
+        guard let o = result, let before = o.beforeRamp, let mid = o.midRamp,
+              let seam = o.atSeam, let releasing = o.releasing else { return }
+
+        #expect(abs(before - 1) < 0.001,
+                "the deck must sit at unity until the ramp window opens (\(before))")
+        #expect(mid < 0.999 && mid > 0.9001,
+                "the deck must be part-way onto its bent rate mid-glide (\(mid))")
+        #expect(mid < before, "the glide must have moved (\(before) → \(mid))")
+        #expect(abs(seam - 0.90) < 0.002,
+                "the glide must have landed before the out point (\(seam))")
+        #expect(o.completed, "a ramped transition must still complete")
+        #expect(releasing > 1.001 && releasing < 1.05,
+                "the incoming rate must be part-way home on a 2 s release (\(releasing))")
+        if let deckB = o.deckB {
+            #expect(deckB.effectsAreNeutral,
+                    "the release must finish and leave the deck neutral (\(deckB))")
+        }
+    }
+
+    /// The glide is the only thing a *waiting* transition writes to a deck, so
+    /// it is the only thing the drop paths have to take back. A seek and a
+    /// cancel, both mid-glide, both leaving the deck at unity: anything less
+    /// and the user's own playback is left detuned by a hand-over that never
+    /// happened.
+    @Test func seekingOrCancellingDuringTheTempoRampPutsTheRateBack() throws {
+        guard audioOutputAvailable else { return }
+        struct Outcome {
+            var midRamp: Float?
+            var afterSeek: Float?
+            var midRampAgain: Float?
+            var afterCancel: Float?
+        }
+        let plan = TransitionPlan.beatMatched(BeatMatchedPlan(
+            outPoint: 5.2, inPoint: 0, overlapBars: 2,
+            outgoingRate: 0.90, incomingRate: 1.05,
+            bassSwapOffset: 1.0, overlapDuration: 2.0,
+            rampLeadSeconds: 2, rampReleaseSeconds: 2))
+
+        let result = withWatchdog("tempoRampRevert", timeout: 45) { () -> Outcome in
+            var o = Outcome()
+            let engine = PlaybackEngine()
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                  (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil else { return o }
+            engine.outputVolume = 0
+
+            engine.play(deck: .a, from: 2.0)
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 1.2)
+            o.midRamp = engine.effectSnapshot(of: .a).rate
+            // Back to the top of the track: nowhere near the ramp window, so
+            // the deck must be plainly at unity again.
+            engine.seek(deck: .a, to: 0.2)
+            Thread.sleep(forTimeInterval: 0.4)
+            o.afterSeek = engine.effectSnapshot(of: .a).rate
+
+            // Same again, ended with a cancel instead.
+            engine.play(deck: .a, from: 2.0)
+            engine.scheduleTransition(.plain(plan), from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 1.2)
+            o.midRampAgain = engine.effectSnapshot(of: .a).rate
+            engine.cancelScheduledTransition()
+            Thread.sleep(forTimeInterval: 0.3)
+            o.afterCancel = engine.effectSnapshot(of: .a).rate
+            return o
+        }
+        guard let o = result, let mid = o.midRamp, let afterSeek = o.afterSeek,
+              let midAgain = o.midRampAgain, let afterCancel = o.afterCancel else { return }
+
+        #expect(mid < 0.999, "the glide must have been running before the seek (\(mid))")
+        #expect(abs(afterSeek - 1) < 0.001,
+                "a seek out of the ramp window must hand the rate back (\(afterSeek))")
+        #expect(midAgain < 0.999,
+                "the glide must have been running before the cancel (\(midAgain))")
+        #expect(abs(afterCancel - 1) < 0.001,
+                "a cancelled hand-over must not leave the deck detuned (\(afterCancel))")
+    }
 }
