@@ -16,6 +16,10 @@ actor AudioCache {
     private static let defaultLimitBytes: Int64 = 2_147_483_648  // 2 GB
     private static let partSuffix = ".part"
     private static let sidecarSuffix = ".analysis.json"
+    /// Timed lyrics, written by `LyricsSidecar` for the hand-over picker. Unlike
+    /// the analysis sidecar this one *replaces* the audio extension (the `.lrc`
+    /// convention `Audition.Lyrics` reads), so it needs its own path math.
+    private static let lyricsExtension = "lrc"
 
     private let directory: URL
     private var inflight: [Key: Task<URL, Error>] = [:]
@@ -192,13 +196,19 @@ actor AudioCache {
 
         let sidecarSizes = Dictionary(
             uniqueKeysWithValues: files
-                .filter { $0.url.lastPathComponent.hasSuffix(Self.sidecarSuffix) }
+                .filter {
+                    $0.url.lastPathComponent.hasSuffix(Self.sidecarSuffix)
+                        || $0.url.pathExtension == Self.lyricsExtension
+                }
                 .map { ($0.url.path, $0.size) })
         let candidates = files
             .filter {
                 let name = $0.url.lastPathComponent
                 return !name.hasSuffix(Self.partSuffix)
                     && !name.hasSuffix(Self.sidecarSuffix)
+                    // A `.lrc` is not audio; evicting it on its own would strip
+                    // a live track of its hand-over words to reclaim a few KB.
+                    && $0.url.pathExtension != Self.lyricsExtension
                     && $0.url.path != spare?.path
             }
             .sorted { $0.modified < $1.modified }
@@ -207,10 +217,15 @@ actor AudioCache {
             guard usage > limitBytes else { break }
             try? FileManager.default.removeItem(at: entry.url)
             usage -= entry.size
-            let sidecarPath = entry.url.path + Self.sidecarSuffix
-            if let sidecarSize = sidecarSizes[sidecarPath] {
-                try? FileManager.default.removeItem(atPath: sidecarPath)
-                usage -= sidecarSize
+            // Both sidecars follow the audio out; a lyrics file left behind
+            // would otherwise outlive every track that ever passed through.
+            for sidecarPath in [entry.url.path + Self.sidecarSuffix,
+                                entry.url.deletingPathExtension()
+                                    .appendingPathExtension(Self.lyricsExtension).path] {
+                if let sidecarSize = sidecarSizes[sidecarPath] {
+                    try? FileManager.default.removeItem(atPath: sidecarPath)
+                    usage -= sidecarSize
+                }
             }
         }
     }

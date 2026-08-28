@@ -196,6 +196,10 @@ final class PlayerService: ObservableObject {
     /// Beat/energy analysis of the track now playing, once its full file is
     /// on disk. Feeds the outgoing side of TransitionPlanner.
     private var currentAnalysis: TrackAnalysis?
+    /// Raw LRC body of the track now playing, kept only so the `.lrc` sidecar
+    /// can be written whenever the local file lands — the words and the file
+    /// arrive in either order (streamed first play, cache hit, hand-over).
+    private var currentLyricLRC: String?
     private var consecutiveFailures = 0
     private var scrobbled = false
 
@@ -591,6 +595,7 @@ final class PlayerService: ObservableObject {
         unblockSource = nil
         isTrial = false
         lyrics = nil
+        currentLyricLRC = nil
         scrobbled = false
         isPlaying = true
         resolveGeneration += 1
@@ -712,6 +717,7 @@ final class PlayerService: ObservableObject {
                    at: local, on: activeDeck, trimDB: loudnessTrimDB(for: cachedAnalysis)) {
                 hasLocalFile = true
                 currentLocalURL = local
+                persistCurrentLyricsSidecar()
                 engine.play(deck: activeDeck, from: 0)
                 isPlaying = true
                 duration = fileDuration
@@ -765,6 +771,9 @@ final class PlayerService: ObservableObject {
                 guard let final = try? await AudioCache.shared.commitPartFile(for: key),
                       let self, generation == self.resolveGeneration else { return }
                 self.ensureCurrentAnalysis(key: key, fileURL: final)
+                // The progressive mirror just became a complete file: the words
+                // fetched at the start of the song now have something to sit by.
+                self.persistCurrentLyricsSidecar(audio: final)
                 // The prefetch pipeline may have deferred while this track
                 // was still streaming (same-track repeat) — re-run it.
                 self.schedulePrefetch()
@@ -804,6 +813,7 @@ final class PlayerService: ObservableObject {
                 let fileDuration = try engine.loadFile(at: local, on: activeDeck, trimDB: 0)
                 hasLocalFile = true
                 currentLocalURL = local
+                persistCurrentLyricsSidecar()
                 isBuffering = false
                 duration = fileDuration
                 if isPlaying {
@@ -875,6 +885,12 @@ final class PlayerService: ObservableObject {
             guard let local = try? await AudioCache.shared.download(from: resolved.url, key: resolved.key)
             else { return }
             guard !Task.isCancelled, generation == self.resolveGeneration else { return }
+            // The words next: this track is about to be the *incoming* side of
+            // a seam and, one song later, the outgoing side whose lyric line
+            // decides where a vocal exchange hands over. One small JSON call.
+            Task.detached(priority: .utility) { [id = target.id] in
+                await LyricsSidecar.fetchAndWrite(trackID: id, for: local)
+            }
             let analysis = await self.analysis(for: resolved.key, fileURL: local)
             guard !Task.isCancelled, generation == self.resolveGeneration,
                   self.autoAdvanceTarget()?.id == target.id else { return }
@@ -1175,6 +1191,7 @@ final class PlayerService: ObservableObject {
         progress = engine.position(of: deck)
         duration = engine.duration(of: deck) ?? next.duration
         lyrics = nil
+        currentLyricLRC = nil
         pendingTransitionTrack = nil
         prefetchedNext = nil
 
@@ -1199,6 +1216,19 @@ final class PlayerService: ObservableObject {
         let response = try? await NeteaseAPI.lyric(id: track.id)
         guard generation == resolveGeneration else { return }
         lyrics = response.map(LyricsParser.parse)
+        currentLyricLRC = response?.lrc?.lyric
+        persistCurrentLyricsSidecar()
+    }
+
+    /// Write the current track's `.lrc` next to its local file once both halves
+    /// are known. The outgoing side of a seam is the one a `vocalExchange`
+    /// reads, so the *playing* track needs its sidecar too — a prefetch-only
+    /// write leaves the first track of every session wordless.
+    ///
+    /// Streaming-only playback has no file and writes nothing.
+    private func persistCurrentLyricsSidecar(audio: URL? = nil) {
+        guard let audio = audio ?? currentLocalURL, let lrc = currentLyricLRC else { return }
+        Task.detached(priority: .utility) { LyricsSidecar.write(lrc, for: audio) }
     }
 
     // MARK: - Scrobble
