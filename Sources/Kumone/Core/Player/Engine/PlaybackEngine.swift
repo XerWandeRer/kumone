@@ -1,12 +1,32 @@
 import AVFoundation
 import Foundation
 
+/// 引擎实际怎么把一次接歌放出来的。
+///
+/// 计划本身也在里面，而且是**引擎跑的那一份**：`resolvePlanLocked` 可能在调度
+/// 时把够不着的计划降级成尾部淡出或 gapless，调用方手上留着的却是降级*前*的，
+/// 所以「刚才到底放了什么」只有引擎说得清。AutoMix 调试面板拿它回看刚听到的
+/// 那一秒；除此之外没有别的消费者。
+struct TransitionOutcome: Sendable {
+    enum Path: String, Sendable {
+        /// 预渲染切片顶掉了实时叠加。
+        case splicedSegment
+        /// 实时双 deck 叠加（crossfade / beatMatched）。
+        case liveOverlap
+        /// 尾接尾，没有叠加。
+        case gapless
+    }
+
+    let path: Path
+    let plan: TransitionPlan
+}
+
 enum PlaybackEngineEvent: Sendable {
     /// Deck 播完了所有已调度音频（自然结束，非 stop/seek 引起）。
     case deckFinished(Deck)
     /// 过渡中点已过（crossfade 中点 / beatMatched 的 bass swap 点）——
     /// PlayerService 以此为界切换 currentTrack/歌词/scrobble。
-    case transitionMidpoint(from: Deck, to: Deck)
+    case transitionMidpoint(from: Deck, to: Deck, via: TransitionOutcome)
     /// 过渡完成，出曲 deck 已停止并复位。
     case transitionCompleted(from: Deck, to: Deck)
     case streamStalled(Deck)      // 渐进流 underrun，正在缓冲
@@ -1725,7 +1745,9 @@ final class PlaybackEngine: @unchecked Sendable {
 
         if !tr.midpointSent, elapsed >= segment.midpointOffset {
             tr.midpointSent = true
-            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+            eventContinuation.yield(.transitionMidpoint(
+                from: tr.from, to: tr.to,
+                via: TransitionOutcome(path: .splicedSegment, plan: tr.plan)))
         }
 
         // --- Tail, the head's mirror image: the incoming deck is started on
@@ -1791,7 +1813,9 @@ final class PlaybackEngine: @unchecked Sendable {
         let to = deckStates[tr.to]!
         if !tr.midpointSent {
             tr.midpointSent = true
-            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+            eventContinuation.yield(.transitionMidpoint(
+                from: tr.from, to: tr.to,
+                via: TransitionOutcome(path: .splicedSegment, plan: tr.plan)))
         }
         if !to.isPlaying, let segment = tr.segment {
             // The tail never started (the clock was unavailable at the arm
@@ -1958,7 +1982,9 @@ final class PlaybackEngine: @unchecked Sendable {
 
         if frame.midpointReached, !tr.midpointSent {
             tr.midpointSent = true
-            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+            eventContinuation.yield(.transitionMidpoint(
+                from: tr.from, to: tr.to,
+                via: TransitionOutcome(path: .liveOverlap, plan: tr.plan)))
         }
         if frame.isComplete {
             finishOverlapLocked(tr)
@@ -1978,7 +2004,9 @@ final class PlaybackEngine: @unchecked Sendable {
         let to = deckStates[tr.to]!
         if !tr.midpointSent {
             tr.midpointSent = true
-            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+            eventContinuation.yield(.transitionMidpoint(
+                from: tr.from, to: tr.to,
+                via: TransitionOutcome(path: .liveOverlap, plan: tr.plan)))
         }
         // A thrown echo tail outlives the overlap: stop the outgoing player
         // (so nothing new feeds the delay) but leave the delay wet, and let
@@ -2035,7 +2063,9 @@ final class PlaybackEngine: @unchecked Sendable {
                 ensureEngineRunningLocked()
                 startNodeIfNeededLocked(to)
             }
-            eventContinuation.yield(.transitionMidpoint(from: tr.from, to: tr.to))
+            eventContinuation.yield(.transitionMidpoint(
+                from: tr.from, to: tr.to,
+                via: TransitionOutcome(path: .gapless, plan: tr.plan)))
             resetDeckLocked(from)
             eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
             transition = nil

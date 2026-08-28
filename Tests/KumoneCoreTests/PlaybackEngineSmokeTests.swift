@@ -631,7 +631,7 @@ struct PlaybackEngineSmokeTests {
                 return false
             }
             o.midpoint = log.contains {
-                if case .transitionMidpoint(from: .a, to: .b) = $0 { return true }
+                if case .transitionMidpoint(from: .a, to: .b, via: _) = $0 { return true }
                 return false
             }
             o.bPosEarly = engine.position(of: .b)
@@ -1308,7 +1308,7 @@ struct PlaybackEngineSmokeTests {
                 Thread.sleep(forTimeInterval: testCase.quiet)
                 o.firedEarly = log.contains {
                     switch $0 {
-                    case .transitionMidpoint(from: .a, to: .b),
+                    case .transitionMidpoint(from: .a, to: .b, via: _),
                          .transitionCompleted(from: .a, to: .b): return true
                     default: return false
                     }
@@ -1487,7 +1487,7 @@ struct PlaybackEngineSmokeTests {
 
                 func waitForMidpoint() -> Bool {
                     log.wait(timeout: 12) {
-                        if case .transitionMidpoint(from: .a, to: .b) = $0 { return true }
+                        if case .transitionMidpoint(from: .a, to: .b, via: _) = $0 { return true }
                         return false
                     }
                 }

@@ -238,7 +238,13 @@ final class PlayerService: ObservableObject {
 
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.isPlaying, self.deckLoaded, !self.isScrubbing else { return }
+                guard let self else { return }
+                // The AutoMix debug panel refreshes off this tick rather than a
+                // timer of its own, so a closed window costs exactly one Bool
+                // test here. It runs before the guard below because a paused or
+                // buffering player is precisely when the panel is being read.
+                if AutoMixDebugModel.shared.isActive { self.publishDebugNow() }
+                guard self.isPlaying, self.deckLoaded, !self.isScrubbing else { return }
                 let seconds = self.engine.position(of: self.activeDeck)
                 if seconds.isFinite, abs(seconds - self.progress) > 0.05 {
                     self.progress = seconds
@@ -571,6 +577,7 @@ final class PlayerService: ObservableObject {
         transitionArmed = false
         pendingTransitionTrack = nil
         armedPlan = nil
+        AutoMixDebugModel.shared.setPlan(nil)
         // Whatever the pre-render was aiming at is void: a re-arm re-derives
         // the plan, and `updateStemPrerender` starts again from there.
         cancelStemPrerender()
@@ -584,6 +591,7 @@ final class PlayerService: ObservableObject {
         prefetchedNext = nil
         currentAnalysis = nil
         currentLocalURL = nil
+        AutoMixDebugModel.shared.clearNext()
         isBuffering = false
         enginePaused = false
 
@@ -781,11 +789,15 @@ final class PlayerService: ObservableObject {
         case .streamFailed(let deck, _):
             guard deck == activeDeck else { return }
             handleStreamFailure()
-        case .transitionMidpoint(_, let to):
+        case .transitionMidpoint(_, let to, let outcome):
+            // Freeze the seam *before* adopting: from here on `currentTrack`
+            // is the incoming song and the outgoing one is gone.
+            recordDebugSeam(outcome)
             adoptTransitionedTrack(on: to)
         case .transitionCompleted:
             transitionArmed = false
             armedPlan = nil
+            AutoMixDebugModel.shared.setPlan(nil)
             cancelStemPrerender()
             schedulePrefetch()
         }
@@ -871,8 +883,14 @@ final class PlayerService: ObservableObject {
             engine.stop(deck: activeDeck.other)
         }
         prefetchedNext = nil
-        guard let target else { return }
+        guard let target else {
+            AutoMixDebugModel.shared.clearNext()
+            return
+        }
+        AutoMixDebugModel.shared.setNextTitle(target.name, stage: .resolving)
         if target.id == currentTrack?.id, deckLoaded, !hasLocalFile {
+            AutoMixDebugModel.shared.setNextStage(
+                .deferred("same track still streaming into the cache"))
             // The next track IS the one still streaming into the cache
             // (single-track repeat-all). A parallel download would race the
             // .part mirror; streamDownloadCompleted re-runs this instead.
@@ -880,20 +898,33 @@ final class PlayerService: ObservableObject {
         }
         let generation = resolveGeneration
         prefetchTask = Task { [weak self] in
-            guard let self, let resolved = await self.resolveForPrefetch(target) else { return }
+            guard let self else { return }
+            guard let resolved = await self.resolveForPrefetch(target) else {
+                AutoMixDebugModel.shared.setNextStage(.failed("no playable source"))
+                return
+            }
             guard !Task.isCancelled, generation == self.resolveGeneration else { return }
+            AutoMixDebugModel.shared.setNextStage(.downloading)
             guard let local = try? await AudioCache.shared.download(from: resolved.url, key: resolved.key)
-            else { return }
+            else {
+                AutoMixDebugModel.shared.setNextStage(.failed("download failed"))
+                return
+            }
             guard !Task.isCancelled, generation == self.resolveGeneration else { return }
+            AutoMixDebugModel.shared.setNextStage(.downloaded)
             // The words next: this track is about to be the *incoming* side of
             // a seam and, one song later, the outgoing side whose lyric line
             // decides where a vocal exchange hands over. One small JSON call.
             Task.detached(priority: .utility) { [id = target.id] in
                 await LyricsSidecar.fetchAndWrite(trackID: id, for: local)
             }
+            AutoMixDebugModel.shared.setNextStage(.analyzing)
             let analysis = await self.analysis(for: resolved.key, fileURL: local)
             guard !Task.isCancelled, generation == self.resolveGeneration,
                   self.autoAdvanceTarget()?.id == target.id else { return }
+            // The `.lrc` write above is detached, so this may read a beat before
+            // the file lands; the sidecar row is re-read on the next re-plan.
+            AutoMixDebugModel.shared.setNextAnalysis(analysis, localURL: local)
             self.prefetchedNext = PrefetchedNext(
                 track: target, key: resolved.key, localURL: local,
                 level: resolved.level, unblockSource: resolved.unblockSource, analysis: analysis)
@@ -915,6 +946,7 @@ final class PlayerService: ObservableObject {
         guard (try? engine.loadFile(at: next.localURL, on: incoming,
                                     trimDB: loudnessTrimDB(for: next.analysis))) != nil else {
             prefetchedNext = nil
+            AutoMixDebugModel.shared.setNextStage(.failed("incoming deck would not load the file"))
             return
         }
         let planned = makeTransitionPlan(for: next)
@@ -922,6 +954,7 @@ final class PlayerService: ObservableObject {
         armedPlan = planned
         transitionArmed = true
         pendingTransitionTrack = next.track
+        publishDebugPlan(planned, next: next)
     }
 
     private func makeTransitionPlan(for next: PrefetchedNext) -> PlannedTransition {
@@ -1040,6 +1073,8 @@ final class PlayerService: ObservableObject {
                 stemPrerenderTask?.cancel()
                 stemPrerenderTask = nil
                 stemPrerenderState = .settled(signature)
+                AutoMixDebugModel.shared.setPrerender(
+                    .abandoned(String(format: "out of runway (%.1fs left)", remaining)))
             }
             return
         case .idle:
@@ -1061,6 +1096,7 @@ final class PlayerService: ObservableObject {
             return try provider(request)
         }
         stemPrerenderState = .running(signature)
+        AutoMixDebugModel.shared.setPrerender(.rendering(Self.debugSignature(signature)))
         stemPrerenderTask = Task { [weak self] in
             // Separation is Metal work and rendering is a synchronous pull
             // loop; both belong off the main actor entirely.
@@ -1073,6 +1109,15 @@ final class PlayerService: ObservableObject {
                 // playhead is already past the splice, and plays the live
                 // hand-over instead — this is a suggestion, not a command.
                 self.engine.armTransitionSegment(segment)
+                // The rejection is silent by design, so the only way to report
+                // it is to ask afterwards. `hasArmedSegment` is the engine's
+                // existing read-only hook, one queue hop, once per seam.
+                AutoMixDebugModel.shared.setPrerender(
+                    self.engine.hasArmedSegment
+                        ? .armed(Self.debugSignature(signature))
+                        : .refused("engine declined — seam moved or splice passed"))
+            } else {
+                AutoMixDebugModel.shared.setPrerender(.abandoned("render produced nothing"))
             }
             self.stemPrerenderTask = nil
             self.stemPrerenderState = .settled(signature)
@@ -1085,6 +1130,7 @@ final class PlayerService: ObservableObject {
         stemPrerenderTask?.cancel()
         stemPrerenderTask = nil
         stemPrerenderState = .idle
+        AutoMixDebugModel.shared.setPrerender(.idle)
     }
 
     /// `Config.standard` with the one knob the user can see: the planner's
@@ -1159,6 +1205,7 @@ final class PlayerService: ObservableObject {
         let planned = makeTransitionPlan(for: next)
         engine.replaceTransitionPlan(planned)
         armedPlan = planned
+        publishDebugPlan(planned, next: next)
     }
 
     /// The engine crossed the transition midpoint: the incoming deck is now
@@ -1206,6 +1253,10 @@ final class PlayerService: ObservableObject {
         currentLyricLRC = nil
         pendingTransitionTrack = nil
         prefetchedNext = nil
+        // The song that was "next" is now "now"; `schedulePrefetch` (via
+        // transitionCompleted) fills the group in again a moment later.
+        AutoMixDebugModel.shared.clearNext()
+        publishDebugNow()
 
         resolveGeneration += 1
         let generation = resolveGeneration
@@ -1241,6 +1292,67 @@ final class PlayerService: ObservableObject {
     private func persistCurrentLyricsSidecar(audio: URL? = nil) {
         guard let audio = audio ?? currentLocalURL, let lrc = currentLyricLRC else { return }
         Task.detached(priority: .utility) { LyricsSidecar.write(lrc, for: audio) }
+    }
+
+    // MARK: - AutoMix debug panel
+
+    // Everything below only *reads* state this class already keeps, and writes
+    // it into `AutoMixDebugModel`. Nothing here may change playback: the panel
+    // is a mirror, and a mirror that moved the thing it reflects would make the
+    // listening tests it exists for worthless.
+
+    private static func debugSignature(_ signature: TransitionSegment.Signature) -> String {
+        String(format: "out %.2fs · in %.2fs · overlap %.2fs",
+               signature.outPoint, signature.inPoint, signature.overlapDuration)
+    }
+
+    /// A player-level phase. The engine's own `TransitionPhase` lives on its
+    /// audio queue and is not reported, so this is what the *orchestrator*
+    /// believes — which is also what the plan/pre-render groups are keyed to.
+    private func debugPhaseLabel() -> String {
+        guard deckLoaded else { return currentTrack == nil ? "idle" : "no source" }
+        var phase = isBuffering ? "buffering" : (isPlaying ? "playing" : "paused")
+        if transitionArmed { phase += " · handover armed" }
+        return phase
+    }
+
+    private func publishDebugNow() {
+        AutoMixDebugModel.shared.setNow(AutoMixDebugNow(
+            title: currentTrack?.name,
+            phase: debugPhaseLabel(),
+            deck: activeDeck.rawValue.uppercased(),
+            position: progress,
+            duration: duration,
+            trimDB: loudnessTrimDB(for: currentAnalysis),
+            analyzed: currentAnalysis != nil))
+    }
+
+    private func publishDebugPlan(_ planned: PlannedTransition, next: PrefetchedNext) {
+        AutoMixDebugModel.shared.setPlan(AutoMixDebugPlan(
+            planned: planned, outgoing: currentAnalysis, incoming: next.analysis))
+        // The sidecar may have landed since the prefetch reported; a re-plan is
+        // the natural moment to re-read it, and it is one `stat`.
+        AutoMixDebugModel.shared.setNextAnalysis(next.analysis, localURL: next.localURL)
+    }
+
+    /// The seam just became audible: freeze what was armed next to what the
+    /// engine says it actually ran, so a listener who heard something odd can
+    /// look afterwards instead of guessing.
+    private func recordDebugSeam(_ outcome: TransitionOutcome) {
+        let planned = armedPlan.map {
+            AutoMixDebugPlan(planned: $0, outgoing: currentAnalysis,
+                             incoming: prefetchedNext?.analysis)
+        }
+        AutoMixDebugModel.shared.recordSeam(AutoMixDebugSeam(
+            from: currentTrack?.name,
+            to: pendingTransitionTrack?.name,
+            planned: planned,
+            path: outcome.path.rawValue,
+            executedKind: AutoMixDebugFormat.planKind(outcome.plan),
+            executedOutPoint: outcome.plan.outPoint,
+            executedOverlap: AutoMixDebugFormat.overlap(outcome.plan),
+            fallback: AutoMixDebugFormat.fallback(planned: planned, executed: outcome.plan),
+            prerender: AutoMixDebugModel.shared.currentPrerenderLabel))
     }
 
     // MARK: - Scrobble
