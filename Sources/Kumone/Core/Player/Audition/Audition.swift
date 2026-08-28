@@ -317,6 +317,11 @@ public enum Audition {
         /// threshold that nudging the constant would flip this pair.
         public let nearMisses: [String]
 
+        /// Every gate the planner walked for this pair, and the first one it
+        /// failed. This is the ledger behind "why is this pair not
+        /// beat-matched": see `PlanTrace`.
+        public let planTrace: PlanTrace
+
         /// The tier the signals alone produced, before the key gate.
         public let rawTier: String
         /// `name: value` for every knob this decision was made under.
@@ -357,8 +362,10 @@ public enum Audition {
             && (keyDistance ?? 0) >= config.clashKeyDistance
         let effectiveTier = demoted ? TransitionPlanner.CompatibilityTier.neutral : rawTier
 
+        var trace: PlanTrace? = PlanTrace()
         var planned = TransitionPlanner.plan(outgoing: out, incoming: inc,
-                                             stems: stems, config: config)
+                                             stems: stems, config: config, trace: &trace)
+        let planTrace = trace ?? PlanTrace()
         let plannedStem = planned.style.stemTechnique
         // The same decision without stems, purely so the console can quote the
         // difference. Planning is a pure function over two cached analyses, so
@@ -466,6 +473,7 @@ public enum Audition {
             stemBaselineOverlap: baselineOverlap,
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
                                    outVocal: outVocal, inVocal: inVocal, config: config),
+            planTrace: planTrace,
             rawTier: name(of: rawTier),
             config: config.asDictionary,
             planned: planned, outgoingURL: outgoingURL, incomingURL: incomingURL,

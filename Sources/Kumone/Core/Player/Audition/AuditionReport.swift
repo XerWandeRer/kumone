@@ -89,6 +89,22 @@ extension Audition {
         public let fired: Bool
     }
 
+    /// One gate off the planner's ledger. Same numbers the chain narrates,
+    /// in machine form — so a sweep can histogram eliminations without
+    /// parsing prose.
+    public struct GateReport: Encodable, Sendable {
+        public let id: String
+        public let label: String
+        /// "duration" | "tier" | "key" | "beatMatch" | "barUpgrade"
+        public let stage: String
+        public let passed: Bool
+        public let value: Double?
+        public let threshold: Double?
+        public let detail: String
+        /// The one gate that cost this pair its beat-matched hand-over.
+        public let blocking: Bool
+    }
+
     public struct PlanReport: Encodable, Sendable {
         public let kind: String
         public let outPoint: TimeInterval?
@@ -135,6 +151,14 @@ extension Audition {
         public let tier: String
         public let demotedByKey: Bool
         public let chain: [ChainStep]
+        /// The gates the planner walked, and — when the pair had already lost
+        /// its beat-match at the tier — the ones it walked into the shadow
+        /// ledger to answer the counterfactual.
+        public let gates: [GateReport]
+        public let shadowGates: [GateReport]
+        /// `id` of the gate that eliminated this pair from `beatMatched`,
+        /// nil when the pair is beat-matched.
+        public let beatMatchBlocker: String?
         public let plan: PlanReport
         public let style: StyleReport
         public let nearMisses: [String]
@@ -161,6 +185,9 @@ extension Audition {
             tier: d.tier,
             demotedByKey: d.demotedByKey,
             chain: chain(d, config: c),
+            gates: d.planTrace.gates.map { gateReport($0, blocker: d.planTrace.blocker?.id) },
+            shadowGates: d.planTrace.shadowGates.map { gateReport($0, blocker: nil) },
+            beatMatchBlocker: d.planTrace.blocker?.id,
             plan: planReport(d, config: c),
             style: styleReport(d, config: c),
             nearMisses: d.nearMisses,
@@ -171,6 +198,12 @@ extension Audition {
             configDiff: c.diffFromStandard.map {
                 ConfigDiffEntry(name: $0.name, standard: $0.standard, current: $0.current)
             })
+    }
+
+    private static func gateReport(_ g: PlanGate, blocker: String?) -> GateReport {
+        GateReport(id: g.id, label: g.label, stage: g.stage.rawValue, passed: g.passed,
+                   value: g.value, threshold: g.threshold, detail: g.detail,
+                   blocking: blocker == g.id)
     }
 
     /// The report as pretty JSON — what `--json` prints and `/api/plan` returns.
@@ -459,55 +492,11 @@ extension Audition {
                 fired: d.demotedByKey))
         }
 
-        // 3. Beat-match attempt (only tried at compatible).
-        if d.tier == "compatible" {
-            let confOK = out.bpmConfidence >= c.bpmConfidenceThreshold
-                && inc.bpmConfidence >= c.bpmConfidenceThreshold
-                && out.bpm > 0 && inc.bpm > 0
-            var detail: String
-            var outcome: String
-            if !confOK {
-                detail = String(format: "节拍把握度：出曲 %.2f、入曲 %.2f，需要 %.2f 以上。",
-                                out.bpmConfidence, inc.bpmConfidence, c.bpmConfidenceThreshold)
-                outcome = "→ 拍子本身都没数清，不谈对拍，走普通交叉淡入淡出。"
-            } else {
-                let folded = [0.5, 1.0, 2.0].map { inc.bpm * $0 }
-                    .min { abs($0 - out.bpm) < abs($1 - out.bpm) }!
-                let delta = abs(folded - out.bpm) / out.bpm
-                let target = (out.bpm + folded) / 2
-                let outRate = target / out.bpm, inRate = target / folded
-                let rateOK = abs(outRate - 1) <= c.maxRateDeviation + 1e-9
-                    && abs(inRate - 1) <= c.maxRateDeviation + 1e-9
-                detail = String(format: "%.1f → %.1f BPM（按倍速关系折算成 %.1f），还差 %.1f%%，"
-                                + "对拍最多容忍 %.1f%%；要让两边踩到一起，各自变速 %.2f%% / %.2f%%，"
-                                + "单边最多允许 %.1f%%。",
-                                out.bpm, inc.bpm, folded, delta * 100, c.maxBPMDeltaRatio * 100,
-                                (outRate - 1) * 100, (inRate - 1) * 100, c.maxRateDeviation * 100)
-                if delta > c.maxBPMDeltaRatio {
-                    outcome = "→ 速度差太多，对不上，走普通交叉淡入淡出。"
-                } else if !rateOK {
-                    outcome = "→ 要对上就得改速度改太多，听起来会变调走味，放弃对拍。"
-                } else if d.planKind == "beatMatched" {
-                    outcome = "→ 对上了，两首歌踩着同一个拍子叠 \(d.overlapBars ?? 0) 个小节。"
-                } else {
-                    outcome = "→ 条件都够，但出曲尾巴上找不到一个能装下这段叠加的乐句起点，"
-                        + "只好退回普通交叉淡入淡出。"
-                }
-            }
-            steps.append(ChainStep(
-                stage: "beatmatch", title: "试试能不能踩到同一个拍子上",
-                rule: "两边节拍都数得准、速度差在对拍线以内、各自变速幅度不过分，"
-                    + "并且出曲尾部有一个乐句起点能装下整段叠加 —— 四条都满足才做对拍过渡。",
-                detail: detail, outcome: outcome,
-                fired: d.planKind == "beatMatched"))
-        } else {
-            steps.append(ChainStep(
-                stage: "beatmatch", title: "试试能不能踩到同一个拍子上",
-                rule: "只有被判成“很搭”的一对，才值得花力气去对拍。",
-                detail: "这一对是「\(tierName(d.tier))」。",
-                outcome: "→ 跳过对拍，走普通交叉淡入淡出。",
-                fired: false))
-        }
+        // 3. Beat-match attempt (only tried at compatible). Narrated straight
+        // off the planner's own ledger, so every number quoted here is the
+        // number the gate compared — see `PlanTrace`.
+        steps.append(beatMatchStep(d, config: c))
+        if let bars = barUpgradeStep(d, config: c) { steps.append(bars) }
 
         // 4. Overlap length.
         if d.planKind == "crossfade" {
@@ -606,6 +595,193 @@ extension Audition {
                 fired: true))
         }
         return steps
+    }
+
+    // MARK: - The beat-match chain, read off the planner's ledger
+
+    /// One gate the planner walked, said the way a person would say it. Every
+    /// number quoted is the number that gate compared — nothing is re-derived,
+    /// so the narration cannot drift from the decision (`PlanTrace`).
+    private static func gateSentence(_ g: PlanGate) -> String {
+        func v(_ digits: Int = 2) -> String {
+            g.value.map { String(format: "%.\(digits)f", $0) } ?? "—"
+        }
+        func t(_ digits: Int = 2) -> String {
+            g.threshold.map { String(format: "%.\(digits)f", $0) } ?? "—"
+        }
+        func pct(_ x: Double?) -> String {
+            x.map { String(format: "%.1f%%", $0 * 100) } ?? "—"
+        }
+        switch g.id {
+        case "minDuration": return "最短的一首 \(v(0)) 秒，门槛 \(t(0)) 秒"
+        case "loudnessGap": return "音量差 \(v()) dB，容忍线 \(t(1)) dB"
+        case "timbreDistance": return "音色距离 \(v(3))，容忍线 \(t(2))"
+        case "tempoClash":
+            return g.value == nil
+                ? "至少一边节拍没测准，速度红线这一关不参与"
+                : "折算速度差 \(pct(g.value))，红线 \(pct(g.threshold))"
+        case "keyDistance":
+            return g.value == nil
+                ? "至少一边听不出稳定的调，和声这一关不参与"
+                : "五度圈距离 \(v(0)) 步，降档线 \(t(0)) 步"
+        case "bpmConfidence": return "节拍把握度（取低的一边）\(v())，门槛 \(t())"
+        case "bpmDelta": return "折算后的 BPM 差 \(pct(g.value))，对拍窗口 \(pct(g.threshold))"
+        case "rateDeviation": return "单边变速幅度 \(pct(g.value))，上限 \(pct(g.threshold))"
+        case "inPoint":
+            return g.passed
+                ? "入点（intro 之后第一个 downbeat）落在 \(v()) 秒"
+                : "入曲整首都没有可用的 downbeat，入点无从谈起"
+        case "overlapCeiling": return "这段叠加要 \(v()) 秒，上限 \(t()) 秒"
+        case "outPoint":
+            return g.passed
+                ? "出点（尾窗里装得下这段叠加的乐句起点）落在 \(v()) 秒"
+                : "出曲尾窗里没有任何一个乐句起点装得下这段叠加"
+        case "incomingRoom": return "入点 + 叠加 = \(v()) 秒，入曲全长 \(t(0)) 秒"
+        default: break
+        }
+        switch g.id.split(separator: ".").last.map(String.init) ?? "" {
+        case "ceiling": return "叠加 \(v()) 秒 / 上限 \(t()) 秒"
+        case "outPoint":
+            return g.passed ? "出点 \(v()) 秒" : "尾窗里没有装得下的乐句起点"
+        case "incomingRoom": return "入点 + 叠加 = \(v()) 秒 / 入曲 \(t(0)) 秒"
+        case "stableOut": return "出曲这段的能量起伏 \(v(3))，稳定门槛 \(t(2))"
+        case "stableIn": return "入曲这段的能量起伏 \(v(3))，稳定门槛 \(t(2))"
+        case "vocals":
+            return g.passed
+                ? "人声不撞车（打架线 \(t()) 倍）"
+                : "两边人声都比各自平时更密，越过了 \(t()) 倍的打架线"
+        default: return g.detail
+        }
+    }
+
+    /// "差多少" — how far a failed gate sat from its line, as a share of the
+    /// line, so a 0.9 dB miss and a 4-point BPM miss are comparable.
+    private static func gateGap(_ g: PlanGate) -> String {
+        guard !g.passed, let m = g.margin, m.isFinite, abs(m) >= 0.005 else { return "" }
+        return m > 0 ? String(format: "，超出 %.0f%%", m * 100)
+                     : String(format: "，还差 %.0f%%", -m * 100)
+    }
+
+    /// Short Chinese name of a gate, for "卡在「X」这道门上".
+    private static func gateName(_ id: String) -> String {
+        switch id {
+        case "minDuration": return "曲长"
+        case "loudnessGap": return "音量差"
+        case "timbreDistance": return "音色距离"
+        case "tempoClash": return "速度红线"
+        case "keyDistance": return "调性"
+        case "bpmConfidence": return "节拍把握度"
+        case "bpmDelta": return "折算 BPM 差"
+        case "rateDeviation": return "变速幅度"
+        case "inPoint": return "入点"
+        case "overlapCeiling": return "叠加上限"
+        case "outPoint": return "出点"
+        case "incomingRoom": return "入曲余量"
+        default: break
+        }
+        switch id.split(separator: ".").last.map(String.init) ?? "" {
+        case "ceiling": return "叠加上限"
+        case "outPoint": return "出点"
+        case "incomingRoom": return "入曲余量"
+        case "stableOut": return "出曲能量稳定"
+        case "stableIn": return "入曲能量稳定"
+        case "vocals": return "人声撞车"
+        default: return id
+        }
+    }
+
+    private static func gateLine(_ g: PlanGate) -> String {
+        "\(g.passed ? "✓" : "✗") \(gateSentence(g))\(gateGap(g))"
+    }
+
+    /// The beat-match step: every gate on the road to a beat-matched
+    /// hand-over, in order, with the number each one compared — and, when the
+    /// pair lost it, exactly which gate did the killing and by how much.
+    ///
+    /// At a demoted tier the pair never reaches this rule for real, so the
+    /// planner's shadow ledger is narrated instead: it answers the question the
+    /// tier alone cannot ("and would it have cleared the rest?").
+    private static func beatMatchStep(
+        _ d: Decision, config c: TransitionPlanner.Config
+    ) -> ChainStep {
+        let rule = "两边节拍都数得准、折算后的速度差在对拍线以内、各自变速幅度不过分、"
+            + "入曲找得到入点、出曲尾部有一个乐句起点能装下整段叠加 —— 全部满足才做对拍过渡。"
+        let trace = d.planTrace
+        let real = trace.gates.filter { $0.stage == .beatMatch }
+        let shadow = trace.shadowGates.filter { $0.stage == .beatMatch }
+        let shown = real.isEmpty ? shadow : real
+        let lines = shown.map(gateLine)
+
+        guard d.tier == "compatible" else {
+            var detail = "这一对是「\(tierName(d.tier))」，对拍这条路在档位那一步就断了。"
+            detail += shown.isEmpty
+                ? "（后面的门一道都没走到。）"
+                : "　假设档位放行，后面几道门会是：" + lines.joined(separator: "；") + "。"
+            let outcome: String
+            if let s = trace.shadowBlocker {
+                outcome = "→ 跳过对拍。而且就算档位放行，它也会卡在「\(gateName(s.id))」"
+                    + "这道门上（\(gateSentence(s))\(gateGap(s))）。"
+            } else if shown.isEmpty {
+                outcome = "→ 跳过对拍，走普通交叉淡入淡出。"
+            } else {
+                outcome = "→ 跳过对拍。不过值得记一笔：对拍自己的每一道门它都过得去 —— "
+                    + "拦住这一对的只有档位本身。"
+            }
+            return ChainStep(stage: "beatmatch", title: "试试能不能踩到同一个拍子上",
+                             rule: rule, detail: detail, outcome: outcome, fired: false)
+        }
+
+        let outcome: String
+        if d.planKind == "beatMatched" {
+            outcome = "→ 每一道门都过了，两首歌踩着同一个拍子叠 \(d.overlapBars ?? 0) 个小节。"
+        } else if let b = trace.blocker {
+            outcome = "→ 卡在「\(gateName(b.id))」这道门上"
+                + "（\(gateSentence(b))\(gateGap(b))），退回普通交叉淡入淡出。"
+        } else {
+            outcome = "→ 没做成对拍，走普通交叉淡入淡出。"
+        }
+        return ChainStep(
+            stage: "beatmatch", title: "试试能不能踩到同一个拍子上",
+            rule: rule,
+            detail: lines.isEmpty ? "（这一对没有走到对拍这一步。）"
+                : lines.joined(separator: "；") + "。",
+            outcome: outcome, fired: d.planKind == "beatMatched")
+    }
+
+    /// The 16 / 8-bar upgrade search. Failing it never costs a pair its
+    /// beat-matched plan — it only shortens the overlap to the 4-bar floor —
+    /// so it gets its own step rather than muddying the elimination story.
+    private static func barUpgradeStep(
+        _ d: Decision, config c: TransitionPlanner.Config
+    ) -> ChainStep? {
+        let gates = d.planTrace.gates.filter { $0.stage == .barUpgrade }
+        guard !gates.isEmpty, d.tier == "compatible" else { return nil }
+        var parts: [String] = []
+        for candidate in [16, 8] {
+            let own = gates.filter { $0.id.hasPrefix("bars\(candidate).") }
+            guard !own.isEmpty else { continue }
+            if let failed = own.first(where: { !$0.passed }) {
+                parts.append("\(candidate) 小节：✗ \(gateSentence(failed))\(gateGap(failed))")
+            } else {
+                parts.append("\(candidate) 小节：全部通过")
+            }
+        }
+        let chosen = d.planTrace.chosenBars
+        let outcome: String
+        if let chosen, chosen > 4 {
+            outcome = "→ 拿到 \(chosen) 小节的长叠加。"
+        } else if d.planKind == "beatMatched" {
+            outcome = "→ 两次升级都没成，退到 4 小节的兜底叠加。"
+        } else {
+            outcome = "→ 两次升级都没成，4 小节兜底也没成（见上一步）。"
+        }
+        return ChainStep(
+            stage: "bars", title: "这段叠加能有多长",
+            rule: "先试 16 小节、再试 8 小节：叠加不超上限、出曲尾窗里有装得下的乐句起点、"
+                + "入曲还有余量、两边这一段的能量都够稳、而且人声不撞车 —— 全中才升级；"
+                + "否则退到 4 小节的兜底。",
+            detail: parts.joined(separator: "；") + "。",
+            outcome: outcome, fired: (chosen ?? 4) > 4)
     }
 
     /// The stem-layer step: which of the two upgrade rules fired, on what

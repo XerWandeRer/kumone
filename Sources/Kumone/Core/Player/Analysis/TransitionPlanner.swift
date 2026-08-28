@@ -184,16 +184,93 @@ enum TransitionPlanner {
         stems: StemAvailability = .none,
         config: Config = .standard
     ) -> PlannedTransition {
-        guard let outgoing, let incoming,
-              outgoing.duration >= config.minTrackDuration,
-              incoming.duration >= config.minTrackDuration
+        var untraced: PlanTrace?
+        return plan(outgoing: outgoing, incoming: incoming, stems: stems,
+                    config: config, trace: &untraced)
+    }
+
+    /// The same decision, with an optional gate-by-gate ledger.
+    ///
+    /// Pass a non-nil `trace` and every gate this pair walked comes back in it,
+    /// along with the first one it failed — which is what turns "beat-matching
+    /// almost never fires on the real library" from a guess into a histogram.
+    /// Pass nil (what `plan` above, and so every product path, does) and the
+    /// ledger costs one nil check per gate: the numbers and the wording of each
+    /// record are built inside autoclosures that are never called. The result is
+    /// field-for-field identical either way — nothing written here is ever read
+    /// back by the planner.
+    static func plan(
+        outgoing: TrackAnalysis?, incoming: TrackAnalysis?,
+        stems: StemAvailability = .none,
+        config: Config = .standard,
+        trace: inout PlanTrace?
+    ) -> PlannedTransition {
+        guard let outgoing, let incoming else {
+            _ = note(&trace, .duration, "minDuration", false,
+                     nil, config.minTrackDuration,
+                     "one side has no analysis at all")
+            return .plain(.gapless)
+        }
+        guard note(&trace, .duration, "minDuration",
+                   outgoing.duration >= config.minTrackDuration
+                       && incoming.duration >= config.minTrackDuration,
+                   Swift.min(outgoing.duration, incoming.duration), config.minTrackDuration,
+                   String(format: "durations %.0f s / %.0f s against a %.0f s floor",
+                          outgoing.duration, incoming.duration, config.minTrackDuration))
         else { return .plain(.gapless) }
 
-        var tier = compatibility(outgoing: outgoing, incoming: incoming, config: config)
-        if tier == .compatible, keysClash(outgoing, incoming, config) { tier = .neutral }
-        if tier == .compatible,
-           let matched = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
-                                         stems: stems, config: config) {
+        let s = signals(outgoing: outgoing, incoming: incoming, config: config)
+        var tier = Self.tier(of: s, config: config)
+        // The three tier signals, each as its own gate. A pair only stays
+        // `compatible` — the one tier that may beat-match — when all three sit
+        // inside their tolerance line, so recording them separately is what
+        // lets a sweep say *which* signal did the demoting.
+        _ = note(&trace, .tier, "loudnessGap", s.loudnessGapDB <= config.neutralLoudnessDB,
+                 s.loudnessGapDB, config.neutralLoudnessDB,
+                 String(format: "%.2f dB gap against a %.1f dB tolerance line "
+                        + "(%.1f dB is the clash line)",
+                        s.loudnessGapDB, config.neutralLoudnessDB, config.clashLoudnessDB))
+        _ = note(&trace, .tier, "timbreDistance",
+                 s.timbreDistance <= config.neutralTimbreDistance,
+                 s.timbreDistance, config.neutralTimbreDistance,
+                 String(format: "%.3f distance against a %.2f tolerance line "
+                        + "(%.2f is the clash line)",
+                        s.timbreDistance, config.neutralTimbreDistance,
+                        config.clashTimbreDistance))
+        _ = note(&trace, .tier, "tempoClash", (s.tempoRatio ?? 0) <= config.clashTempoRatio,
+                 s.tempoRatio, config.clashTempoRatio,
+                 s.tempoRatio.map {
+                     String(format: "folded tempo gap %.1f %% against a %.1f %% clash line",
+                            $0 * 100, config.clashTempoRatio * 100)
+                 } ?? "no confident tempo on both sides, so this gate never fires")
+
+        let keyDist = keyDistance(outgoing, incoming, config: config)
+        let demotedByKey = tier == .compatible && (keyDist ?? 0) >= config.clashKeyDistance
+        _ = note(&trace, .key, "keyDistance", !demotedByKey,
+                 keyDist.map(Double.init), Double(config.clashKeyDistance),
+                 keyDist.map {
+                     "circle-of-fifths distance \($0), demoting at ≥ \(config.clashKeyDistance)"
+                 } ?? "at least one key is below the confidence gate, so harmony abstains")
+        if demotedByKey { tier = .neutral }
+
+        var matched: (plan: BeatMatchedPlan, stem: StemTechnique?)?
+        if tier == .compatible {
+            matched = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
+                                      stems: stems, config: config, trace: &trace)
+        } else if trace != nil {
+            // The tier already ended this pair's beat-match hopes, so the rest
+            // of the chain never runs for real. Walk it anyway into a side
+            // ledger — planning is a pure function over two cached analyses, so
+            // it costs microseconds — to answer the counterfactual a corpus
+            // sweep actually wants: had the tier let this pair through, would
+            // anything else have stopped it?
+            var shadow: PlanTrace? = PlanTrace()
+            _ = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
+                                stems: stems, config: config, trace: &shadow)
+            trace?.shadowGates = shadow?.gates ?? []
+        }
+        if let matched {
+            trace?.chosenBars = matched.plan.overlapBars
             // The full DJ hand-over: staged three-band EQ across the overlap.
             // A stem technique layers *under* that — it rewrites what the
             // outgoing deck is fed, and the fader / EQ / outro automation then
@@ -218,6 +295,28 @@ enum TransitionPlanner {
                                    plan: crossfade.plan, config: config)
         style.stemTechnique = crossfade.stem
         return PlannedTransition(plan: crossfade.plan, style: style)
+    }
+
+    // MARK: - Decision ledger
+
+    /// Record one gate and hand back the very Bool the caller was testing, so a
+    /// `guard note(&trace, …, someCondition, …) else { … }` reads and behaves
+    /// exactly like the `guard someCondition else { … }` it replaced.
+    ///
+    /// Everything except `passed` arrives as an autoclosure: while `trace` is
+    /// nil — the product path — not one number is formatted and not one string
+    /// is built. See `PlanTrace`.
+    @inline(__always)
+    private static func note(
+        _ trace: inout PlanTrace?, _ stage: PlanGate.Stage, _ id: String, _ passed: Bool,
+        _ value: @autoclosure () -> Double?, _ threshold: @autoclosure () -> Double?,
+        _ detail: @autoclosure () -> String
+    ) -> Bool {
+        if trace != nil {
+            trace!.add(PlanGate(id: id, stage: stage, passed: passed,
+                                value: value(), threshold: threshold(), detail: detail()))
+        }
+        return passed
     }
 
     // MARK: - Stem layer
@@ -521,33 +620,59 @@ enum TransitionPlanner {
 
     private static func beatMatchedPlan(
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
-        stems: StemAvailability, config: Config
+        stems: StemAvailability, config: Config,
+        trace: inout PlanTrace?
     ) -> (plan: BeatMatchedPlan, stem: StemTechnique?)? {
-        guard outgoing.bpmConfidence >= config.bpmConfidenceThreshold,
-              incoming.bpmConfidence >= config.bpmConfidenceThreshold,
-              outgoing.bpm > 0, incoming.bpm > 0
+        guard note(&trace, .beatMatch, "bpmConfidence",
+                   outgoing.bpmConfidence >= config.bpmConfidenceThreshold
+                       && incoming.bpmConfidence >= config.bpmConfidenceThreshold
+                       && outgoing.bpm > 0 && incoming.bpm > 0,
+                   Swift.min(outgoing.bpmConfidence, incoming.bpmConfidence),
+                   config.bpmConfidenceThreshold,
+                   String(format: "tempo confidence %.2f / %.2f against a %.2f gate",
+                          outgoing.bpmConfidence, incoming.bpmConfidence,
+                          config.bpmConfidenceThreshold))
         else { return nil }
 
         // Fold the incoming tempo to the closest double/half-time candidate.
         let foldedBPM = [0.5, 1.0, 2.0]
             .map { incoming.bpm * $0 }
             .min { abs($0 - outgoing.bpm) < abs($1 - outgoing.bpm) }!
-        guard abs(foldedBPM - outgoing.bpm) / outgoing.bpm <= config.maxBPMDeltaRatio else {
-            return nil
-        }
+        let bpmDelta = abs(foldedBPM - outgoing.bpm) / outgoing.bpm
+        guard note(&trace, .beatMatch, "bpmDelta", bpmDelta <= config.maxBPMDeltaRatio,
+                   bpmDelta, config.maxBPMDeltaRatio,
+                   String(format: "%.1f → %.1f BPM (folded %.1f), %.1f %% apart "
+                          + "against a %.1f %% beat-match window",
+                          outgoing.bpm, incoming.bpm, foldedBPM,
+                          bpmDelta * 100, config.maxBPMDeltaRatio * 100))
+        else { return nil }
 
         // Meet in the middle; each deck bends at most ±4%.
         let targetBPM = (outgoing.bpm + foldedBPM) / 2
         let outgoingRate = targetBPM / outgoing.bpm
         let incomingRate = targetBPM / foldedBPM
-        guard abs(outgoingRate - 1) <= config.maxRateDeviation + 1e-9,
-              abs(incomingRate - 1) <= config.maxRateDeviation + 1e-9
+        guard note(&trace, .beatMatch, "rateDeviation",
+                   abs(outgoingRate - 1) <= config.maxRateDeviation + 1e-9
+                       && abs(incomingRate - 1) <= config.maxRateDeviation + 1e-9,
+                   Swift.max(abs(outgoingRate - 1), abs(incomingRate - 1)),
+                   config.maxRateDeviation,
+                   String(format: "decks bend %.2f %% / %.2f %% against a ±%.1f %% limit",
+                          (outgoingRate - 1) * 100, (incomingRate - 1) * 100,
+                          config.maxRateDeviation * 100))
         else { return nil }
 
         // In point: the downbeat aligned with the incoming track's intro end.
         guard let inPoint = incoming.downbeats.first(where: { $0 >= incoming.introEnd - 0.05 })
                 ?? incoming.downbeats.first
-        else { return nil }
+        else {
+            _ = note(&trace, .beatMatch, "inPoint", false, nil, nil,
+                     String(format: "the incoming track has no downbeat at all "
+                            + "(intro ends at %.2f s)", incoming.introEnd))
+            return nil
+        }
+        _ = note(&trace, .beatMatch, "inPoint", true, inPoint, nil,
+                 String(format: "first downbeat past the %.2f s intro sits at %.2f s",
+                        incoming.introEnd, inPoint))
 
         let beatDuration = 60.0 / targetBPM
         func overlapDuration(bars: Int) -> TimeInterval { Double(bars) * 4 * beatDuration }
@@ -575,16 +700,53 @@ enum TransitionPlanner {
         var chosenOutPoint: TimeInterval?
         for candidate in [16, 8] {
             let overlap = overlapDuration(bars: candidate)
-            guard overlap <= overlapCeiling,
-                  let op = outPoint(forOverlap: overlap),
-                  inPoint + overlap <= incoming.duration,
-                  isStable(outgoing.rmsEnvelope, from: op, length: overlap,
-                           cv: config.stableCV),
-                  isStable(incoming.rmsEnvelope, from: inPoint, length: overlap,
-                           cv: config.stableCV),
-                  !vocalsClash(outgoing: outgoing, outPoint: op,
-                               incoming: incoming, inPoint: inPoint, overlap: overlap,
-                               config: config)
+            guard note(&trace, .barUpgrade, "bars\(candidate).ceiling",
+                       overlap <= overlapCeiling, overlap, overlapCeiling,
+                       String(format: "%d bars = %.2f s against a %.2f s ceiling",
+                              candidate, overlap, overlapCeiling))
+            else { continue }
+            guard let op = outPoint(forOverlap: overlap) else {
+                _ = note(&trace, .barUpgrade, "bars\(candidate).outPoint", false, nil, nil,
+                         String(format: "no phrase boundary in [%.1f s, %.1f s] leaves room "
+                                + "for a %.2f s overlap",
+                                tailWindowStart, outLimit, overlap))
+                continue
+            }
+            _ = note(&trace, .barUpgrade, "bars\(candidate).outPoint", true, op, nil,
+                     String(format: "out point %.2f s", op))
+            guard note(&trace, .barUpgrade, "bars\(candidate).incomingRoom",
+                       inPoint + overlap <= incoming.duration,
+                       inPoint + overlap, incoming.duration,
+                       String(format: "in point %.2f s + %.2f s against a %.0f s track",
+                              inPoint, overlap, incoming.duration))
+            else { continue }
+            guard note(&trace, .barUpgrade, "bars\(candidate).stableOut",
+                       isStable(outgoing.rmsEnvelope, from: op, length: overlap,
+                                cv: config.stableCV),
+                       energyCV(outgoing.rmsEnvelope, from: op, length: overlap),
+                       config.stableCV,
+                       String(format: "outgoing energy CV %@ against a %.2f steadiness bar",
+                              cvText(outgoing.rmsEnvelope, from: op, length: overlap),
+                              config.stableCV))
+            else { continue }
+            guard note(&trace, .barUpgrade, "bars\(candidate).stableIn",
+                       isStable(incoming.rmsEnvelope, from: inPoint, length: overlap,
+                                cv: config.stableCV),
+                       energyCV(incoming.rmsEnvelope, from: inPoint, length: overlap),
+                       config.stableCV,
+                       String(format: "incoming energy CV %@ against a %.2f steadiness bar",
+                              cvText(incoming.rmsEnvelope, from: inPoint, length: overlap),
+                              config.stableCV))
+            else { continue }
+            guard note(&trace, .barUpgrade, "bars\(candidate).vocals",
+                       !vocalsClash(outgoing: outgoing, outPoint: op,
+                                    incoming: incoming, inPoint: inPoint, overlap: overlap,
+                                    config: config),
+                       nil, config.vocalClashRatio,
+                       String(format: "vocal density %@ / %@ against a %.2f clash line",
+                              scoreText(vocalScore(outgoing, from: op, length: overlap)),
+                              scoreText(vocalScore(incoming, from: inPoint, length: overlap)),
+                              config.vocalClashRatio))
             else { continue }
             bars = candidate
             chosenOutPoint = op
@@ -592,11 +754,42 @@ enum TransitionPlanner {
         }
         if chosenOutPoint == nil {
             let overlap4 = overlapDuration(bars: 4)
-            guard overlap4 <= overlapCeiling,
-                  let op4 = outPoint(forOverlap: overlap4),
-                  inPoint + overlap4 <= incoming.duration
+            guard note(&trace, .beatMatch, "overlapCeiling", overlap4 <= overlapCeiling,
+                       overlap4, overlapCeiling,
+                       String(format: "the 4-bar floor is %.2f s against a %.2f s ceiling",
+                              overlap4, overlapCeiling))
+            else { return nil }
+            guard let op4 = outPoint(forOverlap: overlap4) else {
+                _ = note(&trace, .beatMatch, "outPoint", false, nil, nil,
+                         String(format: "no phrase boundary in [%.1f s, %.1f s] leaves room "
+                                + "for the %.2f s floor (the track has %d boundaries)",
+                                tailWindowStart, outLimit, overlap4,
+                                outgoing.phraseBoundaries.count))
+                return nil
+            }
+            _ = note(&trace, .beatMatch, "outPoint", true, op4, nil,
+                     String(format: "out point %.2f s", op4))
+            guard note(&trace, .beatMatch, "incomingRoom",
+                       inPoint + overlap4 <= incoming.duration,
+                       inPoint + overlap4, incoming.duration,
+                       String(format: "in point %.2f s + %.2f s against a %.0f s track",
+                              inPoint, overlap4, incoming.duration))
             else { return nil }
             chosenOutPoint = op4
+        } else if trace != nil {
+            // The upgrade search already cleared these three for a longer
+            // overlap, so record them passed rather than leaving a hole in the
+            // ledger where the histogram expects a row.
+            let overlap = overlapDuration(bars: bars)
+            _ = note(&trace, .beatMatch, "overlapCeiling", true, overlap, overlapCeiling,
+                     String(format: "%d bars = %.2f s against a %.2f s ceiling",
+                            bars, overlap, overlapCeiling))
+            _ = note(&trace, .beatMatch, "outPoint", true, chosenOutPoint, nil,
+                     String(format: "out point %.2f s", chosenOutPoint ?? 0))
+            _ = note(&trace, .beatMatch, "incomingRoom", true,
+                     inPoint + overlap, incoming.duration,
+                     String(format: "in point %.2f s + %.2f s against a %.0f s track",
+                            inPoint, overlap, incoming.duration))
         }
         guard let outPoint = chosenOutPoint else { return nil }
 
@@ -655,6 +848,34 @@ enum TransitionPlanner {
         let variance = slice.reduce(Float(0)) { $0 + ($1 - mean) * ($1 - mean) }
             / Float(slice.count)
         return Double(variance.squareRoot() / mean) < cv
+    }
+
+    /// The number `isStable` compares against `cv` — the coefficient of
+    /// variation of the 1 s RMS over the window, or nil when the window is too
+    /// short or too quiet to judge. Trace-only: nothing decides on it.
+    private static func energyCV(
+        _ envelope: [Float], from: TimeInterval, length: TimeInterval
+    ) -> Double? {
+        let start = max(0, Int(from))
+        let end = min(envelope.count, Int((from + length).rounded(.up)))
+        guard end - start >= 3 else { return nil }
+        let slice = envelope[start..<end]
+        let mean = slice.reduce(0, +) / Float(slice.count)
+        guard mean > 1e-4 else { return nil }
+        let variance = slice.reduce(Float(0)) { $0 + ($1 - mean) * ($1 - mean) }
+            / Float(slice.count)
+        return Double(variance.squareRoot() / mean)
+    }
+
+    private static func cvText(
+        _ envelope: [Float], from: TimeInterval, length: TimeInterval
+    ) -> String {
+        energyCV(envelope, from: from, length: length)
+            .map { String(format: "%.3f", $0) } ?? "unmeasurable (window too short or silent)"
+    }
+
+    private static func scoreText(_ v: Double?) -> String {
+        v.map { String(format: "%.2f", $0) } ?? "—"
     }
 
     /// How many tail seconds of the outgoing track can sit under a fade:

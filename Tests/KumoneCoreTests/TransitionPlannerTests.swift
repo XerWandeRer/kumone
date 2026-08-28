@@ -857,6 +857,210 @@ import Foundation
         }
     }
 
+    // MARK: - Decision ledger (PlanTrace)
+
+    /// Plan once with a ledger, once without, and hand back both the plan and
+    /// the ledger — so every test here can assert the two agree.
+    private func traced(
+        outgoing: TrackAnalysis?, incoming: TrackAnalysis?,
+        stems: StemAvailability = .none
+    ) -> (planned: PlannedTransition, trace: PlanTrace) {
+        var trace: PlanTrace? = PlanTrace()
+        let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                             stems: stems, trace: &trace)
+        return (planned, trace!)
+    }
+
+    /// Every field of a decision, flattened — so "tracing changed nothing" is
+    /// a string comparison rather than a hand-written list of `#expect`s.
+    private func fingerprint(_ p: PlannedTransition) -> String {
+        var out: String
+        switch p.plan {
+        case .gapless:
+            out = "gapless"
+        case .crossfade(let d, let o, let i):
+            out = String(format: "crossfade %.6f %.6f %.6f", d, o, i)
+        case .beatMatched(let b):
+            out = String(format: "beatMatched %.6f %.6f %d %.6f %.6f %.6f %.6f",
+                         b.outPoint, b.inPoint, b.overlapBars, Double(b.outgoingRate),
+                         Double(b.incomingRate), b.bassSwapOffset, b.overlapDuration)
+        }
+        out += " | \(p.style.outroEffect) \(p.style.stagedEQ)"
+        out += " \(p.style.echoDelayTime.map { String(format: "%.6f", $0) } ?? "—")"
+        out += " \(p.style.stemTechnique?.label ?? "—")"
+        return out
+    }
+
+    /// The whole point of the design: asking for the ledger must not move a
+    /// single number. Run the corpus of shapes these tests already cover
+    /// through both entry points and compare field for field.
+    @Test func askingForATraceChangesNothing() {
+        let shapes: [(String, TrackAnalysis?, TrackAnalysis?)] = [
+            ("beat-matched", makeAnalysis(bpm: 120), makeAnalysis(bpm: 124)),
+            ("choppy", makeAnalysis(bpm: 120, rmsEnvelope: choppyEnvelope(duration: 200)),
+             makeAnalysis(bpm: 124, rmsEnvelope: choppyEnvelope(duration: 200))),
+            ("far bpm", makeAnalysis(bpm: 120), makeAnalysis(bpm: 160)),
+            ("shy tempo", makeAnalysis(bpm: 120, confidence: 0.3),
+             makeAnalysis(bpm: 120, confidence: 0.3)),
+            ("timbre clash", makeAnalysis(bpm: 120),
+             makeAnalysis(bpm: 124, melProfile: Self.profile(distance: 0.6))),
+            ("no boundaries", makeAnalysis(bpm: 120, phraseBoundaries: []),
+             makeAnalysis(bpm: 124)),
+            ("outro fade", makeAnalysis(bpm: 120, outroFadeStart: 170),
+             makeAnalysis(bpm: 124)),
+            ("gapless", makeAnalysis(duration: 40, phraseBoundaries: [20]), makeAnalysis()),
+            ("no incoming", makeAnalysis(), nil),
+        ]
+        for (name, a, b) in shapes {
+            let plain = TransitionPlanner.plan(outgoing: a, incoming: b)
+            let withLedger = traced(outgoing: a, incoming: b).planned
+            #expect(fingerprint(plain) == fingerprint(withLedger),
+                    "tracing moved the decision for \(name)")
+            // Same again with stems offered, where the planner has a second
+            // search to run.
+            let plainStems = TransitionPlanner.plan(outgoing: a, incoming: b, stems: .ready)
+            let ledgerStems = traced(outgoing: a, incoming: b, stems: .ready).planned
+            #expect(fingerprint(plainStems) == fingerprint(ledgerStems),
+                    "tracing moved the stem decision for \(name)")
+        }
+    }
+
+    /// The ledger and the plan are never allowed to disagree: a blocker means
+    /// no beat-matched plan, and a beat-matched plan means no blocker — and its
+    /// recorded bar count is the one in the plan.
+    @Test func theLedgerAgreesWithThePlanItRecorded() {
+        let shapes: [(TrackAnalysis?, TrackAnalysis?)] = [
+            (makeAnalysis(bpm: 120), makeAnalysis(bpm: 124)),
+            (makeAnalysis(bpm: 120, rmsEnvelope: choppyEnvelope(duration: 200)),
+             makeAnalysis(bpm: 124, rmsEnvelope: choppyEnvelope(duration: 200))),
+            (makeAnalysis(bpm: 120), makeAnalysis(bpm: 160)),
+            (makeAnalysis(bpm: 120, confidence: 0.3), makeAnalysis(bpm: 120, confidence: 0.3)),
+            (makeAnalysis(bpm: 120), makeAnalysis(bpm: 124,
+                                                 melProfile: Self.profile(distance: 0.6))),
+            (makeAnalysis(bpm: 120, phraseBoundaries: []), makeAnalysis(bpm: 124)),
+            (makeAnalysis(duration: 40, phraseBoundaries: [20]), makeAnalysis()),
+            (nil, makeAnalysis()),
+        ]
+        for (a, b) in shapes {
+            let (planned, trace) = traced(outgoing: a, incoming: b)
+            if case .beatMatched(let plan) = planned.plan {
+                #expect(trace.blocker == nil,
+                        "a beat-matched pair must have no blocker, got \(trace.blocker?.id ?? "—")")
+                #expect(trace.chosenBars == plan.overlapBars)
+            } else {
+                #expect(trace.blocker != nil,
+                        "a non-beat-matched pair must name the gate that stopped it")
+                #expect(trace.chosenBars == nil)
+            }
+        }
+    }
+
+    /// Each gate, made to be the one that fails, is the one the ledger blames.
+    @Test func theLedgerBlamesTheGateThatActuallyFailed() {
+        func blocker(_ a: TrackAnalysis?, _ b: TrackAnalysis?) -> String? {
+            traced(outgoing: a, incoming: b).trace.blocker?.id
+        }
+        // Too short to be worth a transition.
+        #expect(blocker(makeAnalysis(duration: 40, phraseBoundaries: [20]),
+                        makeAnalysis()) == "minDuration")
+        // Timbre far enough apart to demote the tier.
+        #expect(blocker(makeAnalysis(bpm: 120),
+                        makeAnalysis(bpm: 124,
+                                     melProfile: Self.profile(distance: 0.6)))
+                == "timbreDistance")
+        // Confident keys three fifths apart.
+        #expect(blocker(makeAnalysis(bpm: 120, keyPitchClass: 0, keyConfidence: 0.9),
+                        makeAnalysis(bpm: 124, keyPitchClass: 3, keyConfidence: 0.9))
+                == "keyDistance")
+        // Neither tempo is trusted.
+        #expect(blocker(makeAnalysis(bpm: 120, confidence: 0.3),
+                        makeAnalysis(bpm: 120, confidence: 0.3)) == "bpmConfidence")
+        // 120 → 135 is inside the 20 % clash line, so the tier stays
+        // compatible, but 12.5 % is well past the 8 % beat-match window.
+        #expect(blocker(makeAnalysis(bpm: 120), makeAnalysis(bpm: 135)) == "bpmDelta")
+        // Further out still and the tempo signal demotes the tier first, so
+        // the blame moves up the chain rather than down it.
+        #expect(blocker(makeAnalysis(bpm: 120), makeAnalysis(bpm: 160)) == "tempoClash")
+        // 100 → 92 is inside the 8 % window, but meeting in the middle bends
+        // the slower deck by 4.35 %, past the ±4 % limit.
+        #expect(blocker(makeAnalysis(bpm: 100), makeAnalysis(bpm: 92)) == "rateDeviation")
+        // No downbeat to align the incoming track to.
+        #expect(blocker(makeAnalysis(bpm: 120),
+                        makeAnalysis(bpm: 124, downbeats: [])) == "inPoint")
+        // No phrase boundary in the outgoing tail to start the overlap on.
+        #expect(blocker(makeAnalysis(bpm: 120, phraseBoundaries: []),
+                        makeAnalysis(bpm: 124)) == "outPoint")
+    }
+
+    /// First gate wins: once a pair is out, the chain stops, so the ledger
+    /// never blames it for a gate it was never asked to clear.
+    @Test func theChainStopsAtTheFirstFailure() {
+        // Tempos too shy to trust *and* far apart. Only the first is recorded.
+        let trace = traced(outgoing: makeAnalysis(bpm: 120, confidence: 0.3),
+                           incoming: makeAnalysis(bpm: 160, confidence: 0.3)).trace
+        #expect(trace.blocker?.id == "bpmConfidence")
+        #expect(!trace.gates.contains { $0.id == "bpmDelta" })
+        #expect(trace.gates.filter { !$0.passed }.count == 1)
+    }
+
+    /// The bar search shortens an overlap; it never eliminates a pair. A
+    /// choppy pair beat-matches at the 4-bar floor with failed upgrade gates
+    /// on the ledger and no blocker at all.
+    @Test func theBarSearchIsNeverBlamedForAnElimination() {
+        let choppy = choppyEnvelope(duration: 200)
+        let (planned, trace) = traced(
+            outgoing: makeAnalysis(bpm: 120, rmsEnvelope: choppy),
+            incoming: makeAnalysis(bpm: 124, rmsEnvelope: choppy))
+        guard case .beatMatched(let plan) = planned.plan else {
+            Issue.record("expected a beat-matched plan at the 4-bar floor")
+            return
+        }
+        #expect(plan.overlapBars == 4)
+        #expect(trace.blocker == nil)
+        #expect(trace.gates.contains { $0.stage == .barUpgrade && !$0.passed })
+    }
+
+    /// The shadow ledger answers the counterfactual a demoted pair otherwise
+    /// cannot: had the tier let it through, would anything else have stopped
+    /// it? Same two tempos, one pair only demoted by timbre — so nothing else
+    /// would have.
+    @Test func theShadowLedgerWalksTheChainTheTierCutShort() {
+        let clash = traced(
+            outgoing: makeAnalysis(bpm: 120),
+            incoming: makeAnalysis(bpm: 124, melProfile: Self.profile(distance: 0.6))).trace
+        #expect(clash.blocker?.id == "timbreDistance")
+        #expect(clash.shadowBlocker == nil, "this pair fails nothing but the tier")
+        #expect(clash.shadowGates.contains { $0.id == "bpmDelta" && $0.passed })
+
+        // Now a pair that is *both* timbre-demoted and tempo-mismatched: the
+        // blame stays on the tier, and the shadow says what came next.
+        let both = traced(
+            outgoing: makeAnalysis(bpm: 120),
+            incoming: makeAnalysis(bpm: 160, melProfile: Self.profile(distance: 0.6))).trace
+        #expect(both.blocker?.stage == .tier)
+        #expect(both.shadowBlocker?.id == "bpmDelta")
+    }
+
+    /// A gate's margin is what "by how much" means in the report, and it has
+    /// to point the right way on both sides of a line.
+    @Test func aGateReportsHowFarItMissedItsLine() {
+        let trace = traced(outgoing: makeAnalysis(bpm: 120),
+                           incoming: makeAnalysis(bpm: 135)).trace
+        guard let blocker = trace.blocker, let margin = blocker.margin else {
+            Issue.record("expected a numeric blocker")
+            return
+        }
+        // 120 → 135 is a 12.5 % gap against an 8 % window.
+        #expect(margin > 0)
+        #expect(abs((blocker.value ?? 0) - 0.125) < 0.001)
+        #expect(blocker.threshold == TransitionPlanner.maxBPMDeltaRatio)
+
+        // A confidence gate misses from below, so its margin is negative.
+        let shy = traced(outgoing: makeAnalysis(bpm: 120, confidence: 0.3),
+                         incoming: makeAnalysis(bpm: 120, confidence: 0.3)).trace
+        #expect((shy.blocker?.margin ?? 0) < 0)
+    }
+
     // MARK: - Config
 
     /// The flat constants the rest of the codebase reads must stay exactly

@@ -137,6 +137,17 @@ func explain(_ d: Audition.Decision) -> String {
     }
     if d.overridden { mechanics += "  [OVERRIDDEN by --style/--fade]" }
     lines.append(mechanics)
+    // Which gate on the beat-match chain this pair lost, and by how much.
+    if let blocker = d.planTrace.blocker {
+        lines.append("  beat-match    blocked at \(blocker.label) — \(blocker.detail)")
+        if let shadow = d.planTrace.shadowBlocker {
+            lines.append("                and would then have failed \(shadow.label)"
+                         + " — \(shadow.detail)")
+        }
+    } else {
+        lines.append("  beat-match    every gate cleared"
+                     + " (\(d.planTrace.chosenBars ?? 0) bars)")
+    }
     if d.stemsReady {
         var stemLine = "  stems on      "
         if let technique = d.plannedStemTechnique {
@@ -332,6 +343,157 @@ func runRender(_ args: Arguments) {
     }
 }
 
+// MARK: - beatMatched elimination ledger
+//
+// `beatMatched` is a conjunction of a dozen gates, so "the real library almost
+// never beat-matches" is not one fact but a distribution. The planner keeps a
+// ledger of every gate it walked (`PlanTrace`); this turns the ledger over a
+// whole corpus into the histogram that has to exist before anyone touches a
+// threshold: which gate did the killing, how often, and by how much.
+//
+// Attribution is *first gate wins*: a pair the tier stopped is counted at the
+// tier and nowhere else, never also blamed on the gates it never reached. The
+// counterfactual those pairs would otherwise answer is kept separately, off the
+// planner's shadow ledger.
+
+/// A bar of blocks, capped so one dominant row cannot run off the page.
+func bar(_ count: Int, of total: Int) -> String {
+    let width = total > 0 ? Int((Double(count) / Double(total) * 40).rounded()) : 0
+    return String(repeating: "█", count: max(count > 0 ? 1 : 0, width))
+}
+
+func eliminationSection(_ decisions: [Audition.Decision]) -> [String] {
+    var out = ["## beatMatched 逐门淘汰", ""]
+    let total = decisions.count
+    let matched = decisions.filter { $0.planKind == "beatMatched" }
+    out.append("\(total) 对里 \(matched.count) 对做成了 beatMatched，"
+               + "\(total - matched.count) 对被淘汰。下面按**第一道拦住它的门**归因 —— "
+               + "被档位（tier）拦下的一对只记在档位上，不重复计入它根本没走到的后续各门。")
+    out.append("")
+
+    // First-blocker histogram, in chain order.
+    var counts: [String: Int] = [:]
+    var labels: [String: String] = [:]
+    var stages: [String: String] = [:]
+    for d in decisions {
+        guard let b = d.planTrace.blocker else { continue }
+        counts[b.id, default: 0] += 1
+        labels[b.id] = b.label
+        stages[b.id] = b.stage.rawValue
+    }
+    out.append("**第一淘汰门**\n")
+    for id in PlanTrace.gateOrder {
+        let n = counts[id] ?? 0
+        guard n > 0 else { continue }
+        out.append("- `\(labels[id] ?? id)` (\(stages[id] ?? "")): \(n)  \(bar(n, of: total))")
+    }
+    if matched.count > 0 {
+        out.append("- `— cleared every gate —`: \(matched.count)  \(bar(matched.count, of: total))")
+    }
+    out.append("")
+
+    // Counterfactual: of the pairs the tier/key stopped, which would have died
+    // further down anyway?
+    let demoted = decisions.filter {
+        guard let b = $0.planTrace.blocker else { return false }
+        return b.stage == .tier || b.stage == .key
+    }
+    if !demoted.isEmpty {
+        var shadow: [String: Int] = [:]
+        var shadowLabels: [String: String] = [:]
+        var clean = 0
+        for d in demoted {
+            if let s = d.planTrace.shadowBlocker {
+                shadow[s.id, default: 0] += 1
+                shadowLabels[s.id] = s.label
+            } else {
+                clean += 1
+            }
+        }
+        out.append("**如果档位放行** — 被档位/调性拦下的 \(demoted.count) 对，"
+                   + "接着会死在哪道门（planner 的影子账本，不影响上面的归因）\n")
+        for id in PlanTrace.gateOrder {
+            let n = shadow[id] ?? 0
+            guard n > 0 else { continue }
+            out.append("- `\(shadowLabels[id] ?? id)`: \(n)  \(bar(n, of: demoted.count))")
+        }
+        if clean > 0 {
+            out.append("- `— would have beat-matched —`: \(clean)  \(bar(clean, of: demoted.count))")
+        }
+        out.append("")
+    }
+
+    // The bar-length search: never an elimination, only a shortening — so it
+    // gets its own tally.
+    let reachedBars = decisions.filter { d in
+        d.planTrace.gates.contains { $0.stage == .barUpgrade }
+    }
+    if !reachedBars.isEmpty {
+        var upgrade: [String: Int] = [:]
+        var upgradeLabels: [String: String] = [:]
+        var won = 0
+        for d in reachedBars {
+            if let bars = d.planTrace.chosenBars, bars > 4 { won += 1; continue }
+            let eight = d.planTrace.gates.filter { $0.id.hasPrefix("bars8.") }
+            let sixteen = d.planTrace.gates.filter { $0.id.hasPrefix("bars16.") }
+            guard let first = (eight.first { !$0.passed } ?? sixteen.first { !$0.passed })
+            else { continue }
+            upgrade[first.id, default: 0] += 1
+            upgradeLabels[first.id] = first.label
+        }
+        out.append("**16 / 8 小节升级** — 走到了小节搜索的 \(reachedBars.count) 对里，"
+                   + "是哪道门把它们压回 4 小节兜底（这一步从不淘汰 beatMatched，只缩短叠加）\n")
+        if won > 0 {
+            out.append("- `— upgraded to 8 or 16 bars —`: \(won)  \(bar(won, of: reachedBars.count))")
+        }
+        for (id, n) in upgrade.sorted(by: { $0.value == $1.value ? $0.key < $1.key
+                                            : $0.value > $1.value }) {
+            out.append("- `\(upgradeLabels[id] ?? id)`: \(n)  \(bar(n, of: reachedBars.count))")
+        }
+        out.append("")
+    }
+
+    // Signal spread: whether a gate is a near miss corpus-wide or a structural
+    // mismatch is the whole "tighten the line vs. rethink the rule" question.
+    func spreadOf(_ xs: [Double]) -> String {
+        guard !xs.isEmpty else { return "n/a" }
+        let s = xs.sorted()
+        return "min \(f(s.first!, 3)) · median \(f(s[s.count / 2], 3)) · "
+            + "max \(f(s.last!, 3))  (n=\(s.count))"
+    }
+    out.append("**信号分布** — 门槛差一点，还是根本不在一个量级\n")
+    out.append("- 音色距离（容忍线 \(f(Audition.standardConfig["neutralTimbreDistance"] ?? 0, 2))）："
+               + spreadOf(decisions.map(\.timbreDistance)))
+    out.append("- 节拍把握度（门槛 \(f(Audition.standardConfig["bpmConfidenceThreshold"] ?? 0, 2))）："
+               + spreadOf(decisions.flatMap { [$0.outgoingBPMConfidence, $0.incomingBPMConfidence] }))
+    out.append("- 折算速度差（对拍窗口 \(f(Audition.standardConfig["maxBPMDeltaRatio"] ?? 0, 2))）："
+               + spreadOf(decisions.compactMap(\.tempoRatio)))
+    out.append("")
+
+    // One line per pair: where it died and by how much.
+    out.append("**每一对的淘汰路径**\n")
+    for d in decisions {
+        let head = "- \(d.outgoingName) → \(d.incomingName): "
+        guard let b = d.planTrace.blocker else {
+            out.append(head + "**beatMatched** (\(d.planTrace.chosenBars ?? 0) bars)")
+            continue
+        }
+        var line = head + "**\(b.label)** — \(b.detail)"
+        if let m = b.margin, m.isFinite, abs(m) >= 0.005 {
+            line += String(format: " (%@ %.0f%%)", m > 0 ? "over by" : "short by",
+                           abs(m) * 100)
+        }
+        if let s = d.planTrace.shadowBlocker {
+            line += "; would then have failed **\(s.label)** — \(s.detail)"
+        } else if b.stage == .tier || b.stage == .key {
+            line += "; every later gate would have passed"
+        }
+        out.append(line)
+    }
+    out.append("")
+    return out
+}
+
 func runBatch(_ args: Arguments) {
     guard let dirArg = args.positional.first else { fail(usage) }
     // A stem render costs a model pass per pair; a corpus sweep is for
@@ -400,6 +562,7 @@ func runBatch(_ args: Arguments) {
                     + " | \(f(d.timbreDistance, 3))"
                     + " | \(optional(d.tempoRatio, 3)) | \(d.keyDistance.map(String.init) ?? "—")"
                     + " | \(optional(d.outgoingVocalScore))/\(optional(d.incomingVocalScore))"
+                    + " | \(d.planTrace.blocker?.label ?? "—")"
                     + " | \(d.planKind) | \(d.styleDescription)"
                     + " | \(d.plannedStemTechnique ?? "—")"
                     + " | \(f(d.overlapDuration))s"
@@ -469,6 +632,8 @@ func runBatch(_ args: Arguments) {
                    + "over the red line (\(f(clashLine, 1)) dB): "
                    + "\(over(rawGaps, clashLine)) → \(over(gaps, clashLine))")
     summary.append("")
+    summary.append(contentsOf: eliminationSection(decisions))
+
     let borderline = decisions.filter { !$0.nearMisses.isEmpty }
     if !borderline.isEmpty {
         summary.append("**Borderline pairs** (a threshold nudge would reclassify these)\n")
@@ -495,9 +660,9 @@ func runBatch(_ args: Arguments) {
         "## Per-pair decisions",
         "",
         "| pair | tier | loudness dB | raw loudness dB | trim out/in dB "
-            + "| timbre | tempo | key | vocals out/in "
+            + "| timbre | tempo | key | vocals out/in | blocked at "
             + "| plan | style | stem | overlap | out point | render |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ] + rows).joined(separator: "\n") + "\n"
 
     let docURL = outDir.appendingPathComponent("decisions.md")

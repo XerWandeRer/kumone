@@ -56,6 +56,36 @@ constant you moved changed the shape of the corpus:
 **Overlap length** — min 2.50s · median 2.50s · mean 3.81s · max 15.18s
 ```
 
+### 3b. Then read the elimination ledger
+
+`beatMatched` is a conjunction of a dozen gates, so "the library almost never
+beat-matches" is not one fact but a distribution. The planner keeps a
+gate-by-gate ledger (`PlanTrace`), and `decisions.md` turns it over the whole
+corpus into **beatMatched 逐门淘汰**:
+
+```
+**第一淘汰门**
+- `loudness gap` (tier): 27  ███████████████████████
+- `timbre distance` (tier): 13  ███████████
+- `folded BPM delta` (beatMatch): 1  █
+
+**如果档位放行** — 被档位/调性拦下的 45 对，接着会死在哪道门
+- `folded BPM delta`: 25  ██████████████████████
+- `— would have beat-matched —`: 14  ████████████
+```
+
+Attribution is **first gate wins**: a pair the tier stopped is counted at the
+tier and nowhere else. The second block is the counterfactual those pairs
+cannot otherwise answer — had the tier let them through, what would have
+stopped them — and it comes off a shadow ledger the planner walks only while
+tracing. A third block does the same for the 16 / 8-bar upgrade search, which
+never eliminates a pair, only shortens its overlap. `audition plan` prints the
+one-line version (`beat-match  blocked at …`) for a single pair, and the
+console's derivation chain narrates every gate with its numbers.
+
+The ledger is diagnostic only: nothing in it is read back by the planner, and
+the untraced call the product makes decides field-for-field what it always did.
+
 `decisions.md` also lists **borderline pairs** — every signal sitting within
 15 % of a threshold, e.g. *"loudness 6.75 dB just over the clash line
 6.50 dB"*. Those are the pairs your next constant change will flip, so they are
