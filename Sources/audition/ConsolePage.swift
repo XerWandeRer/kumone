@@ -76,6 +76,18 @@ button:disabled{opacity:.45;cursor:default}
 .tl h4 span{color:var(--dim);font-weight:400;font-size:.78rem}
 .tl svg{width:100%;height:auto;display:block;border-radius:8px;background:var(--panel2)}
 .tl svg.pick{cursor:crosshair}
+/* Section band. Same trick as the ruler: the SVG below is squashed to the panel
+   width, so any type inside it would stretch — the blocks are HTML, positioned
+   in percent off the same time→x mapping, and stay pixel-aligned with it. */
+.secband{position:relative;height:1.25rem;margin:.15rem 0 .2rem;border-radius:4px;
+  overflow:hidden;background:var(--panel2);font-size:.66rem}
+.secband span{position:absolute;top:0;bottom:0;display:flex;align-items:center;
+  justify-content:center;overflow:hidden;white-space:nowrap;
+  border-right:1px solid var(--panel)}
+.secband span i{position:absolute;inset:0;border-radius:0}
+.secband span b{position:relative;font-weight:600;padding:0 .2rem}
+.secband .none{position:static;display:block;line-height:1.25rem;color:var(--dim);
+  padding-left:.4rem;justify-content:flex-start;border:0}
 .ruler{position:relative;height:1.1rem;margin-top:.1rem;font-size:.65rem;color:var(--dim);
   overflow:hidden}
 .ruler .tick{position:absolute;top:0;transform:translateX(2px);white-space:nowrap}
@@ -215,7 +227,15 @@ audio{width:100%;margin:.4rem 0;height:38px}
     <span><i style="background:var(--key)"></i>人声密度</span>
     <span><i style="background:var(--good);opacity:.45"></i>两首歌叠在一起的那一段</span>
     <span><i style="background:var(--warn);opacity:.35"></i>前奏 / 尾奏</span>
-    <span>▾ 乐句起点 · 底部细刻度 = 每小节第一拍</span>
+    <span>▾ 乐句起点 · 底部细刻度 = 每小节第一拍 · 顶部细刻度 = 歌词行</span>
+  </p>
+  <p class="legend">
+    段落条（还只是给人眼核对用的，规划器暂时不读它）：
+    <span><i style="background:var(--dim);opacity:.3"></i>前奏 / 尾奏</span>
+    <span><i style="background:var(--accent);opacity:.34"></i>主歌</span>
+    <span><i style="background:var(--warn);opacity:.55"></i>副歌</span>
+    <span><i style="background:var(--key);opacity:.34"></i>过渡</span>
+    <span><i style="background:var(--bad);opacity:.48"></i>drop</span>
   </p>
 
   <h2>五项信号：系统在看什么</h2>
@@ -669,11 +689,43 @@ function paintVerdict() {
 
 // ---------------------------------------------------------------- timelines
 
+// Section kinds, in the console's own palette. Chorus is the loud colour on
+// purpose — it is the block every cue decision is measured against.
+const SECTION_STYLE = {
+  intro:  {c: "var(--dim)",    o: .30, label: "前奏"},
+  verse:  {c: "var(--accent)", o: .34, label: "主歌"},
+  chorus: {c: "var(--warn)",   o: .55, label: "副歌"},
+  bridge: {c: "var(--key)",    o: .34, label: "过渡"},
+  drop:   {c: "var(--bad)",    o: .48, label: "drop"},
+  outro:  {c: "var(--dim)",    o: .30, label: "尾奏"},
+};
+
+/// The structure band above a timeline. Empty sections are not a rendering
+/// failure — they are the segmenter refusing to guess, and the band says which
+/// confidence it refused at, because that number is the thing being tuned.
+function sectionBand(t) {
+  const conf = `分段置信度 ${fmt(t.structureConfidence)}`;
+  if (!t.sections || !t.sections.length)
+    return `<div class="secband"><span class="none">${conf}——没到门槛，`
+      + "这首没有可信的段落划分（下游照旧走能量启发式）</span></div>";
+  const pct = s => (s / t.duration) * 100;
+  const blocks = t.sections.map(s => {
+    const st = SECTION_STYLE[s.kind] || {c: "var(--dim)", o: .3, label: s.kind};
+    const left = pct(s.start), width = Math.max(0.4, pct(s.end) - left);
+    const title = `${st.label} ${mmss(s.start)}–${mmss(s.end)} · 重复 ${s.repetition}`
+      + ` · 能量 ${fmt(s.energy)} · 人声 ${fmt(s.vocalDensity)}`;
+    return `<span style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" title="${title}"
+      ><i style="background:${st.c};opacity:${st.o}"></i><b>${st.label}</b></span>`;
+  }).join("");
+  return `<div class="secband">${blocks}</div>`;
+}
+
 function timeline(t, role, r) {
   const W = 1000, H = 132, PAD = 4;
   const x = s => PAD + (s / t.duration) * (W - 2 * PAD);
   const top = 14, base = H - 20, h = base - top;
   let g = "";
+
 
   // intro / outro shading
   if (t.introEnd > 0)
@@ -710,6 +762,16 @@ function timeline(t, role, r) {
       d += `${i ? "L" : "M"} ${(PAD + i * step).toFixed(1)} ${(base - v * h).toFixed(1)} `;
     });
     g += `<path d="${d}" fill="none" stroke="var(--key)" stroke-width="1.4" opacity=".95"/>`;
+  }
+  // Lyric lines as ticks along the top, drawn over the curves. Free ground
+  // truth for the section band above: a chorus boundary that does not sit where
+  // the repeated block of lines starts is a wrong boundary, and that is visible
+  // without anyone annotating anything.
+  const ly = (REPORT.lyrics || {})[role === "out" ? "outgoing" : "incoming"];
+  for (const time of (ly && ly.times) || []) {
+    if (time < 0 || time > t.duration) continue;
+    g += `<line x1="${x(time).toFixed(1)}" y1="${top}" x2="${x(time).toFixed(1)}" y2="${top + 6}"
+           stroke="var(--fg)" opacity=".45"/>`;
   }
   // downbeat grid
   g += t.downbeats.map(d =>
@@ -770,7 +832,11 @@ function paintTimelines() {
         <span>${mmss(t.duration)} · ${fmt(t.bpm, 1)} BPM (${fmt(t.bpmConfidence)})
           · ${t.key || "无调"} (${fmt(t.keyConfidence)})
           · intro ${mmss(t.introEnd)}
-          · outro ${t.outroFadeStart != null ? mmss(t.outroFadeStart) : "无"}</span></h4>
+          · outro ${t.outroFadeStart != null ? mmss(t.outroFadeStart) : "无"}
+          · 分段 ${t.sections && t.sections.length
+            ? t.sections.length + " 段（" + fmt(t.structureConfidence) + "）"
+            : "无（" + fmt(t.structureConfidence) + "）"}</span></h4>
+      ${sectionBand(t)}
       ${timeline(t, role, r)}
     </div>`;
   $("#timelines").innerHTML = block(r.outgoing, "out", "出 ") + block(r.incoming, "in", "入 ");
@@ -1185,6 +1251,33 @@ function aiTimelines() {
   return lines.join("\n");
 }
 
+/// The structure table. Paired with the lyrics block below it, this is what
+/// lets an outside reader check a label — "副歌 at 2:41" against the line that
+/// repeats there — instead of taking the segmenter's word for it.
+function aiSections() {
+  const r = REPORT;
+  const lines = ["## 段落划分（分析器给的,规划器还没用它选点）"];
+  lines.push("energy 是段均 RMS / 全曲峰值,vocal 是段均人声活跃度 / 全曲均值"
+    + "（1 = 与全曲平均一样密）,repeat 是同类段落出现的次数。"
+    + "置信度低于门槛时整份丢空——那不是失败,是分析器拒绝猜。"
+    + "标签可以怀疑:歌词块的重复位置才是判它对不对的依据。");
+  for (const [label, t] of [["出曲", r.outgoing], ["入曲", r.incoming]]) {
+    lines.push("");
+    lines.push(`### ${label} ${t.name}（置信度 ${fmt(t.structureConfidence)}）`);
+    if (!t.sections || !t.sections.length) {
+      lines.push("（没有可信的段落划分）");
+      continue;
+    }
+    for (const s of t.sections) {
+      const st = SECTION_STYLE[s.kind] || {label: s.kind};
+      const name = st.label === s.kind ? s.kind : `${st.label}(${s.kind})`;
+      lines.push(`  ${mmss(s.start)}–${mmss(s.end)}  ${name}`
+        + `  repeat=${s.repetition} energy=${fmt(s.energy)} vocal=${fmt(s.vocalDensity)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 /// Timed lyrics from the corpus `.lrc` sidecars, so "let the outgoing singer
 /// finish the line" is a decision the AI can actually make.
 function aiLyrics() {
@@ -1220,6 +1313,8 @@ function aiContext() {
   }
   lines.push("");
   lines.push(aiTimelines());
+  lines.push("");
+  lines.push(aiSections());
   lines.push("");
   lines.push(aiLyrics());
   lines.push("");

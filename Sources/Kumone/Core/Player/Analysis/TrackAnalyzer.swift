@@ -9,6 +9,10 @@ import Foundation
 // programming (Ellis 2007) for the beat grid, low-frequency voting for
 // downbeats, and RMS-based structure features (phrases, intro, outro).
 //
+// The same pass also feeds `StructureSegmenter` (v7), which turns the per-beat
+// log-mel/chroma into a self-similarity matrix and hands back `sections` —
+// intro/verse/chorus/… — or nothing at all when it is not confident.
+//
 // The same STFT pass also feeds two tonal/timbral estimators: a peak-picked
 // chromagram → Krumhansl-Schmuckler template matching for the key, and a
 // four-feature vocal-activity detector.
@@ -182,6 +186,15 @@ enum TrackAnalyzer {
             fps: fps,
             rmsEnvelope: rmsEnvelope)
 
+        // Structure segmentation rides on the features already in hand — no
+        // second sweep over the audio — and returns nothing at all when it is
+        // not confident, so everything downstream keeps its pre-v7 behaviour
+        // unless the track is one the segmenter is sure about.
+        let structure = StructureSegmenter.segment(
+            mel: mel, chroma: features.chroma, low: lowEnergy, fps: fps,
+            beats: beats, downbeats: downbeats,
+            rmsEnvelope: rmsEnvelope, vocalActivity: vocals, duration: duration)
+
         return TrackAnalysis(
             version: TrackAnalysis.currentVersion,
             bpm: bpm,
@@ -202,7 +215,9 @@ enum TrackAnalyzer {
             // the same resampled mono signal every other feature uses, so it
             // costs one extra pass of two biquads and no extra decode.
             referenceLoudness: LoudnessMeter.integratedLUFS(x, sampleRate: sr),
-            peakDBFS: LoudnessMeter.peakDBFS(x))
+            peakDBFS: LoudnessMeter.peakDBFS(x),
+            sections: structure.sections,
+            structureConfidence: structure.confidence)
     }
 
     /// Whole-track timbre fingerprint for the planner's compatibility gate:

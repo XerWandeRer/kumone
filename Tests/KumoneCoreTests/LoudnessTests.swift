@@ -95,7 +95,8 @@ import Foundation
     }
 
     @Test func analysisVersionCoversTheNewFields() {
-        #expect(TrackAnalysis.currentVersion == 6)
+        // 6 added the loudness fields; 7 added `sections` (predev §2.1).
+        #expect(TrackAnalysis.currentVersion == 7)
     }
 }
 

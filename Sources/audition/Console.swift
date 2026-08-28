@@ -168,6 +168,10 @@ final class Console: @unchecked Sendable {
                 "count": all.count,
                 "head": Audition.Lyrics.head(all, count: 12).map { ["t": $0.time, "text": $0.text] },
                 "tail": Audition.Lyrics.tail(all, count: 12).map { ["t": $0.time, "text": $0.text] },
+                // Every line's timestamp, words dropped: the timeline draws them
+                // as ticks under the section band, which is how a section
+                // boundary gets checked against where the singing actually is.
+                "times": all.map(\.time),
             ] as [String: Any]
         }
         object["lyrics"] = ["outgoing": lines(outgoing), "incoming": lines(incoming)]
