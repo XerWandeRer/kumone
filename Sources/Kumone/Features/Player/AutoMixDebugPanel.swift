@@ -80,6 +80,26 @@ struct AutoMixDebugPanel: View {
                      + " / \(AutoMixDebugFormat.clock(now.duration))")
             DebugRow("trim", String(format: "%+.2f dB", now.trimDB))
             DebugRow("analysis", now.analyzed ? "in hand" : "none")
+            deckRow("deck A", now.deckA)
+            deckRow("deck B", now.deckB)
+        }
+    }
+
+    /// One deck's rate and gain stages. The rate goes red when it is bent with
+    /// no transition to account for it — that combination *is* the watery-
+    /// playback bug, and it is the reason this row exists.
+    private func deckRow(_ label: String, _ deck: AutoMixDebugDeck) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(verbatim: label)
+                .foregroundStyle(.secondary)
+                .frame(width: 76, alignment: .leading)
+            Text(verbatim: String(format: "×%.4f", deck.rate))
+                .fontWeight(deck.rateIsSuspect ? .bold : .regular)
+                .foregroundStyle(deck.rateIsSuspect ? Color.red : Color.primary)
+            Text(verbatim: String(format: "pad %+.2f · ride %+.2f · trim %+.2f dB · %@",
+                                  deck.ratePadDB, deck.rideDB, deck.trimDB, deck.role))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
     }
 

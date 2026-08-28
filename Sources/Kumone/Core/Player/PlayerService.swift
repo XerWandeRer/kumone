@@ -1368,6 +1368,20 @@ final class PlayerService: ObservableObject {
     }
 
     private func publishDebugNow() {
+        // One queue hop for both decks, and only while the panel is open — see
+        // `PlaybackEngine.deckGains`. Reading them separately could straddle a
+        // transition tick, which is the exact instant a stuck rate is about to
+        // be explained away.
+        let gains = engine.deckGains()
+        func deck(_ which: Deck, _ snapshot: PlaybackEngine.DeckGainSnapshot)
+            -> AutoMixDebugDeck {
+            AutoMixDebugDeck(
+                role: which == activeDeck
+                    ? (transitionArmed ? "outgoing" : "playing")
+                    : (transitionArmed ? "incoming" : "idle"),
+                rate: snapshot.rate, trimDB: snapshot.trimDB, rideDB: snapshot.rideDB,
+                ratePadDB: snapshot.ratePadDB, inTransition: snapshot.inTransition)
+        }
         AutoMixDebugModel.shared.setNow(AutoMixDebugNow(
             title: currentTrack?.name,
             phase: debugPhaseLabel(),
@@ -1375,7 +1389,9 @@ final class PlayerService: ObservableObject {
             position: progress,
             duration: duration,
             trimDB: loudnessTrimDB(for: currentAnalysis),
-            analyzed: currentAnalysis != nil))
+            analyzed: currentAnalysis != nil,
+            deckA: deck(.a, gains.a),
+            deckB: deck(.b, gains.b)))
     }
 
     private func publishDebugPlan(_ planned: PlannedTransition, next: PrefetchedNext) {

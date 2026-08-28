@@ -17,6 +17,25 @@ import Foundation
 // On iOS every plan is `.gapless` and nothing ever activates it, so the whole
 // thing costs a Bool test per push.
 
+/// One deck's rate and gain stages, as the panel prints them.
+///
+/// Both decks are shown, always. The watery-playback family of bugs is exactly
+/// "a deck left off unity rate with nothing running", and it is invisible in a
+/// read-out that only shows the deck currently carrying the song — the leak is
+/// as often on the *other* one, waiting to be reused.
+struct AutoMixDebugDeck: Equatable {
+    var role = "idle"
+    var rate: Float = 1
+    var trimDB: Double = 0
+    var rideDB: Double = 0
+    var ratePadDB: Double = 0
+    var inTransition = false
+
+    /// A bent rate with no transition to explain it. This is the read-out the
+    /// panel colours red: it is the bug, not a symptom of it.
+    var rateIsSuspect: Bool { abs(rate - 1) > 0.001 && !inTransition }
+}
+
 /// The "Now" group: what is audible this instant.
 struct AutoMixDebugNow: Equatable {
     var title: String?
@@ -31,6 +50,9 @@ struct AutoMixDebugNow: Equatable {
     var trimDB: Double = 0
     /// The playing track has a full analysis in hand (so a real plan is possible).
     var analyzed = false
+    /// Both decks as the engine has them this instant, read in one hop.
+    var deckA = AutoMixDebugDeck()
+    var deckB = AutoMixDebugDeck()
 }
 
 /// How far the prefetch pipeline has got with the auto-advance target.

@@ -365,9 +365,24 @@ final class PlaybackEngine: @unchecked Sendable {
     private var transition: TransitionState? {
         get { storedTransition }
         set {
-            if let old = storedTransition, old !== newValue { endTempoRampLocked(old) }
+            if let old = storedTransition, old !== newValue {
+                // The single chokepoint every teardown path goes through, so
+                // it is also the only place that can honestly say a plan was
+                // dropped and from which phase — which is the first question
+                // asked of a deck found stuck off unity.
+                PlaybackJournal.note(
+                    "plan dropped phase=\(old.phase) \(newValue == nil ? "cleared" : "replaced") "
+                        + "from=\(old.from.rawValue) to=\(old.to.rawValue) \(journalRates)")
+                endTempoRampLocked(old)
+            }
             storedTransition = newValue
         }
+    }
+
+    /// Both decks' rates, for a journal line. Cheap enough to build on any
+    /// lifecycle event; never called per tick.
+    private var journalRates: String {
+        PlaybackJournal.rates(deckStates[.a]!.timePitch.rate, deckStates[.b]!.timePitch.rate)
     }
 
     private var storedTransition: TransitionState?
@@ -758,6 +773,12 @@ final class PlaybackEngine: @unchecked Sendable {
             let resolved = self.resolvePlanLocked(planned, from: self.deckStates[from]!)
             self.transition = TransitionState(plan: resolved.plan, style: resolved.style,
                                               rideDB: resolved.rideDB, from: from, to: to)
+            PlaybackJournal.note(
+                "plan armed \(from.rawValue)→\(to.rawValue) "
+                    + "\(Self.journalPlan(resolved.plan)) "
+                    + String(format: "ride=%+.2fdB ", resolved.rideDB)
+                    + "stem=\(resolved.style.stemTechnique?.label ?? "none") "
+                    + "\(self.journalRates)")
             self.startTransitionTimerLocked(interval: self.slowTickInterval)
         }
     }
@@ -862,6 +883,44 @@ final class PlaybackEngine: @unchecked Sendable {
         }
     }
 
+    /// Both decks' rate and gain stages, read in **one** queue hop.
+    ///
+    /// The watery-playback bug is always a deck left off unity rate with no
+    /// transition running, and the only way to see it while it is happening is
+    /// to read both decks at the same instant — two `effectSnapshot` calls are
+    /// two hops and can straddle a tick, which is exactly the moment in
+    /// question. Everything here is a plain load; the caller (the AutoMix debug
+    /// panel, only while its window is open) polls it at 5 Hz, and nothing
+    /// polls it otherwise.
+    struct DeckGainSnapshot: Sendable, Equatable {
+        var rate: Float = 1
+        /// Where a glide is heading, when the rate is being ramped or released.
+        var trimDB: Double = 0
+        var rideDB: Double = 0
+        var ratePadDB: Double = 0
+        /// A transition is running on this deck right now, so a rate off unity
+        /// is expected rather than a leak.
+        var inTransition = false
+    }
+
+    func deckGains() -> (a: DeckGainSnapshot, b: DeckGainSnapshot) {
+        queue.sync {
+            let live = transition
+            func snapshot(_ deck: Deck) -> DeckGainSnapshot {
+                let state = deckStates[deck]!
+                return DeckGainSnapshot(
+                    rate: state.timePitch.rate,
+                    // The deck stores the trim as the multiplier it applies;
+                    // dB is what the panel reads and what the sidecar quoted.
+                    trimDB: state.trim > 0 ? 20 * log10(Double(state.trim)) : 0,
+                    rideDB: state.rideDB,
+                    ratePadDB: state.ratePadDB,
+                    inTransition: live.map { $0.from == deck || $0.to == deck } ?? false)
+            }
+            return (snapshot(.a), snapshot(.b))
+        }
+    }
+
     /// Test hook: whether any transition is still scheduled or running.
     var hasPendingTransition: Bool { queue.sync { transition != nil } }
 
@@ -912,7 +971,13 @@ final class PlaybackEngine: @unchecked Sendable {
     /// so a late re-plan can never cut audio that is already sounding.
     func replaceTransitionPlan(_ planned: PlannedTransition) {
         queue.async {
-            guard let tr = self.transition, tr.phase == .waiting else { return }
+            guard let tr = self.transition, tr.phase == .waiting else {
+                PlaybackJournal.note(
+                    "plan replace ignored phase="
+                        + "\(self.transition.map { "\($0.phase)" } ?? "none") "
+                        + "\(self.journalRates)")
+                return
+            }
             // The new plan carries its own glide (or none); installing it hands
             // the old one's back rather than letting a state that was not built
             // for it inherit a bent deck.
@@ -929,6 +994,28 @@ final class PlaybackEngine: @unchecked Sendable {
                 state.segment = segment
             }
             self.transition = state
+            PlaybackJournal.note(
+                "plan replaced \(tr.from.rawValue)→\(tr.to.rawValue) "
+                    + "\(Self.journalPlan(resolved.plan)) "
+                    + "segment=\(state.segment != nil ? "kept" : "dropped") "
+                    + "\(self.journalRates)")
+        }
+    }
+
+    /// A plan in one field-per-number line, the same shape everywhere so the
+    /// journal can be grepped and diffed across two runs of the same seam.
+    private static func journalPlan(_ plan: TransitionPlan) -> String {
+        switch plan {
+        case .gapless:
+            return "kind=gapless"
+        case .crossfade(let duration, let outPoint, let inPoint):
+            return String(format: "kind=crossfade out=%.3f in=%.3f overlap=%.3f",
+                          outPoint, inPoint, duration)
+        case .beatMatched(let p):
+            return String(format: "kind=beatMatched out=%.3f in=%.3f overlap=%.3f bars=%d "
+                          + "rateOut=%.4f rateIn=%.4f swap=%.3f",
+                          p.outPoint, p.inPoint, p.overlapDuration, p.overlapBars,
+                          p.outgoingRate, p.incomingRate, p.bassSwapOffset)
         }
     }
 
@@ -976,7 +1063,22 @@ final class PlaybackEngine: @unchecked Sendable {
     /// Deliberately does NOT touch the fader: raising a deck's gain while its
     /// chain may still be sounding is what `resetDeckLocked` exists to avoid.
     private func neutralizeEffectsLocked(_ state: DeckState) {
+        // The rate before the snap, because this is the one call that *silently
+        // fixes* a stuck bend — a journal that only showed the after would make
+        // the bug look like it never happened.
+        if abs(state.timePitch.rate - 1) > 0.001 {
+            PlaybackJournal.note(String(
+                format: "deck neutralize deck=%@ rate=×%.4f → ×1.0000 pad=%+.2fdB",
+                journalDeckName(state), state.timePitch.rate, state.ratePadDB))
+        }
         DeckChain.neutralize(timePitch: state.timePitch, eq: state.eq, delay: state.delay)
+    }
+
+    /// Which deck a state belongs to, for a journal line. Linear over two
+    /// entries, and only ever on a lifecycle event.
+    private func journalDeckName(_ state: DeckState) -> String {
+        if state === segmentState { return "segment" }
+        return deckStates.first { $0.value === state }?.key.rawValue ?? "?"
     }
 
     // MARK: - Fader (locked)
@@ -1058,6 +1160,8 @@ final class PlaybackEngine: @unchecked Sendable {
             state.ratePadTargetDB = 0
             return
         }
+        PlaybackJournal.note(String(
+            format: "pad release from=%+.2fdB rate=×%.4f", state.ratePadDB, state.timePitch.rate))
         state.ratePadTargetDB = 0
         startRideTimerLocked()
     }
@@ -1253,6 +1357,10 @@ final class PlaybackEngine: @unchecked Sendable {
     /// `play(deck:from:)`, `armGaplessLocked`, `beginOverlapLocked`'s ramp,
     /// the gapless drain fallback, and the cancel paths all set it explicitly.
     private func resetDeckLocked(_ state: DeckState, keepingEchoTail: Bool = false) {
+        PlaybackJournal.note(String(
+            format: "deck reset deck=%@ rate=×%.4f pad=%+.2fdB ride=%+.2fdB echoTail=%@",
+            journalDeckName(state), state.timePitch.rate, state.ratePadDB, state.rideDB,
+            keepingEchoTail ? "kept" : "no"))
         state.generation += 1
         if keepingEchoTail {
             // The tail owns the fader; a pending flush restore must not fire
@@ -1719,6 +1827,11 @@ final class PlaybackEngine: @unchecked Sendable {
         let padTarget = padTargetLocked(from)
         let padStart = ramp.start - TransitionAutomation.ratePadLeadSeconds(padTarget)
         if padTarget != 0, position >= padStart {
+            if !tr.rampActive {
+                PlaybackJournal.note(String(
+                    format: "pad engage deck=%@ target=%+.2fdB at=%.3f lead=%.2fs",
+                    tr.from.rawValue, padTarget, position, ramp.start - padStart))
+            }
             tr.rampActive = true      // so every teardown path hands it back
             setRatePadLocked(from, db: padTarget * Double(
                 TransitionAutomation.ramp(position, from: padStart, to: ramp.start)))
@@ -1728,6 +1841,11 @@ final class PlaybackEngine: @unchecked Sendable {
         // Anchor on first entry, and never past the end — a glide with no room
         // left is a step, which is exactly what this seam used to be.
         let anchor = tr.rampFrom ?? Swift.min(position, ramp.end)
+        if tr.rampFrom == nil {
+            PlaybackJournal.note(String(
+                format: "ramp glide start deck=%@ from=%.3f end=%.3f target=×%.4f rate=×%.4f",
+                tr.from.rawValue, anchor, ramp.end, ramp.target, from.timePitch.rate))
+        }
         tr.rampFrom = anchor
         tr.rampActive = true
         let bent = TransitionAutomation.TempoRamp(
@@ -1751,6 +1869,9 @@ final class PlaybackEngine: @unchecked Sendable {
         tr.rampActive = false
         tr.rampFrom = nil
         guard let from = deckStates[tr.from] else { return }
+        PlaybackJournal.note(String(
+            format: "ramp glide end deck=%@ was=×%.4f → ×1.0000 (plan lost or overlap took over)",
+            tr.from.rawValue, from.timePitch.rate))
         from.timePitch.rate = 1
         // The pad exists only to cover the bend; the bend is gone, so it goes
         // with it — but *glided*, not snapped. This deck is still playing, and
@@ -1859,6 +1980,12 @@ final class PlaybackEngine: @unchecked Sendable {
         setFaderLocked(to, 0)
         to.isPlaying = true
         startNodeIfNeededLocked(to)
+        PlaybackJournal.note(
+            "overlap begin \(tr.from.rawValue)→\(tr.to.rawValue) "
+                + String(format: "in=%.3f overlap=%.3f swap=%.3f stagedEQ=%@ ",
+                         inPoint, tr.overlapDuration, tr.swapOffset,
+                         tr.style.stagedEQ ? "yes" : "no")
+                + "\(journalRates)")
         tr.phase = .overlapping
         tr.elapsed = 0
         // The overlap automation writes the outgoing rate from here on (flat at
@@ -1928,6 +2055,10 @@ final class PlaybackEngine: @unchecked Sendable {
         segmentState.player.volume = 0
         segmentState.faderRequest = 0
         segmentState.player.play(at: startTime)
+        PlaybackJournal.note(String(
+            format: "splice armed %@→%@ spliceStart=%.3f duration=%.3f head=%.3f tail=%.3f ",
+            tr.from.rawValue, tr.to.rawValue, segment.spliceStart, segment.duration,
+            segment.handoffIn, segment.handoffOut) + journalRates)
         tr.phase = .segmentArmed
         startTransitionTimerLocked(interval: tickInterval)
         return true
@@ -2004,6 +2135,9 @@ final class PlaybackEngine: @unchecked Sendable {
                 setSegmentFaderLocked(u)
             } else {
                 setSegmentFaderLocked(1)
+                PlaybackJournal.note(String(
+                    format: "splice head done deck=%@ retired at=%.3f ",
+                    tr.from.rawValue, elapsed) + journalRates)
                 retireOutgoingForSegmentLocked(from)
             }
         }
@@ -2071,6 +2205,9 @@ final class PlaybackEngine: @unchecked Sendable {
         setFaderLocked(to, 0)
         to.isPlaying = true
         to.player.play(at: start)
+        PlaybackJournal.note(String(
+            format: "splice tail start deck=%@ resume=%.3f ride=%+.2fdB ",
+            tr.to.rawValue, segment.incomingResume, segment.incomingRideDB) + journalRates)
     }
 
     private func finishSegmentLocked(_ tr: TransitionState) {
@@ -2104,6 +2241,8 @@ final class PlaybackEngine: @unchecked Sendable {
         parkSegmentLocked()
         if from.isPlaying { retireOutgoingForSegmentLocked(from) }
         resetDeckLocked(from)
+        PlaybackJournal.note("transition complete via=splice "
+                             + "\(tr.from.rawValue)→\(tr.to.rawValue) \(journalRates)")
         eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
         transition = nil
         stopTransitionTimerLocked()
@@ -2208,6 +2347,9 @@ final class PlaybackEngine: @unchecked Sendable {
             to.timePitch.rate = settle.incomingRate
             if settle.rateRestoreDone {
                 tr.restoringRate = false
+                PlaybackJournal.note(String(
+                    format: "rate release DONE deck=%@ final=×%.4f after=%.3fs ",
+                    tr.to.rawValue, to.timePitch.rate, tr.restoreElapsed) + journalRates)
                 // Back at unity rate, so the pad has nothing left to cover.
                 // Released here rather than alongside the rate glide because
                 // it is a gain move and the rate is not: the rate hurries back
@@ -2305,10 +2447,17 @@ final class PlaybackEngine: @unchecked Sendable {
         to.band(.mid).gain = 0
         to.band(.high).gain = 0
         to.band(.highPass).bypass = true
+        PlaybackJournal.note("transition complete via=overlap "
+                             + "\(tr.from.rawValue)→\(tr.to.rawValue) "
+                             + "echoTail=\(tailRinging ? "ringing" : "none") \(journalRates)")
         eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
 
         if case .beatMatched(let plan) = tr.plan, abs(plan.incomingRate - 1) > 0.001 {
             tr.restoringRate = true
+            PlaybackJournal.note(String(
+                format: "rate release start deck=%@ from=×%.4f over=%.2fs ",
+                tr.to.rawValue, to.timePitch.rate,
+                TransitionAutomation.rateReleaseDuration(tr.plan)) + journalRates)
         } else {
             to.timePitch.rate = 1
             releaseRatePadLocked(to)
@@ -2350,6 +2499,8 @@ final class PlaybackEngine: @unchecked Sendable {
                 from: tr.from, to: tr.to,
                 via: TransitionOutcome(path: .gapless, plan: tr.plan)))
             resetDeckLocked(from)
+            PlaybackJournal.note("transition complete via=gapless "
+                                 + "\(tr.from.rawValue)→\(tr.to.rawValue) \(journalRates)")
             eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
             transition = nil
             stopTransitionTimerLocked()
@@ -2371,6 +2522,12 @@ final class PlaybackEngine: @unchecked Sendable {
 
     private func cancelTransitionLocked() {
         guard let tr = transition else { return }
+        // Named before the teardown runs: "which path did this seam die down"
+        // is the question the journal exists to answer, and each `case` below
+        // hands the decks back differently.
+        PlaybackJournal.note(
+            "transition cancel teardown=\(tr.phase) midpointSent=\(tr.midpointSent) "
+                + "\(tr.from.rawValue)→\(tr.to.rawValue) \(journalRates)")
         transition = nil
         stopTransitionTimerLocked()
         let from = deckStates[tr.from]!
