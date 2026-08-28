@@ -182,8 +182,15 @@ enum TransitionAutomation {
 
     /// Geometry-injecting overload, so a caller stepping a whole transition
     /// does not recompute the landmarks 50 times a second.
+    ///
+    /// `approximateStems` is the live engine's stand-in for a stem technique
+    /// it cannot perform (see below). Pass false when the deck really is being
+    /// fed separated stems — a pre-rendered segment, or an audition render with
+    /// a separator wired up — or the duck lands *on top of* the technique it
+    /// was only ever meant to imitate.
     static func frame(plan: TransitionPlan, style: TransitionStyle,
-                      elapsed: TimeInterval, geometry: Geometry) -> Frame {
+                      elapsed: TimeInterval, geometry: Geometry,
+                      approximateStems: Bool = true) -> Frame {
         var f = Frame()
         guard case .gapless = plan else {
             let duration = geometry.overlapDuration
@@ -213,14 +220,14 @@ enum TransitionAutomation {
 
             applyEQHandover(&f, plan: plan, style: style, geometry: geometry, elapsed: t)
 
-            // Live approximation of the vocal-facing stem techniques: the
-            // engine has no stem playback path yet (that is S3's pre-render
-            // job), so a plan that asked for one gets a mid-band duck on the
-            // outgoing deck — the 900 Hz parametric band carries most vocal
+            // Live approximation of the vocal-facing stem techniques, for the
+            // hand-overs that get no separated audio: a mid-band duck on the
+            // outgoing deck, the 900 Hz parametric band carrying most vocal
             // presence. Crude next to a real separated duck, but audibly the
-            // right direction, and it only engages when the planner explicitly
-            // chose a stem technique.
-            if style.stemTechnique != nil {
+            // right direction. It engages only when the planner explicitly
+            // chose a stem technique *and* nothing is going to perform it —
+            // no separator installed, or the pre-render did not finish in time.
+            if style.stemTechnique != nil, approximateStems {
                 let edge = Float(min(1, t / 0.5))
                 f.outgoing.midGain = min(f.outgoing.midGain,
                                          Self.stemApproxDuckDB * edge)

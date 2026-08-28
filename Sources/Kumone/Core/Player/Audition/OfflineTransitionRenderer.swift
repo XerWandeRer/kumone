@@ -488,7 +488,10 @@ enum OfflineTransitionRenderer {
             while elapsed < overlap {
                 let frame = TransitionAutomation.frame(
                     plan: planned.plan, style: planned.style,
-                    elapsed: elapsed, geometry: geometry)
+                    elapsed: elapsed, geometry: geometry,
+                    // The stem layer has already rewritten the source buffers,
+                    // so the live stand-in for it must not run as well.
+                    approximateStems: stemApplied == nil)
                 from.apply(frame.outgoing)
                 to.apply(frame.incoming)
                 if frame.echoThrown { echoThrown = true }

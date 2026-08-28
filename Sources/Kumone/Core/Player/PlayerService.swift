@@ -186,6 +186,13 @@ final class PlayerService: ObservableObject {
     private var prefetchedNext: PrefetchedNext?
     private var transitionArmed = false
     private var pendingTransitionTrack: Track?
+    /// The plan the engine is currently holding, kept so the stem pre-render
+    /// knows which seam it is rendering for (and notices when a re-plan moves
+    /// it). Nil whenever no hand-over is armed.
+    private var armedPlan: PlannedTransition?
+    /// The complete local file of the track now playing, when there is one —
+    /// the outgoing source a stem pre-render reads.
+    private var currentLocalURL: URL?
     /// Beat/energy analysis of the track now playing, once its full file is
     /// on disk. Feeds the outgoing side of TransitionPlanner.
     private var currentAnalysis: TrackAnalysis?
@@ -233,6 +240,7 @@ final class PlayerService: ObservableObject {
                     self.progress = seconds
                     NowPlayingManager.shared.updateElapsed(seconds, rate: 1)
                 }
+                self.updateStemPrerender()
             }
         }
         // .common keeps the clock ticking through menu tracking and window
@@ -558,6 +566,10 @@ final class PlayerService: ObservableObject {
         engine.cancelScheduledTransition()
         transitionArmed = false
         pendingTransitionTrack = nil
+        armedPlan = nil
+        // Whatever the pre-render was aiming at is void: a re-arm re-derives
+        // the plan, and `updateStemPrerender` starts again from there.
+        cancelStemPrerender()
     }
 
     private func startPlaying(_ track: Track, indexUnchanged: Bool = false) {
@@ -567,6 +579,7 @@ final class PlayerService: ObservableObject {
         prefetchTask?.cancel()
         prefetchedNext = nil
         currentAnalysis = nil
+        currentLocalURL = nil
         isBuffering = false
         enginePaused = false
 
@@ -698,6 +711,7 @@ final class PlayerService: ObservableObject {
                let fileDuration = try? engine.loadFile(
                    at: local, on: activeDeck, trimDB: loudnessTrimDB(for: cachedAnalysis)) {
                 hasLocalFile = true
+                currentLocalURL = local
                 engine.play(deck: activeDeck, from: 0)
                 isPlaying = true
                 duration = fileDuration
@@ -762,6 +776,8 @@ final class PlayerService: ObservableObject {
             adoptTransitionedTrack(on: to)
         case .transitionCompleted:
             transitionArmed = false
+            armedPlan = nil
+            cancelStemPrerender()
             schedulePrefetch()
         }
     }
@@ -787,6 +803,7 @@ final class PlayerService: ObservableObject {
                 // fallback is inaudible.
                 let fileDuration = try engine.loadFile(at: local, on: activeDeck, trimDB: 0)
                 hasLocalFile = true
+                currentLocalURL = local
                 isBuffering = false
                 duration = fileDuration
                 if isPlaying {
@@ -884,7 +901,9 @@ final class PlayerService: ObservableObject {
             prefetchedNext = nil
             return
         }
-        engine.scheduleTransition(makeTransitionPlan(for: next), from: activeDeck, to: incoming)
+        let planned = makeTransitionPlan(for: next)
+        engine.scheduleTransition(planned, from: activeDeck, to: incoming)
+        armedPlan = planned
         transitionArmed = true
         pendingTransitionTrack = next.track
     }
@@ -915,6 +934,133 @@ final class PlayerService: ObservableObject {
         return TransitionPlanner.plan(outgoing: currentAnalysis, incoming: next.analysis,
                                       stems: .ready, config: cfg)
         #endif
+    }
+
+    // MARK: - Stem pre-render
+
+    /// How far ahead of the splice the pre-render is started, and the point at
+    /// which an unfinished one is abandoned.
+    ///
+    /// A separation pass runs at roughly realtime per side, so a 15 s hand-over
+    /// wanting both sides is ~30 s of work plus a second of rendering: a minute
+    /// of lead is comfortable, and the guard is there so a machine that is
+    /// busier than that never delays a hand-over — it simply gets the live one.
+    private static let stemPrerenderLead: TimeInterval = 60
+    private static let stemPrerenderGuard: TimeInterval = 5
+
+    private enum StemPrerenderState {
+        case idle
+        /// A job is running for this seam.
+        case running(TransitionSegment.Signature)
+        /// This seam has had its one attempt — finished, failed or abandoned.
+        /// Never retried: the lead time is gone either way.
+        case settled(TransitionSegment.Signature)
+
+        var signature: TransitionSegment.Signature? {
+            switch self {
+            case .idle: return nil
+            case .running(let s), .settled(let s): return s
+            }
+        }
+    }
+
+    /// A pre-render's stop switch.
+    ///
+    /// `Task.cancel` alone would only orphan the job: the render is a
+    /// synchronous pull loop inside a detached task and a separation pass is
+    /// seconds of Metal work. So cancellation is also checked where it can
+    /// actually be acted on — at each separation boundary, which is where all
+    /// the time goes.
+    private final class PrerenderCancel: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+        var isCancelled: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
+    private var stemPrerenderTask: Task<Void, Never>?
+    private var stemPrerenderCancel: PrerenderCancel?
+    private var stemPrerenderState: StemPrerenderState = .idle
+
+    /// Polled from the progress timer: start, abandon or ignore the pre-render
+    /// of the armed hand-over. Cheap — a few comparisons — until the moment it
+    /// starts the one background job it will ever run for a given seam.
+    private func updateStemPrerender() {
+        guard StemSeparation.isAvailable,
+              transitionArmed, let planned = armedPlan,
+              planned.style.stemTechnique != nil,
+              let signature = TransitionSegment.Signature(plan: planned.plan),
+              let outgoingURL = currentLocalURL, let next = prefetchedNext
+        else { return }
+
+        // A re-plan (a late analysis, a degraded seam after a seek) moves the
+        // splice; whatever was rendered for the old one is the wrong audio.
+        if let running = stemPrerenderState.signature, running != signature {
+            cancelStemPrerender()
+        }
+        let splice = signature.outPoint - TransitionSegmentRenderer.handoff
+        let remaining = splice - progress
+
+        switch stemPrerenderState {
+        case .settled:
+            return
+        case .running:
+            // Out of runway: drop the job and let the live path have the
+            // hand-over. The engine has never been told about this segment, so
+            // there is nothing to undo there.
+            if remaining < Self.stemPrerenderGuard {
+                stemPrerenderCancel?.cancel()
+                stemPrerenderTask?.cancel()
+                stemPrerenderTask = nil
+                stemPrerenderState = .settled(signature)
+            }
+            return
+        case .idle:
+            guard remaining <= Self.stemPrerenderLead,
+                  remaining > Self.stemPrerenderGuard else { return }
+        }
+
+        guard let provider = StemSeparation.provider else { return }
+        let request = TransitionSegmentRenderer.Request(
+            planned: planned, outgoingURL: outgoingURL, incomingURL: next.localURL,
+            outgoingTrimDB: loudnessTrimDB(for: currentAnalysis),
+            incomingTrimDB: loudnessTrimDB(for: next.analysis),
+            outgoingAnalysis: currentAnalysis, config: plannerConfig)
+        let generation = resolveGeneration
+        let stop = PrerenderCancel()
+        stemPrerenderCancel = stop
+        let cancellable: VocalStemProvider = { request in
+            if stop.isCancelled { throw CancellationError() }
+            return try provider(request)
+        }
+        stemPrerenderState = .running(signature)
+        stemPrerenderTask = Task { [weak self] in
+            // Separation is Metal work and rendering is a synchronous pull
+            // loop; both belong off the main actor entirely.
+            let segment = await Task.detached(priority: .utility) { () -> TransitionSegment? in
+                try? TransitionSegmentRenderer.render(request, provider: cancellable)
+            }.value
+            guard let self, !Task.isCancelled, generation == self.resolveGeneration else { return }
+            if let segment {
+                // The engine rejects it if the seam moved underneath us or the
+                // playhead is already past the splice, and plays the live
+                // hand-over instead — this is a suggestion, not a command.
+                self.engine.armTransitionSegment(segment)
+            }
+            self.stemPrerenderTask = nil
+            self.stemPrerenderState = .settled(signature)
+        }
+    }
+
+    private func cancelStemPrerender() {
+        stemPrerenderCancel?.cancel()
+        stemPrerenderCancel = nil
+        stemPrerenderTask?.cancel()
+        stemPrerenderTask = nil
+        stemPrerenderState = .idle
     }
 
     /// `Config.standard` with the one knob the user can see: the planner's
@@ -986,7 +1132,9 @@ final class PlayerService: ObservableObject {
     /// while the transition is still waiting, so audible audio is never cut.
     private func replanArmedTransition() {
         guard transitionArmed, let next = prefetchedNext else { return }
-        engine.replaceTransitionPlan(makeTransitionPlan(for: next))
+        let planned = makeTransitionPlan(for: next)
+        engine.replaceTransitionPlan(planned)
+        armedPlan = planned
     }
 
     /// The engine crossed the transition midpoint: the incoming deck is now
@@ -1021,6 +1169,7 @@ final class PlayerService: ObservableObject {
         hasLocalFile = true
         isBuffering = false
         currentCacheKey = prefetchedNext?.key
+        currentLocalURL = prefetchedNext?.localURL
         currentRemoteURL = nil
         currentAnalysis = prefetchedNext?.analysis
         servedQuality = prefetchedNext?.level

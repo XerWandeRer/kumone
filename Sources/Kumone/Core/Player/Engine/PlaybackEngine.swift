@@ -770,23 +770,31 @@ final class PlaybackEngine: @unchecked Sendable {
     /// it is folded in by hand here. Installing a tap does not reconfigure the
     /// graph, so this is safe while the engine runs. Pass nil to remove.
     func setOutputMonitor(on deck: Deck, _ block: (@Sendable (Float) -> Void)?) {
-        queue.sync {
-            let state = deckStates[deck]!
-            state.delay.removeTap(onBus: 0)
-            guard let block else { return }
-            let player = state.player
-            state.delay.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
-                var peak: Float = 0
-                if let data = buffer.floatChannelData {
-                    for channel in 0..<Int(buffer.format.channelCount) {
-                        let samples = data[channel]
-                        for frame in 0..<Int(buffer.frameLength) {
-                            peak = max(peak, abs(samples[frame]))
-                        }
+        queue.sync { installMonitorLocked(deckStates[deck]!, block) }
+    }
+
+    /// Test hook: the same tap on the pre-rendered segment's chain, so a
+    /// splice can be judged on what all three sources contributed.
+    func setSegmentOutputMonitor(_ block: (@Sendable (Float) -> Void)?) {
+        queue.sync { installMonitorLocked(segmentState, block) }
+    }
+
+    private func installMonitorLocked(_ state: DeckState,
+                                      _ block: (@Sendable (Float) -> Void)?) {
+        state.delay.removeTap(onBus: 0)
+        guard let block else { return }
+        let player = state.player
+        state.delay.installTap(onBus: 0, bufferSize: 1024, format: nil) { buffer, _ in
+            var peak: Float = 0
+            if let data = buffer.floatChannelData {
+                for channel in 0..<Int(buffer.format.channelCount) {
+                    let samples = data[channel]
+                    for frame in 0..<Int(buffer.frameLength) {
+                        peak = max(peak, abs(samples[frame]))
                     }
                 }
-                block(peak * player.volume)
             }
+            block(peak * player.volume)
         }
     }
 
@@ -802,8 +810,18 @@ final class PlaybackEngine: @unchecked Sendable {
         queue.async {
             guard let tr = self.transition, tr.phase == .waiting else { return }
             let resolved = self.resolvePlanLocked(planned, from: self.deckStates[tr.from]!)
-            self.transition = TransitionState(plan: resolved.plan, style: resolved.style,
-                                              from: tr.from, to: tr.to)
+            let state = TransitionState(plan: resolved.plan, style: resolved.style,
+                                        from: tr.from, to: tr.to)
+            // A pre-rendered segment survives a re-plan that did not move the
+            // seam — an upgraded plan is usually the same geometry with better
+            // provenance, and re-rendering would cost another minute we may
+            // not have.
+            if let segment = tr.segment,
+               let signature = TransitionSegment.Signature(plan: resolved.plan),
+               signature == segment.signature {
+                state.segment = segment
+            }
+            self.transition = state
         }
     }
 
