@@ -326,6 +326,15 @@ The report carries the full play order per schedule (every track appears in all
 four: losing a round only ages a candidate, it never eliminates one) and a
 per-pick candidate table with the score broken into its terms.
 
+`--bench` answers a different question and stops: **what does the scoring itself
+cost**, in milliseconds, at this corpus's pool size — one `plan`+score, one full
+rank (what a pick costs), and one lookahead chain (what a refresh costs). The
+selector runs on the main actor, so these are the numbers that decide what may
+run there. Measured at a 156-track pool: 0.006 / 0.9 / 5.6 ms in release, and
+0.088 / 13.8 / **109.6 ms** in debug. The chain is linear in the pool, which is
+why it now runs on a detached task and the app carries a journal warning for any
+queue-order computation over 50 ms.
+
 `--low-dir` points at a directory of low-bitrate copies of the same tracks,
 matched by track ID, and turns on the check predev §2.2 asks for: how often the
 tier read off a low-bitrate analysis — which is all the *scorer* ever sees —

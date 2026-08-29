@@ -64,7 +64,8 @@ usage:
   audition sweep  <corpusDir> [-o report.md] [--mode structure|tempo|gates]
                   [--set name=value,...]
   audition order  <cacheOrCorpusDir> [-o report.md] [--window 4] [--limit N]
-                  [--candidates 6] [--low-dir DIR] [--set ...] [--order-set ...]
+                  [--candidates 6] [--low-dir DIR] [--bench]
+                  [--set ...] [--order-set ...]
   audition knobs  [--json]
 
   order     run the AutoMix queue-reorder greedy over a directory of locally
@@ -86,6 +87,10 @@ usage:
                           agreement check. Without it the check runs on any
                           track the corpus itself holds at two quality levels,
                           and is skipped when there are none.
+            --bench       report what the scoring costs in ms at this pool size
+                          (one plan, one rank = a pick, one chain = a lookahead
+                          refresh) and stop. The selector runs on the main
+                          actor, so these decide what may run there.
             --order-set   queue-order weights, e.g. --order-set agingEpsilon=0.5
                           (`audition knobs` lists them under "queue order")
 
@@ -1282,6 +1287,26 @@ func runOrder(_ args: Arguments) {
         }
     }
     playback.sort { $0.lastPathComponent < $1.lastPathComponent }
+
+    // `--bench` answers one question and stops: what does the scoring itself
+    // cost at this pool size, on the main actor, in milliseconds. The selector
+    // runs on the main actor, so this is the number that decides whether the
+    // chain can be computed there at all.
+    if args.flags["bench"] != nil {
+        do {
+            let bench = try Audition.orderBench(
+                files: playback, config: configOverrides(args),
+                orderConfig: orderConfigOverrides(args))
+            print(String(
+                format: "\npool %d tracks\n  one plan+score   %8.3f ms"
+                    + "\n  one rank (pool)  %8.1f ms   ← what `pick` costs"
+                    + "\n  chain (depth %d) %8.1f ms   ← what one lookahead refresh costs",
+                bench.poolSize, bench.planMS, bench.rankMS, bench.depth, bench.chainMS))
+        } catch {
+            fail("bench: \(error.localizedDescription)")
+        }
+        exit(0)
+    }
 
     let window = args.double("window").map { Int($0) } ?? 4
     let limit = args.double("limit").map { Int($0) }

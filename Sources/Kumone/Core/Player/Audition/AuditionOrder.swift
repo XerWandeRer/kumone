@@ -229,6 +229,75 @@ extension Audition {
             names: names, tiers: tiers, steps: steps)
     }
 
+    // MARK: - Cost of the scoring itself
+
+    /// How long the queue-order arithmetic actually takes at a given pool size.
+    ///
+    /// The design called a scoring pass "microseconds — a pure function call".
+    /// A `TransitionPlanner.plan` is a phrase search, a gate cascade and a
+    /// couple of envelope walks, and a pool that started at 4 tracks is now
+    /// 200+. This measures the claim instead of repeating it, because the
+    /// selector runs on the main actor and a main actor that is busy is an app
+    /// that has stopped.
+    public struct OrderBench: Sendable {
+        public let poolSize: Int
+        /// Milliseconds for one `TransitionPlanner.plan`.
+        public let planMS: Double
+        /// Milliseconds to score a whole pool once — what `pick` costs.
+        public let rankMS: Double
+        /// Milliseconds for a full lookahead chain — `depth + 1` ranks over a
+        /// shrinking pool.
+        public let chainMS: Double
+        public let depth: Int
+    }
+
+    public static func orderBench(
+        files: [URL], config: [String: Double] = [:], orderConfig: [String: Double] = [:]
+    ) throws -> OrderBench {
+        let plannerConfig = TransitionPlanner.Config.standard(overriding: config)
+        let queueConfig = QueueOrderConfig.standard(overriding: orderConfig)
+        var analyses: [TrackAnalysis] = []
+        for file in files { analyses.append(try analysis(of: file)) }
+        guard analyses.count >= 2 else {
+            return OrderBench(poolSize: analyses.count, planMS: 0, rankMS: 0,
+                              chainMS: 0, depth: queueConfig.lookaheadDepth)
+        }
+        let outgoing = analyses[0]
+        let pool = Array(analyses.dropFirst())
+
+        func score(_ a: TrackAnalysis, _ b: TrackAnalysis) {
+            let planned = TransitionPlanner.plan(
+                outgoing: a, incoming: b, stems: .none, config: plannerConfig,
+                context: .init(outgoingLyricLineEnds: []))
+            _ = QueueOrderScorer.score(outgoing: a, incoming: b, planned: planned,
+                                       config: queueConfig, plannerConfig: plannerConfig)
+        }
+        func milliseconds(_ body: () -> Void) -> Double {
+            let start = ContinuousClock.now
+            body()
+            return (ContinuousClock.now - start).milliseconds
+        }
+
+        // One rank: the whole pool scored against one outgoing track.
+        let rankMS = milliseconds { for b in pool { score(outgoing, b) } }
+        // A full chain: `depth + 1` ranks over a pool that shrinks by one each
+        // step — the shape `recomputeLookahead` runs.
+        let depth = max(0, queueConfig.lookaheadDepth)
+        let chainMS = milliseconds {
+            var remaining = pool
+            var from = outgoing
+            for _ in 0...depth {
+                guard let next = remaining.first else { break }
+                for b in remaining { score(from, b) }
+                from = next
+                remaining.removeFirst()
+            }
+        }
+        return OrderBench(poolSize: pool.count,
+                          planMS: rankMS / Double(max(1, pool.count)),
+                          rankMS: rankMS, chainMS: chainMS, depth: depth)
+    }
+
     // MARK: - Satisficing escalation
 
     /// What the escalation cost, alongside what it bought.
