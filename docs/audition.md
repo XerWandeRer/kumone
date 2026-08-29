@@ -288,23 +288,37 @@ The acceptance tool for the AutoMix queue-reorder mode
 better, decide whether it can even *reach* better transitions. `order` runs the
 selector's own greedy — the same `QueueOrderScorer` the player picks with,
 scoring each candidate by running `TransitionPlanner.plan` on it — over a
-directory of locally cached, already analyzed tracks, and tables three
+directory of locally cached, already analyzed tracks, and tables four
 schedules:
 
 - **original order** — the files as listed. For the live cache that is track-ID
   order, i.e. arbitrary with respect to the music, which is the baseline this
   whole feature is measured against.
 - **greedy W=`--window`** — at each pick, only the next W entries of the
-  remaining list are in the pool. This is the worst case: nothing is cached
-  ahead, so the choice is only ever between the next few.
-- **greedy (all cached)** — every remaining track is in the pool, which is what
-  a playlist whose audio is already on disk really offers the selector.
+  remaining list are in the pool. The mode's first candidate policy, kept as a
+  row because measuring it is what retired it: on the 56-track live cache it
+  scored 9/55 against the baseline's 7/55, which is noise.
+- **escalation** — the shipping policy (predev §2.2): start each pick from
+  everything already analyzed, and buy more only until a candidate is good
+  enough — 1 track, then 4, then 16, stopping mid-round on satisfaction.
+- **greedy (all cached)** — every remaining track is in the pool. Not a policy
+  but a ceiling: it presumes the whole playlist was analyzed up front.
+
+The escalation row is the only one with a price, and it is reported: **average
+and maximum downloads per pick**, the round bound, and how many picks ended on
+satisfaction rather than on running the queue out. To make that number mean
+anything offline — where every file is cached and every pick would otherwise be
+free — the simulation hides each analysis until the escalation has paid for it,
+in the order the escalation would have reached it. Visibility carries across
+picks, because sidecars do, so the warming by-product is in the numbers too.
+The decision deadline is *not* modelled (it is a clock), so the counts are the
+worst case the deadline would truncate rather than an understatement.
 
 It is offline and read-only: it never analyzes, never writes and never touches
 the network, so a file without an `.analysis.json` sidecar is simply skipped —
 which is what lets it be pointed straight at `~/Library/Caches/Kumone/Audio`.
 The report carries the full play order per schedule (every track appears in all
-three: losing a round only ages a candidate, it never eliminates one) and a
+four: losing a round only ages a candidate, it never eliminates one) and a
 per-pick candidate table with the score broken into its terms.
 
 `--low-dir` points at a directory of low-bitrate copies of the same tracks,

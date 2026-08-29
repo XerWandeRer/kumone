@@ -70,9 +70,12 @@ usage:
   order     run the AutoMix queue-reorder greedy over a directory of locally
             cached, already analyzed tracks and table what it did to the tier
             distribution: original order vs `greedy W=<window>` (only the next
-            W listed entries are in the pool) vs `greedy (all cached)` (every
-            remaining track is, which is what a fully cached playlist gives the
-            selector). Offline and read-only — it never analyzes and never hits
+            W listed entries are in the pool) vs `escalation` (the shipping
+            policy: start from what is already analyzed, buy 1 more track, then
+            4, then 16, stopping the moment one is good enough — reported with
+            its downloads-per-pick cost) vs `greedy (all cached)` (every
+            remaining track is in the pool, the ceiling a fully cached playlist
+            gives the selector). Offline and read-only — it never analyzes and never hits
             the network, so a file without an `.analysis.json` sidecar is
             skipped. Point it straight at ~/Library/Caches/Kumone/Audio.
             --window      pool size for the windowed schedule (default 4)
@@ -1225,6 +1228,17 @@ func orderShare(_ part: Int, _ whole: Int) -> Double {
     whole == 0 ? 0 : 100 * Double(part) / Double(whole)
 }
 
+/// The escalation's price tag, in one line: what a pick costs on average, what
+/// the worst one cost, and how often "good enough" was actually reached.
+func escalationCostLine(_ e: Audition.OrderEscalation) -> String {
+    guard e.picks > 0 else { return "escalation: no picks" }
+    return String(
+        format: "%.2f downloads/pick (max %d, %d total over %d picks) · "
+            + "≤%d rounds · satisfied %d/%d (%.0f %%) at %@",
+        e.averageDownloads, e.maxDownloads, e.totalDownloads, e.picks, e.maxRounds,
+        e.satisfied, e.picks, orderShare(e.satisfied, e.picks), e.satisfyingTier)
+}
+
 func runOrder(_ args: Arguments) {
     guard let dirArg = args.positional.first else { fail(usage) }
     let corpus = url(dirArg)
@@ -1278,6 +1292,7 @@ func runOrder(_ args: Arguments) {
     var sections: [String] = []
     var totals: [(label: String, pairs: Int, beatMatched: Int)] = []
     var rows: [String] = []
+    var escalations: [Audition.OrderEscalation] = []
 
     for group in orderGroups(playback) {
         var files = group.files
@@ -1286,17 +1301,23 @@ func runOrder(_ args: Arguments) {
         print("\n## \(group.name) — \(files.count) analyzed tracks")
 
         let schedules: [Audition.OrderSchedule]
+        let escalation: Audition.OrderEscalation
         do {
+            escalation = try Audition.orderEscalating(
+                files: files, config: extra, orderConfig: orderOverrides,
+                candidateLimit: candidateLimit)
             schedules = [
                 try Audition.orderBaseline(files: files, config: extra),
                 try Audition.order(files: files, window: window, config: extra,
                                    orderConfig: orderOverrides, candidateLimit: candidateLimit),
+                escalation.schedule,
                 try Audition.order(files: files, window: nil, config: extra,
                                    orderConfig: orderOverrides, candidateLimit: candidateLimit),
             ]
         } catch {
             fail("\(group.name): \(error.localizedDescription)")
         }
+        escalations.append(escalation)
 
         for schedule in schedules {
             print("  " + schedule.label.padding(toLength: 22, withPad: " ", startingAt: 0)
@@ -1309,7 +1330,10 @@ func runOrder(_ args: Arguments) {
                         + "/\(schedule.pairs) | \(tierBar(schedule)) |")
         }
 
+        print("  escalation cost         " + escalationCostLine(escalation))
+
         sections.append("### \(group.name)\n")
+        sections.append("**escalation cost** — " + escalationCostLine(escalation) + "\n")
         for schedule in schedules {
             sections.append("**\(schedule.label)** — beatMatched \(schedule.beatMatched)"
                             + "/\(schedule.pairs) · \(tierBar(schedule))\n")
@@ -1377,7 +1401,11 @@ func runOrder(_ args: Arguments) {
                    + "cache that is track-ID order, i.e. arbitrary with respect to the music, "
                    + "which is the point). `greedy W=\(window)` sees only the next \(window) "
                    + "listed entries at each pick; `greedy (all cached)` sees every remaining "
-                   + "track, which is what a fully cached playlist really offers the selector.",
+                   + "track, which is what a fully cached playlist really offers the selector. "
+                   + "`escalation` is the shipping policy: it starts each pick from what it has "
+                   + "already paid for and buys more — 1 track, then 4, then 16 — only until a "
+                   + "candidate is good enough, so it is the only row here that comes with a "
+                   + "cost.",
                    ""]
     var byLabel: [String: (pairs: Int, beatMatched: Int)] = [:]
     var labelOrder: [String] = []
@@ -1394,6 +1422,24 @@ func runOrder(_ args: Arguments) {
                               t.pairs, orderShare(t.beatMatched, t.pairs)))
     }
     summary.append("")
+    if !escalations.isEmpty {
+        let picks = escalations.reduce(0) { $0 + $1.picks }
+        let downloads = escalations.reduce(0) { $0 + $1.totalDownloads }
+        let worst = escalations.map(\.maxDownloads).max() ?? 0
+        let rounds = escalations.map(\.maxRounds).max() ?? 0
+        let satisfied = escalations.reduce(0) { $0 + $1.satisfied }
+        summary.append(String(
+            format: "**Escalation cost** — %.2f low-bitrate downloads per pick on average "
+                + "(worst pick %d, %d in total over %d picks, at most %d rounds). "
+                + "%d/%d picks (%.0f %%) ended because a candidate reached **%@**; the rest ran "
+                + "the remaining queue out. Downloads leave analysis sidecars behind, so the "
+                + "cost is one-time per playlist and every later pick starts from a richer pool "
+                + "— the per-pick figure is an average over a run that begins cold.",
+            picks == 0 ? 0 : Double(downloads) / Double(picks), worst, downloads, picks, rounds,
+            satisfied, picks, orderShare(satisfied, picks),
+            escalations[0].satisfyingTier))
+        summary.append("")
+    }
     summary += agreementLines
     summary.append("")
 

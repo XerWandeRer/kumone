@@ -229,6 +229,177 @@ extension Audition {
             names: names, tiers: tiers, steps: steps)
     }
 
+    // MARK: - Satisficing escalation
+
+    /// What the escalation cost, alongside what it bought.
+    public struct OrderEscalation: Sendable {
+        public let schedule: OrderSchedule
+        /// Downloads the escalation started at each pick, in schedule order.
+        public let downloadsPerPick: [Int]
+        /// Rounds it opened at each pick.
+        public let roundsPerPick: [Int]
+        /// Picks that ended because a candidate reached the satisfying tier,
+        /// rather than because the queue ran out.
+        public let satisfied: Int
+        public let satisfyingTier: String
+
+        public var picks: Int { downloadsPerPick.count }
+        public var totalDownloads: Int { downloadsPerPick.reduce(0, +) }
+        public var maxDownloads: Int { downloadsPerPick.max() ?? 0 }
+        public var maxRounds: Int { roundsPerPick.max() ?? 0 }
+        public var averageDownloads: Double {
+            picks == 0 ? 0 : Double(totalDownloads) / Double(picks)
+        }
+    }
+
+    /// The satisficing escalation of predev §2.2, run offline over a corpus
+    /// that is fully analyzed on disk.
+    ///
+    /// The corpus being fully analyzed is exactly what would make an offline
+    /// run meaningless — every candidate free, every pick trivial — so this
+    /// simulates **visibility** instead: a track's analysis is hidden until the
+    /// escalation has paid for it, in the order the escalation would have
+    /// reached it. That is what makes the download counts here the counts the
+    /// player would really incur on a cold playlist.
+    ///
+    /// Visibility persists across picks, because sidecars do: the warming is a
+    /// by-product, and it is why the per-pick cost falls as the schedule runs.
+    ///
+    /// The one thing not modelled is the decision deadline, which is a clock
+    /// and has no offline meaning; the escalation here is bounded only by the
+    /// remaining queue, so these numbers are the **worst case** the deadline
+    /// would truncate, never an understatement.
+    public static func orderEscalating(
+        files: [URL],
+        config: [String: Double] = [:],
+        orderConfig: [String: Double] = [:],
+        artists: [String: String] = [:],
+        candidateLimit: Int = 6,
+        label: String = "escalation"
+    ) throws -> OrderEscalation {
+        let plannerConfig = TransitionPlanner.Config.standard(overriding: config)
+        let queueConfig = QueueOrderConfig.standard(overriding: orderConfig)
+        guard files.count >= 2 else {
+            return OrderEscalation(
+                schedule: OrderSchedule(label: label, names: files.map(displayName),
+                                        tiers: [], steps: []),
+                downloadsPerPick: [], roundsPerPick: [], satisfied: 0,
+                satisfyingTier: queueConfig.satisfyingTier.label)
+        }
+        var analyses: [String: TrackAnalysis] = [:]
+        for file in files { analyses[file.path] = try analysis(of: file) }
+
+        var current = files[0]
+        var remaining = Array(files.dropFirst())
+        var lostRounds: [String: Int] = [:]
+        var names = [displayName(current)]
+        var tiers: [String] = []
+        var steps: [OrderStep] = []
+        var downloadsPerPick: [Int] = []
+        var roundsPerPick: [Int] = []
+        var satisfied = 0
+        /// The pool that costs nothing: everything paid for so far. The track
+        /// now playing is visible because it is playing.
+        var visible: Set<String> = [current.path]
+
+        while !remaining.isEmpty {
+            let outgoing = analyses[current.path]
+            let outgoingArtist = artists[current.path]
+            let lineEnds = Lyrics.lineEnds(for: current)
+
+            /// Score the free pool as it stands. Best first.
+            func rank() -> [(url: URL, score: QueueOrderScore)] {
+                remaining.filter { visible.contains($0.path) }.map { candidate in
+                    let incoming = analyses[candidate.path]
+                    let planned = TransitionPlanner.plan(
+                        outgoing: outgoing, incoming: incoming, stems: .none,
+                        config: plannerConfig,
+                        context: .init(outgoingLyricLineEnds: lineEnds))
+                    let sharesArtist = outgoingArtist != nil
+                        && outgoingArtist == artists[candidate.path]
+                    return (candidate, QueueOrderScorer.score(
+                        outgoing: outgoing, incoming: incoming, planned: planned,
+                        lostRounds: lostRounds[candidate.path] ?? 0,
+                        sharesArtist: sharesArtist,
+                        config: queueConfig, plannerConfig: plannerConfig))
+                }
+                // Ties break on list order, which the filter above preserves.
+                .enumerated()
+                .sorted {
+                    $0.element.score.total == $1.element.score.total
+                        ? $0.offset < $1.offset
+                        : $0.element.score.total > $1.element.score.total
+                }
+                .map(\.element)
+            }
+            func isSatisfied(_ ranked: [(url: URL, score: QueueOrderScore)]) -> Bool {
+                (ranked.first?.score.tier).map { $0 >= queueConfig.satisfyingTier } ?? false
+            }
+
+            var ranked = rank()
+            var downloads = 0
+            var rounds = 0
+            var roundSize = 0
+            // Escalate only while nothing satisfies. Each round admits its own
+            // size worth of not-yet-visible tracks in list order, and the loop
+            // re-scores after *every* one — so it stops mid-round, which is
+            // where most of the saving is.
+            while !isSatisfied(ranked) {
+                roundSize = roundSize == 0
+                    ? max(1, queueConfig.escalationFirstRound)
+                    : roundSize * max(1, queueConfig.escalationFactor)
+                let opened = remaining.filter { !visible.contains($0.path) }.prefix(roundSize)
+                guard !opened.isEmpty else { break }
+                rounds += 1
+                for candidate in opened {
+                    visible.insert(candidate.path)
+                    downloads += 1
+                    ranked = rank()
+                    if isSatisfied(ranked) { break }
+                }
+            }
+            if isSatisfied(ranked) { satisfied += 1 }
+            guard let winner = ranked.first else { break }
+
+            steps.append(OrderStep(
+                position: steps.count + 1,
+                from: displayName(current), to: displayName(winner.url),
+                tier: winner.score.tier.label,
+                poolSize: ranked.count,
+                candidates: ranked.prefix(candidateLimit).map { entry in
+                    OrderCandidate(
+                        name: displayName(entry.url),
+                        tier: entry.score.tier.label,
+                        tempoAffinity: entry.score.tempoAffinity,
+                        keyAffinity: entry.score.keyAffinity,
+                        styleAffinity: entry.score.styleAffinity,
+                        energyContinuity: entry.score.energyContinuity,
+                        aging: entry.score.aging,
+                        sameArtistPenalty: entry.score.sameArtistPenalty,
+                        total: entry.score.total,
+                        lostRounds: lostRounds[entry.url.path] ?? 0,
+                        chosen: entry.url.path == winner.url.path)
+                }))
+            downloadsPerPick.append(downloads)
+            roundsPerPick.append(rounds)
+
+            for entry in ranked where entry.url.path != winner.url.path {
+                lostRounds[entry.url.path, default: 0] += 1
+            }
+            lostRounds[winner.url.path] = nil
+
+            names.append(displayName(winner.url))
+            tiers.append(winner.score.tier.label)
+            remaining.removeAll { $0.path == winner.url.path }
+            current = winner.url
+        }
+
+        return OrderEscalation(
+            schedule: OrderSchedule(label: label, names: names, tiers: tiers, steps: steps),
+            downloadsPerPick: downloadsPerPick, roundsPerPick: roundsPerPick,
+            satisfied: satisfied, satisfyingTier: queueConfig.satisfyingTier.label)
+    }
+
     // MARK: - Low-bitrate agreement
 
     /// Plan each adjacent pair of `files` twice — once from the playback-quality
