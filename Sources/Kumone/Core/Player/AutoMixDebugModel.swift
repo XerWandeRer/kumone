@@ -115,6 +115,10 @@ struct AutoMixDebugPlan: Equatable {
     var outroEffect = "fade"
     var stagedEQ = false
     var stemTechnique: String?
+    /// The transition score the plan carries, named the way the predev names
+    /// it ("cutOnOne+echoThrow"). Nil on every shipped seam — a score only
+    /// appears with the panel's own toggle on.
+    var score: String?
     var rideDB: Double = 0
     /// Which structural section the out point falls in, when the outgoing
     /// analysis has sections at all (it usually does not — see `TrackAnalysis`).
@@ -252,6 +256,12 @@ struct AutoMixOverrides: Equatable {
     var disableTempoRamp = false
     var disableDominantDeckBlend = false
     var disableTwoClockExchange = false
+    /// **Transition score (P1)**, and the one switch here spelled as an
+    /// *enable*: the feature ships dark (`Config.scoreEnabled` is false), so
+    /// "off" is already the config's own value and there is nothing to shadow.
+    /// On, a qualifying seam is offered a cut-on-one — performed only if the
+    /// pre-rendered segment arms, because the live path never approximates one.
+    var enableScore = false
     /// Not a planner knob: skips the stem pre-render entirely so the seam is
     /// carried by the live two-deck path — which is the *approximation* of a
     /// stem hand-over, and the thing an A/B wants to compare against.
@@ -266,6 +276,7 @@ struct AutoMixOverrides: Equatable {
         if disableTempoRamp { names.append("noTempoRamp") }
         if disableDominantDeckBlend { names.append("noDominantDeck") }
         if disableTwoClockExchange { names.append("noTwoClock") }
+        if enableScore { names.append("score") }
         if forceLivePath { names.append("forceLivePath") }
         return names
     }
@@ -274,8 +285,13 @@ struct AutoMixOverrides: Equatable {
     /// segment the engine may already be holding. Turning the live path on is
     /// the whole point of that switch, and the engine has no un-arm call — so
     /// this asks for the heavier re-arm instead of a plain re-plan.
+    /// The score is in here for a subtler reason: it does not move the *plan*
+    /// at all (that is the point — a score decorates the style, so the fall-back
+    /// is a complete blend), which means a segment rendered a moment ago still
+    /// matches by signature and would keep playing the version the toggle just
+    /// turned off. An A/B that plays the old take is worse than no A/B.
     func needsReArm(comparedTo other: AutoMixOverrides) -> Bool {
-        forceLivePath != other.forceLivePath
+        forceLivePath != other.forceLivePath || enableScore != other.enableScore
     }
 }
 
@@ -533,6 +549,9 @@ enum AutoMixDebugOverrides {
         if overrides.disableTempoRamp { config.tempoRampEnabled = false }
         if overrides.disableDominantDeckBlend { config.dominantDeckBlend = false }
         if overrides.disableTwoClockExchange { config.twoClockExchange = false }
+        // The only *enable*: `scoreEnabled` ships false, so a switch spelled as
+        // a disable would have nothing to disable.
+        if overrides.enableScore { config.scoreEnabled = true }
         return config
     }
 }
@@ -737,6 +756,7 @@ extension AutoMixDebugPlan {
         outroEffect = AutoMixDebugFormat.outroEffect(planned.style.outroEffect)
         stagedEQ = planned.style.stagedEQ
         stemTechnique = planned.style.stemTechnique?.label
+        score = planned.style.score?.label
         rideDB = planned.rideDB
         outSection = outPoint.flatMap { AutoMixDebugFormat.section(at: $0, in: outgoing) }
         inPointSource = inPoint.flatMap {

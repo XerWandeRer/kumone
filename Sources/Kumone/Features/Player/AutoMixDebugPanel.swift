@@ -244,6 +244,11 @@ struct AutoMixDebugPanel: View {
                 DebugRow("style", plan.outroEffect
                          + (plan.stagedEQ ? " · stagedEQ" : "")
                          + (plan.stemTechnique.map { " · \($0)" } ?? ""))
+                // Only ever present with the score toggle on, and only ever
+                // *offered*: the live path blends, so what this row promises is
+                // conditional on the pre-render row below it.
+                DebugRow("score", plan.score.map { "score=\($0)" }
+                         ?? "none — today's blend")
                 DebugRow("ride", String(format: "%+.2f dB", plan.rideDB))
                 DebugRow("out section", plan.outSection ?? "no structure")
                 DebugRow("in source", plan.inPointSource ?? "—")
@@ -291,6 +296,11 @@ struct AutoMixDebugPanel: View {
             overrideToggle("Disable tempo ramp", \.disableTempoRamp)
             overrideToggle("Disable dominant-deck blend", \.disableDominantDeckBlend)
             overrideToggle("Disable two-clock exchange", \.disableTwoClockExchange)
+            overrideToggle("Transition score (P1: cut-on-one)", \.enableScore)
+            if model.overrides.enableScore {
+                DebugRow("score", "offered on confident grids; the live path still blends"
+                         + " unless the segment arms")
+            }
             overrideToggle("Force live path (no stem pre-render)", \.forceLivePath)
 
             Divider().padding(.vertical, 3)
@@ -398,6 +408,7 @@ struct AutoMixDebugPanel: View {
                             "\($0.kind) · out " + AutoMixDebugFormat.clock($0.outPoint)
                                 + String(format: " · overlap %.2fs", $0.overlap)
                                 + ($0.stemTechnique.map { " · \($0)" } ?? "")
+                                + ($0.score.map { " · score=\($0)" } ?? "")
                         } ?? "—")
                         DebugRow("fallback", seam.fallback ?? "none — ran as planned")
                         DebugRow("pre-render", seam.prerender)

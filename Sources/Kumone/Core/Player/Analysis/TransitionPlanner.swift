@@ -427,6 +427,25 @@ enum TransitionPlanner {
         /// the carried voice starts riding the fader down regardless).
         var vocalCarryWindowSeconds: TimeInterval = 8
 
+        // --- Transition score (docs/automix-score-predev.md). P1 ships dark:
+        // the knob is **off**, so the planner writes no `TransitionStyle.score`
+        // and every decision, curve and rendered sample is field-for-field what
+        // it was before the score model existed. The debug panel's A/B toggle
+        // and the audition console are how it gets heard.
+
+        /// Emit a `TransitionScore` on hand-overs that qualify for one.
+        ///
+        /// A score is only ever *offered*: the live path never performs one, so
+        /// with this on the seam still sounds like today's blend unless a
+        /// pre-rendered segment arms in time. Refusal is the blend, never an
+        /// approximated cut (predev §2.2).
+        var scoreEnabled: Bool = false
+        /// How sure the beat tracker has to be about **both** sides before a
+        /// score is offered. Deliberately far above `bpmConfidenceThreshold`:
+        /// a fade survives a grid that is half a beat out and a cut does not,
+        /// so the gesture that cannot forgive a bad grid asks for a better one.
+        var scoreMinBPMConfidence: Double = 0.8
+
         // --- Structure layer (predev §2.3). Read *only* when the analysis on
         // the relevant side carries `sections` — a v7 sidecar the segmenter was
         // confident about. Every other track (older sidecar, ambient material,
@@ -714,6 +733,16 @@ enum TransitionPlanner {
             // deck up to it would be holding it up to nothing in particular.
             style.dominantDeck = config.dominantDeckBlend
             style.preSwapPlateau = Float(config.preSwapPlateau)
+            // …and a score layers over *that*, as an alternative the segment
+            // path may perform. Off by default, so this is nil on every
+            // shipped decision and the style is field-for-field what it was.
+            style.score = score(outgoing: outgoing, incoming: incoming,
+                                context: context, config: config)
+            // Deliberately *not* a `PlanTrace` gate: the trace's stages are the
+            // chain that decides whether a pair hands over at all, and a score
+            // decides nothing — it is offered on top of a plan already made.
+            // Where it went is reported by the compile (`Audition.describe`),
+            // which is the only place that knows whether it was performed.
             return finish(PlannedTransition(plan: .beatMatched(matched.plan), style: style,
                                             rideDB: s.rideDB))
         }
@@ -738,6 +767,35 @@ enum TransitionPlanner {
         // such window (and `.plain(.gapless)`, the AutoMix-off / iOS path, must
         // stay bit-identical), so every early return above keeps ride 0.
         return finish(PlannedTransition(plan: crossfade.plan, style: style, rideDB: s.rideDB))
+    }
+
+    // MARK: - Transition score
+
+    /// The score this pair is offered, or nil — which is everything today.
+    ///
+    /// **Naming an intent, not building one.** The planner is a pure function
+    /// of two analyses: it can see that both grids are quantized and confident,
+    /// which is the cultural precondition for cutting rather than blending, but
+    /// it cannot see where bar 0 beat 0 lands in seconds. So it emits the score
+    /// as a marker and `ScoreCompiler` places it — the same division of labour
+    /// `.vocalExchange` has, one level up.
+    ///
+    /// P1 keeps the selection rule deliberately thin: gates only, no material
+    /// semantics. The gesture budget the predev's §2.4 describes is P3's, and
+    /// inventing half of it here would be a rule nobody has listened to yet.
+    static func score(outgoing: TrackAnalysis, incoming: TrackAnalysis,
+                      context: PlanContext, config: Config) -> TransitionScore? {
+        guard config.scoreEnabled else { return nil }
+        // Both grids confident enough to cut on, and long enough to address:
+        // a cut half a beat out is the one error the gesture cannot survive.
+        guard outgoing.bpmConfidence >= config.scoreMinBPMConfidence,
+              incoming.bpmConfidence >= config.scoreMinBPMConfidence,
+              outgoing.downbeats.count > TransitionScore.maxPreBars,
+              incoming.downbeats.count > TransitionScore.maxPostBars
+        else { return nil }
+        // An echo throw needs a last line to throw; with no `.lrc` the score is
+        // the plain cut, which is the same gesture without the tail.
+        return .cutOnOne(throwingEcho: !context.outgoingLyricLineEnds.isEmpty)
     }
 
     // MARK: - Decision ledger

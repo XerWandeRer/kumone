@@ -263,6 +263,15 @@ extension TransitionPlanner.Config {
                       + "（vocalYield，交接点砸在一个没人唱的小节上）。"
                       + "关 = 回到只有一个交接点、离叠加正中最近的老编排，逐字段一致。",
                   \.twoClockExchange),
+        boolField("scoreEnabled", "stem",
+                  "开 = 允许规划器给够格的一对开一张“转场乐谱”（格点上的离散手势：正拍直切 + "
+                      + "末句甩延时），由预渲染 segment 演出；segment 没备好就还是今天的 blend，"
+                      + "live 路径永远不近似乐谱。关（默认）= 一张谱都不出，逐字段回到今天。",
+                  \.scoreEnabled),
+        field("scoreMinBPMConfidence", "stem",
+              "两首歌的拍子都要数到这个把握以上，才谈得上在格点上“切”。"
+                  + "比对拍那条线高得多：blend 扛得住半拍的网格误差，切扛不住。",
+              0, 1, 0.01, 2, \.scoreMinBPMConfidence),
         field("vocalCarryWindowSeconds", "stem",
               "出曲人声最多可以越过低频交接点 S 多少秒去把一句唱完；这个窗口里找得到歌词行末"
                   + "就是 vocalCarryover，找不到就退成 vocalYield（在 S 之前唱完）。"
