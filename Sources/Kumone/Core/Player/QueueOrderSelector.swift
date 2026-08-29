@@ -472,6 +472,13 @@ final class QueueOrderSelector {
         lookahead = results.compactMap { result in
             byID[result.id].map { ChainStep(track: $0, score: result.score) }
         }
+        // One line per applied chain — the observable proof of "recomputed at
+        // every commit, rarely in between". Throttled upstream, so this is
+        // lifecycle-frequency, not per-tick.
+        let steps = lookahead
+            .map { "\($0.track.id):\($0.score.tier.label)" }
+            .joined(separator: " ")
+        PlaybackJournal.note("order lookahead applied steps=\(lookahead.count) [\(steps)]")
     }
 
     func clearLookahead() { lookahead = [] }
