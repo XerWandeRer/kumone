@@ -2771,6 +2771,52 @@ final class PlaybackEngine: @unchecked Sendable {
         }
     }
 
+    // MARK: - Output device (macOS)
+
+    #if os(macOS)
+    /// Point the engine's output at a specific CoreAudio device, or at the
+    /// system default when `deviceID` is nil.
+    ///
+    /// This is macOS AirPlay support: a system-exposed AirPlay receiver is an
+    /// ordinary CoreAudio device (transport 'airp'), and routing to it means
+    /// setting the output unit's device — `AVRoutePickerView` routes AVPlayer,
+    /// which this app no longer has. See `AudioOutputDevices`.
+    ///
+    /// The device can only be changed while the output unit is stopped, and
+    /// changing it invalidates every player node's schedule exactly the way a
+    /// hardware change does — so the resume path is the same one:
+    /// `handleConfigurationChange` rebuilds the chains, puts the output tap
+    /// back and restarts each deck from its cached position. Runs on `queue`
+    /// like every other mutation, so it serialises against the
+    /// AVAudioEngineConfigurationChange the switch itself provokes; neither
+    /// path ever blocks on the other.
+    ///
+    /// Seam timing caveat: an AirPlay device adds a large output buffer
+    /// (typically ~2 s). Position math reads the player node's clock, which is
+    /// upstream of that buffer, so transitions still fire at the right place
+    /// *in the stream*; what the listener hears is delayed as a whole, and the
+    /// debug panel's countdown reaches zero before the seam is audible. Not
+    /// compensated in v1 — see docs/automix-airplay.md.
+    func setOutputDevice(_ deviceID: AudioDeviceID?) {
+        queue.async { self.applyOutputDeviceLocked(deviceID) }
+    }
+
+    private func applyOutputDeviceLocked(_ deviceID: AudioDeviceID?) {
+        guard let target = deviceID ?? AudioOutputDevices.defaultDeviceID() else { return }
+        let unit = engine.outputNode.auAudioUnit
+        guard unit.deviceID != target else { return }
+        engine.stop()
+        do {
+            try unit.setDeviceID(target)
+        } catch {
+            PlaybackJournal.note("output device switch failed id=\(target) \(error)")
+            // The old device is still wired; bring playback back on it rather
+            // than leaving a stopped engine behind.
+        }
+        handleConfigurationChange()
+    }
+    #endif
+
     // MARK: - Configuration changes (locked)
 
     /// The engine stopped because the output hardware changed (new default

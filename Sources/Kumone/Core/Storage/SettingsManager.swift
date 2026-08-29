@@ -91,6 +91,9 @@ final class SettingsManager: ObservableObject {
         static let automix = "settings.automixEnabled"
         static let loudnessCompensation = "settings.loudnessCompensation"
         static let audioCacheLimit = "settings.audioCacheLimit"
+        #if os(macOS)
+        static let outputDevice = "settings.outputDeviceUID"
+        #endif
     }
 
     @Published var audioQuality: AudioQuality {
@@ -168,6 +171,15 @@ final class SettingsManager: ObservableObject {
         }
     }
 
+    #if os(macOS)
+    /// CoreAudio UID of the chosen output device; "" follows the system
+    /// default. UID rather than the numeric AudioDeviceID, which is not
+    /// stable across launches. Written by `AudioOutputController`.
+    @Published var outputDeviceUID: String {
+        didSet { UserDefaults.standard.set(outputDeviceUID, forKey: Keys.outputDevice) }
+    }
+    #endif
+
     private init() {
         let defaults = UserDefaults.standard
         audioQuality = defaults.string(forKey: Keys.quality).flatMap(AudioQuality.init) ?? .exhigh
@@ -185,5 +197,8 @@ final class SettingsManager: ObservableObject {
         loudnessCompensationEnabled =
             defaults.object(forKey: Keys.loudnessCompensation) as? Bool ?? true
         audioCacheLimit = (defaults.object(forKey: Keys.audioCacheLimit) as? Int64) ?? 2_147_483_648
+        #if os(macOS)
+        outputDeviceUID = defaults.string(forKey: Keys.outputDevice) ?? ""
+        #endif
     }
 }

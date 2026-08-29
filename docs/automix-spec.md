@@ -187,3 +187,4 @@ struct BeatMatchedPlan {
 - **NetEase URL 时效**：resolve 与下载原子化在同一 pipeline task 内，URL 永不落盘。
 - **分析准确度**：自研 beat tracking 对无鼓点/自由节拍曲目会低置信，退化链保证听感底线——置信度阈值宁高勿低。
 - **许可证**：全部自研 + 系统框架，无新第三方依赖，LGPL-3.0-only 不受影响。
+- **AirPlay 输出延迟**：AirPlay 设备的输出缓冲很大（典型 ~2 秒），而位置计算读的是 player node 时钟（在该缓冲上游）。过渡点在流里的位置仍然正确，但**用户感知到的 seam 时刻会整体偏移一个 AirPlay 延迟**，调试面板倒计时会提前归零。v1 不补偿，详见 `docs/automix-airplay.md`。

@@ -283,6 +283,11 @@
 "未检测到 TrollStore：检查更新会打开发布页，需用侧载工具重新安装（登录状态与设置保留）" = "No TrollStore: Check for Updates opens the release page; reinstall with your sideloading tool (sign-in and settings are kept)";
 "可能被网易云风控拦截而不可用，推荐使用扫码登录" = "May be blocked by NetEase risk control and unavailable — QR sign-in is recommended";
 
+/* Output device menu (macOS) */
+"系统默认" = "System Default";
+"输出设备：%@" = "Output Device: %@";
+"“%@”已断开，已切换到系统默认输出" = "“%@” disconnected — switched to the system default output";
+
 /* Dock menu */
 "不循环" = "Off";
 "列表循环" = "Repeat All";

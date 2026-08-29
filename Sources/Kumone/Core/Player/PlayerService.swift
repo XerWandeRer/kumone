@@ -268,6 +268,17 @@ final class PlayerService: ObservableObject {
             AudioSpectrum.shared.ingest(buffer)
         }
 
+        #if os(macOS)
+        // macOS output routing (incl. AirPlay endpoints the system publishes):
+        // the controller owns the device list and the user's choice, and this
+        // is the only place it can reach the engine. Restores the persisted
+        // device as a side effect.
+        let engine = engine
+        AudioOutputController.shared.attach { deviceID in
+            engine.setOutputDevice(deviceID)
+        }
+        #endif
+
         #if os(iOS)
         // The engine configures the AVAudioSession lazily on first start.
 
