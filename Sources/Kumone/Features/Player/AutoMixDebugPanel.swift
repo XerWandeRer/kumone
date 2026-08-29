@@ -179,7 +179,7 @@ struct AutoMixDebugPanel: View {
         HStack(spacing: 6) {
             Text(verbatim: "candidate").frame(width: 128, alignment: .leading)
             Text(verbatim: "tier").frame(width: 92, alignment: .leading)
-            ForEach(["tmp", "key", "sty", "enr", "age", "art"], id: \.self) { column in
+            ForEach(["tmp", "key", "sty", "enr", "age", "art", "fut"], id: \.self) { column in
                 Text(verbatim: column).frame(width: 34, alignment: .trailing)
             }
             Text(verbatim: "total").frame(width: 44, alignment: .trailing)
@@ -195,7 +195,7 @@ struct AutoMixDebugPanel: View {
                 .lineLimit(1).truncationMode(.tail)
                 .frame(width: 128, alignment: .leading)
             Text(verbatim: c.tier).frame(width: 92, alignment: .leading)
-            ForEach(Array([c.tempo, c.key, c.style, c.energy, c.aging, c.samePenalty]
+            ForEach(Array([c.tempo, c.key, c.style, c.energy, c.aging, c.samePenalty, c.future]
                           .enumerated()), id: \.offset) { _, value in
                 Text(verbatim: String(format: "%.2f", value))
                     .frame(width: 34, alignment: .trailing)
@@ -478,6 +478,8 @@ private struct DebugRow: View {
         self.value = value
     }
 
+    @State private var copied = false
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(verbatim: label)
@@ -487,6 +489,15 @@ private struct DebugRow: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
+            Button(copied ? "copied" : "copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("\(label)\t\(value)", forType: .string)
+                copied = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+            }
+            .buttonStyle(.plain)
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
     }
 }
