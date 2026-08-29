@@ -138,6 +138,21 @@ struct TransitionStyle: Sendable, Equatable {
     /// emits today — means the hand-over works on the whole mix, exactly as
     /// it always has. See `StemTechnique`.
     var stemTechnique: StemTechnique? = nil
+    /// A **transition score**: a few typed events on the bar grid around the
+    /// seam, to be compiled into audio by `ScoreCompiler` and performed by the
+    /// pre-rendered segment path (`docs/automix-score-predev.md`).
+    ///
+    /// Mounted exactly like `stemTechnique`, and for the same reason: `nil` is
+    /// the default and `nil` is everything today. A planner that does not write
+    /// it leaves every decision, every curve and every rendered sample
+    /// field-for-field what it was — the structural guarantee behind "the
+    /// fall-back path is byte-identical to today", rather than a test's promise.
+    ///
+    /// The live path never performs one. Sample-accurate gestures need the
+    /// segment renderer; a 20 ms automation tick cannot cut cleanly, and an
+    /// approximated cut is worse than the blend it replaced (predev §1.2), so a
+    /// segment that does not arm means the listener hears today's hand-over.
+    var score: TransitionScore? = nil
 
     static let plain = TransitionStyle(outroEffect: .fade, stagedEQ: false)
 }
