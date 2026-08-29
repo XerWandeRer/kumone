@@ -612,7 +612,7 @@ final class PlayerService: ObservableObject {
             autoMixQueue.remove(at: idx)
         }
         // The chain may have been planning around the track that just left.
-        refreshAutoMixLookahead()
+        refreshAutoMixLookahead(force: true)
         schedulePrefetch()
     }
 
@@ -1693,11 +1693,19 @@ final class PlayerService: ObservableObject {
         if autoMixPickPending, currentAnalysis != nil,
            Date().timeIntervalSince(lastDebugOrderPreview) >= Self.debugOrderPreviewInterval {
             lastDebugOrderPreview = Date()
+            // A preview pass is one full rank of the pool — the same work the
+            // real pick does, and measured under the same tripwire. It stays on
+            // the main actor because that is where `lastPick` lives and because
+            // one rank measures 0.9 ms in release (13.8 ms in debug) at a
+            // 156-track pool; the throttle above is what keeps it there.
+            let start = ContinuousClock.now
             _ = selector.pick(
                 outgoing: currentTrack, outgoingAnalysis: currentAnalysis, pool: pool,
                 plannerConfig: plannerConfig,
                 outgoingLyricLineEnds: currentLocalURL
                     .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
+            Self.noteIfSlow("debug-preview", (ContinuousClock.now - start).milliseconds,
+                            detail: "pool=\(pool.count)")
         }
         let candidates = selector.lastPick.enumerated().map { index, candidate in
             AutoMixDebugCandidate(
@@ -2040,11 +2048,19 @@ final class PlayerService: ObservableObject {
         }
 
         let pool = selector.pool(remaining: remaining)
+        // The real decision stays on the main actor: one rank measures 0.9 ms
+        // in release and 13.8 ms in debug at a 156-track pool, it happens once
+        // per landing candidate rather than nine times, and the pick is the one
+        // thing here that is not provisional. The tripwire says so if that
+        // stops being true.
+        let pickStart = ContinuousClock.now
         let winner = selector.pick(
             outgoing: currentTrack, outgoingAnalysis: currentAnalysis, pool: pool,
             plannerConfig: plannerConfig,
             outgoingLyricLineEnds: currentLocalURL
                 .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
+        Self.noteIfSlow("pick", (ContinuousClock.now - pickStart).milliseconds,
+                        detail: "pool=\(pool.count)")
         // Good enough is good enough: the tier is the dominant term, so a
         // further round can only buy a *higher* tier or a second-order
         // reshuffle inside this one — not worth another download and another
@@ -2101,7 +2117,9 @@ final class PlayerService: ObservableObject {
             queueOrderSelector?.noteRound(chosen: winner, pool: pool)
             spliceAutoMixPlan([winner])
         }
-        refreshAutoMixLookahead()
+        // The chain's head just changed: this is the one moment it is worth
+        // being right, so it jumps the throttle.
+        refreshAutoMixLookahead(force: true)
         schedulePrefetch()
     }
 
@@ -2116,39 +2134,152 @@ final class PlayerService: ObservableObject {
     /// (rather than teaching `upcomingTracks` a second source of truth) is the
     /// same trick the decided next already uses, so `currentIndex` stays the
     /// only cursor there is.
+    ///
+    /// **One assignment, or none.** `autoMixQueue` is `@Published` and the
+    /// queue view is a list of a few hundred rows, so every mutation costs a
+    /// full SwiftUI diff of the whole list. The first version of this moved the
+    /// tracks one at a time — nine publishes and nine diffs per refresh, on
+    /// every candidate that landed. The reordered array is now built whole and
+    /// assigned once, and not assigned at all when the order is already what it
+    /// should be, which is the common case after the first refresh.
     private func spliceAutoMixPlan(_ tracks: [Track]) {
-        var target = currentIndex + 1
-        for track in tracks {
-            guard target < autoMixQueue.count,
-                  let from = autoMixQueue.firstIndex(where: { $0.id == track.id }),
-                  from > currentIndex else { continue }
-            if from != target {
-                autoMixQueue.insert(autoMixQueue.remove(at: from), at: target)
-            }
-            target += 1
-        }
+        guard let reordered = Self.queueSplicingPlan(
+            autoMixQueue, at: currentIndex + 1, plan: tracks) else { return }
+        autoMixQueue = reordered
     }
+
+    /// The reordered queue, or **nil when it would change nothing** — which is
+    /// the common case once the chain has settled, and the signal the caller
+    /// uses to skip the publish entirely.
+    ///
+    /// Pure, so the property that matters (this is a permutation of the input
+    /// that moves the plan to the front of the tail and disturbs nothing else)
+    /// is assertable without a player.
+    nonisolated static func queueSplicingPlan(
+        _ queue: [Track], at target: Int, plan: [Track]
+    ) -> [Track]? {
+        guard target >= 0, target <= queue.count else { return nil }
+        let ahead = queue[target...]
+        let aheadIDs = Set(ahead.map(\.id))
+        var planned: [Track] = []
+        var placed: Set<Int> = []
+        // Only tracks that are actually still ahead of the playhead, each once.
+        for track in plan where aheadIDs.contains(track.id) && !placed.contains(track.id) {
+            placed.insert(track.id)
+            planned.append(track)
+        }
+        guard !planned.isEmpty else { return nil }
+        let reordered = Array(queue[..<target]) + planned
+            + ahead.filter { !placed.contains($0.id) }
+        // Compare identities, not whole tracks: a `Track` carries nested arrays
+        // and this runs on every refresh.
+        guard reordered.map(\.id) != queue.map(\.id) else { return nil }
+        return reordered
+    }
+
+    /// How often the provisional chain may be recomputed off the back of a
+    /// landing analysis.
+    ///
+    /// A commit always recomputes — that is the moment the chain's head
+    /// changes and the moment it is worth being right. In between, candidates
+    /// land every few seconds during an escalation, and a pool one track richer
+    /// does not meaningfully change an eight-step preview. So the pool-growth
+    /// trigger is throttled and the work is skipped rather than queued.
+    static let lookaheadRefreshInterval: TimeInterval = 5
+
+    /// The throttle rule, in one place: a commit always goes, a landing
+    /// analysis waits its turn, and only one computation is ever in flight.
+    nonisolated static func lookaheadRefreshAllowed(
+        force: Bool, computing: Bool, sinceLast: TimeInterval
+    ) -> Bool {
+        force || (!computing && sinceLast >= lookaheadRefreshInterval)
+    }
+
+    private var lastLookaheadRefresh: Date = .distantPast
+    /// A chain computation is in flight; a second one would only race it.
+    private var lookaheadComputing = false
+    /// Bumped whenever the chain's premise changes, so an answer computed
+    /// against a queue that has since moved on is dropped rather than shown.
+    private var lookaheadGeneration = 0
 
     /// Redo the provisional chain and lay it into the working list.
     ///
     /// Called on every commit, whenever a candidate analysis lands (the pool
-    /// grew) and when the queue is edited. It is pure arithmetic over the
-    /// analyzed pool — microseconds — so there is no invalidation bookkeeping:
-    /// the answer is simply recomputed rather than repaired.
-    private func refreshAutoMixLookahead() {
+    /// grew) and when the queue is edited.
+    ///
+    /// The computation itself runs **off the main actor**. Measured at a
+    /// 156-track pool it is 5.6 ms in release and 110 ms in debug, and it grows
+    /// linearly with the pool — which grew from the 4-track window this feature
+    /// shipped with to 200+ as the cache warmed. Main-actor work of that size,
+    /// arriving every time a download lands, is a stutter; it is what made the
+    /// app appear to hang after a queue action.
+    private func refreshAutoMixLookahead(force: Bool = false) {
         guard let selector = queueOrderSelector, queueOrder == .autoMix else { return }
         // The chain hangs off the decided next. While the pick is still
         // pending there is nothing to hang it off, and showing a chain from a
         // head that is about to change would be worse than showing none.
         guard !autoMixPickPending, currentIndex >= 0,
               currentIndex + 1 < autoMixQueue.count else {
+            lookaheadGeneration += 1
             return selector.clearLookahead()
         }
+        guard selector.config.lookaheadDepth > 0 else { return selector.clearLookahead() }
+        let now = Date()
+        // A commit forces; a landing analysis waits its turn. Either way only
+        // one computation is ever in flight — a forced one supersedes whatever
+        // is running by bumping the generation below, and the superseded task
+        // drops its answer without touching the flag.
+        guard Self.lookaheadRefreshAllowed(
+            force: force, computing: lookaheadComputing,
+            sinceLast: now.timeIntervalSince(lastLookaheadRefresh)) else { return }
+
         let head = autoMixQueue[currentIndex + 1]
         let rest = Array(autoMixQueue[(currentIndex + 2)...])
-        selector.recomputeLookahead(head: head, remaining: rest,
-                                    plannerConfig: plannerConfig)
-        spliceAutoMixPlan([head] + selector.lookahead.map(\.track))
+        lastLookaheadRefresh = now
+        lookaheadComputing = true
+        lookaheadGeneration += 1
+        let generation = lookaheadGeneration
+        let depth = selector.config.lookaheadDepth
+        let input = selector.chainInput(head: head, remaining: rest,
+                                        plannerConfig: plannerConfig)
+        Task { [weak self] in
+            let start = ContinuousClock.now
+            let results = await Task.detached(priority: .utility) {
+                QueueOrderSelector.chain(input, depth: depth)
+            }.value
+            let elapsed = (ContinuousClock.now - start).milliseconds
+            guard let self else { return }
+            // A commit, a queue edit or a track change happened while this was
+            // running: its premise is gone, and a provisional chain is never
+            // worth showing against the wrong head. The flag stays set — it
+            // belongs to whichever computation superseded this one.
+            guard generation == self.lookaheadGeneration else { return }
+            self.lookaheadComputing = false
+            guard self.currentIndex >= 0,
+                  self.currentIndex + 1 < self.autoMixQueue.count,
+                  self.autoMixQueue[self.currentIndex + 1].id == input.headID else { return }
+            let current = Array(self.autoMixQueue[(self.currentIndex + 2)...])
+            self.queueOrderSelector?.applyLookahead(results, remaining: current)
+            let chain = self.queueOrderSelector?.lookahead.map(\.track) ?? []
+            self.spliceAutoMixPlan([head] + chain)
+            Self.noteIfSlow("lookahead", elapsed,
+                            detail: "pool=\(input.poolIDs.count) depth=\(depth) "
+                                + "steps=\(chain.count)")
+        }
+    }
+
+    /// The permanent tripwire on the queue-order arithmetic.
+    ///
+    /// Everything this mode computes was designed when the pool was four tracks
+    /// and described in the predev as "microseconds". The pool is now whatever
+    /// the cache has warmed to, and the cost is linear in it — so the honest
+    /// thing is not to assert the cost is small but to say so out loud the
+    /// moment it is not. 50 ms is three frames.
+    private static let slowWorkThresholdMS: Double = 50
+
+    private static func noteIfSlow(_ what: String, _ ms: Double, detail: String) {
+        guard ms >= slowWorkThresholdMS else { return }
+        PlaybackJournal.note(String(format: "order SLOW %@ %.0fms %@", what, ms, detail))
     }
 
     // MARK: - Persistence

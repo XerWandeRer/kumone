@@ -372,47 +372,125 @@ final class QueueOrderSelector {
     /// towards.
     private(set) var lookahead: [ChainStep] = []
 
-    /// Recompute the chain from `head` (the decided next) over `remaining`
-    /// (everything after it).
+    /// Everything the chain needs, in value types only — no `Track`, no
+    /// selector, nothing main-actor-bound. This is what crosses to the
+    /// background, and the reason it can.
+    struct ChainInput: Sendable {
+        var headID: Int
+        /// Analyzed candidates in list order.
+        var poolIDs: [Int]
+        var analyses: [Int: TrackAnalysis]
+        var lostRounds: [Int: Int]
+        /// Credited artist IDs per track, for the same-artist penalty. Id 0 is
+        /// the decoder's "unknown" and is filtered out before it gets here.
+        var artistIDs: [Int: Set<Int>]
+        var config: QueueOrderConfig
+        var plannerConfig: TransitionPlanner.Config
+    }
+
+    /// One computed step, still in value types.
+    struct ChainResult: Sendable, Equatable {
+        let id: Int
+        let score: QueueOrderScore
+    }
+
+    /// The chain, as a pure function.
     ///
-    /// Chained greedy over the analyzed pool only — no download is ever started
-    /// for a chain step, so this is some tens of `TransitionPlanner.plan` calls
-    /// and costs microseconds. Cheap enough to simply redo whenever the pool
-    /// grows or the queue is edited, which is why there is no invalidation
-    /// bookkeeping anywhere.
+    /// Chained greedy over the analyzed pool: each step scores the pool against
+    /// the previous step's winner, takes the best, and ages its own private
+    /// copy of the counters exactly as a real round would — so a chain of eight
+    /// does not hand the same track to all eight seams.
     ///
-    /// Aging and the same-artist penalty are honoured, against a **copy** of
-    /// the counters — see `rank`. Lyric line ends are not: a chain step's
-    /// candidate has no local file yet, and a vocal-exchange hand-over is a
-    /// detail of a seam this chain is not promising to make.
+    /// `nonisolated` and free of reference types on purpose: at a 156-track
+    /// pool this is 5.6 ms in release and **110 ms in debug**, and the selector
+    /// lives on the main actor. A hundred milliseconds of main actor, every
+    /// time a candidate lands, is a stutter; at a thousand-track playlist it is
+    /// a freeze. So it runs on a detached task and only the answer comes back.
+    ///
+    /// Lyric line ends are deliberately absent: a chain step's candidate has no
+    /// local file yet, and a vocal-exchange hand-over is a detail of a seam
+    /// this chain is not promising to make.
+    nonisolated static func chain(_ input: ChainInput, depth: Int) -> [ChainResult] {
+        var out: [ChainResult] = []
+        var aging = input.lostRounds
+        var outgoingID = input.headID
+        var pool = input.poolIDs.filter { $0 != input.headID }
+        while out.count < depth, !pool.isEmpty {
+            let outgoing = input.analyses[outgoingID]
+            let outgoingArtists = input.artistIDs[outgoingID] ?? []
+            var best: (index: Int, id: Int, score: QueueOrderScore)?
+            for (index, id) in pool.enumerated() {
+                guard let incoming = input.analyses[id] else { continue }
+                let planned = TransitionPlanner.plan(
+                    outgoing: outgoing, incoming: incoming, stems: .none,
+                    config: input.plannerConfig,
+                    context: .init(outgoingLyricLineEnds: []))
+                let score = QueueOrderScorer.score(
+                    outgoing: outgoing, incoming: incoming, planned: planned,
+                    lostRounds: aging[id] ?? 0,
+                    sharesArtist: !outgoingArtists.isEmpty
+                        && !(input.artistIDs[id] ?? []).isDisjoint(with: outgoingArtists),
+                    config: input.config, plannerConfig: input.plannerConfig)
+                // Ties break on list order, which `pool` is in.
+                if best == nil || score.total > best!.score.total { best = (index, id, score) }
+            }
+            guard let winner = best else { break }
+            out.append(ChainResult(id: winner.id, score: winner.score))
+            for id in pool where id != winner.id { aging[id, default: 0] += 1 }
+            aging[winner.id] = nil
+            pool.remove(at: winner.index)
+            outgoingID = winner.id
+        }
+        return out
+    }
+
+    /// Build the chain's input from the selector's state.
+    func chainInput(head: Track, remaining: [Track],
+                    plannerConfig: TransitionPlanner.Config) -> ChainInput {
+        let candidates = remaining.filter { analyses[$0.id] != nil }
+        var artistIDs: [Int: Set<Int>] = [:]
+        for track in [head] + candidates {
+            artistIDs[track.id] = Set(track.artists.map(\.id).filter { $0 != 0 })
+        }
+        var wanted = Set(candidates.map(\.id))
+        wanted.insert(head.id)
+        let needed = analyses.filter { wanted.contains($0.key) }
+        return ChainInput(
+            headID: head.id, poolIDs: candidates.map(\.id), analyses: needed,
+            lostRounds: lostRounds, artistIDs: artistIDs,
+            config: config, plannerConfig: plannerConfig)
+    }
+
+    /// Turn a computed chain back into steps, dropping anything that has left
+    /// the queue while the background task was running.
+    ///
+    /// That drop is the whole staleness story: the chain is provisional, the
+    /// answer is only ever *shown*, and a track that is no longer in the queue
+    /// simply is not in the chain. No repair, no invalidation bookkeeping.
+    func applyLookahead(_ results: [ChainResult], remaining: [Track]) {
+        let byID = Dictionary(remaining.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        lookahead = results.compactMap { result in
+            byID[result.id].map { ChainStep(track: $0, score: result.score) }
+        }
+    }
+
+    func clearLookahead() { lookahead = [] }
+
+    /// Input → chain → apply, in one synchronous call.
+    ///
+    /// The production path does the middle step on a detached task, which is
+    /// the whole point of the split; this composes the same three functions so
+    /// the two cannot drift, and so the chain's behaviour is assertable without
+    /// a scheduler in the test.
     func recomputeLookahead(
         head: Track, remaining: [Track],
         plannerConfig: TransitionPlanner.Config = .standard
     ) {
-        var chain: [ChainStep] = []
-        var aging = lostRounds
-        var outgoing = head
-        var pool = remaining.filter { analyses[$0.id] != nil && $0.id != head.id }
-        let depth = max(0, config.lookaheadDepth)
-        while chain.count < depth, !pool.isEmpty {
-            let ranked = rank(
-                outgoing: outgoing, outgoingAnalysis: analyses[outgoing.id], pool: pool,
-                lostRounds: aging, plannerConfig: plannerConfig, outgoingLyricLineEnds: [])
-            guard let best = ranked.first else { break }
-            chain.append(ChainStep(track: best.track, score: best.score))
-            // The preview ages its own copy, exactly as a real round would, so
-            // a chain of eight does not hand the same track to every seam.
-            for candidate in ranked where candidate.track.id != best.track.id {
-                aging[candidate.track.id, default: 0] += 1
-            }
-            aging[best.track.id] = nil
-            pool.removeAll { $0.id == best.track.id }
-            outgoing = best.track
-        }
-        lookahead = chain
+        let input = chainInput(head: head, remaining: remaining,
+                               plannerConfig: plannerConfig)
+        applyLookahead(Self.chain(input, depth: max(0, config.lookaheadDepth)),
+                       remaining: remaining)
     }
-
-    func clearLookahead() { lookahead = [] }
 
     /// Commit a pick: everyone else in the pool ages by one round.
     ///
@@ -525,5 +603,17 @@ final class QueueOrderSelector {
         }).value else { return .refused("analysis failed") }
         await AudioCache.shared.storeAnalysis(analyzed, for: key)
         return .analyzed(analyzed)
+    }
+}
+
+extension Duration {
+    /// Wall-clock milliseconds, for the timing the queue-order code reports.
+    ///
+    /// `ContinuousClock` is the right clock for "did this block the main
+    /// actor": it does not stop when the machine sleeps and it is not
+    /// adjustable, so a number measured here is the number the user waited.
+    var milliseconds: Double {
+        let parts = components
+        return Double(parts.seconds) * 1000 + Double(parts.attoseconds) / 1e15
     }
 }

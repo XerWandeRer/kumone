@@ -703,6 +703,151 @@ import Foundation
         #expect(selector.lastPick.isEmpty)
     }
 
+    // MARK: - Chain cost and concurrency
+
+    @MainActor
+    @Test func theChainComputesTheSameAnswerOffTheMainActorAsOn() async {
+        // The production path splits the chain into snapshot → pure compute →
+        // apply so the middle can run on a detached task. That split is only
+        // safe if it is an identity, so: build the input, run the pure function
+        // *off* the main actor, and check it against the synchronous wrapper.
+        let selector = QueueOrderSelector()
+        selector.config.lookaheadDepth = 5
+        let head = track(1, artist: 7)
+        let remaining = (2...12).map { track($0, artist: $0 % 3 == 0 ? 7 : $0) }
+        for t in [head] + remaining {
+            selector.injectAnalysisForTesting(
+                makeAnalysis(bpm: 110 + Double(t.id), keyPitchClass: t.id % 12,
+                             keyConfidence: 0.8, melProfile: [Float(t.id), 1, 0, 0],
+                             energy: Float(t.id % 5) / 5),
+                forTrackID: t.id)
+        }
+        let input = selector.chainInput(head: head, remaining: remaining,
+                                        plannerConfig: .standard)
+        let offMain = await Task.detached(priority: .utility) {
+            QueueOrderSelector.chain(input, depth: 5)
+        }.value
+
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead.map(\.track.id) == offMain.map(\.id))
+        #expect(selector.lookahead.map(\.score) == offMain.map(\.score))
+        #expect(!offMain.isEmpty)
+        // The same-artist penalty survives the crossing: the snapshot carries
+        // artist IDs rather than tracks, and this is what proves it.
+        #expect(input.artistIDs[head.id] == [7])
+        #expect(input.artistIDs[6] == [7])
+    }
+
+    @MainActor
+    @Test func applyingAChainDropsStepsThatHaveLeftTheQueue() {
+        // The compute runs while the user can still edit the queue, so the
+        // answer may name tracks that are gone by the time it lands. They are
+        // dropped, not repaired — the chain is provisional and showing a track
+        // that is no longer queued would be a lie.
+        let selector = QueueOrderSelector()
+        let head = track(1)
+        let remaining = (2...6).map { track($0) }
+        for t in [head] + remaining {
+            selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: t.id)
+        }
+        let results = [3, 4, 5].map {
+            QueueOrderSelector.ChainResult(id: $0, score: QueueOrderScore())
+        }
+        selector.applyLookahead(results, remaining: remaining.filter { $0.id != 4 })
+        #expect(selector.lookahead.map(\.track.id) == [3, 5])
+
+        // Nothing left at all is an empty chain, not a stale one.
+        selector.applyLookahead(results, remaining: [])
+        #expect(selector.lookahead.isEmpty)
+    }
+
+    @MainActor
+    @Test func aChainInputCarriesOnlyWhatTheChainCanUse() {
+        let selector = QueueOrderSelector()
+        let head = track(1)
+        let remaining = (2...9).map { track($0) }
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 1)
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 4)
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 7)
+        // An analysis for a track outside this queue entirely — the pool is
+        // cumulative across sessions, so this is the normal case.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 999)
+
+        let input = selector.chainInput(head: head, remaining: remaining,
+                                        plannerConfig: .standard)
+        // Only analyzed candidates, in list order; the head is not a candidate
+        // for its own chain.
+        #expect(input.poolIDs == [4, 7])
+        #expect(input.headID == 1)
+        // The analyses dictionary is the snapshot that crosses to another
+        // thread, so it carries the head and the pool and nothing else.
+        #expect(Set(input.analyses.keys) == [1, 4, 7])
+    }
+
+    @Test func theChainRefreshIsThrottledExceptWhenItsHeadChanges() {
+        let allowed = PlayerService.lookaheadRefreshAllowed
+        let interval = PlayerService.lookaheadRefreshInterval
+
+        // A landing analysis just after another one: skipped. During an
+        // escalation these arrive every few seconds, and a pool one track
+        // richer does not meaningfully change an eight-step preview.
+        #expect(!allowed(false, false, 0))
+        #expect(!allowed(false, false, interval - 0.01))
+        #expect(allowed(false, false, interval))
+
+        // A commit is the moment the chain's head changes, so it never waits.
+        #expect(allowed(true, false, 0))
+
+        // Never two at once — a second computation would only race the first.
+        #expect(!allowed(false, true, interval * 10))
+        // Except a forced one, which supersedes rather than races: the running
+        // task's generation is stale by then and it drops its own answer.
+        #expect(allowed(true, true, 0))
+    }
+
+    // MARK: - Splicing the plan into the working list
+
+    @Test func splicingBuildsTheWholeQueueOnceAndSaysWhenItWouldChangeNothing() {
+        let queue = (0...9).map { track($0) }
+        // Current track is index 0, so the plan lands at 1.
+        let moved = PlayerService.queueSplicingPlan(queue, at: 1, plan: [track(5), track(3)])
+        #expect(moved?.map(\.id) == [0, 5, 3, 1, 2, 4, 6, 7, 8, 9])
+        // A permutation: nothing gained, nothing lost, and the current track
+        // never moves.
+        #expect(Set(moved!.map(\.id)) == Set(queue.map(\.id)))
+        #expect(moved?.count == queue.count)
+        #expect(moved?.first?.id == 0)
+
+        // **Nil is the point.** Re-splicing the same plan onto the result must
+        // not publish: `autoMixQueue` is `@Published` and the queue view is
+        // hundreds of rows, so a no-op assignment costs a full SwiftUI diff.
+        #expect(PlayerService.queueSplicingPlan(moved!, at: 1,
+                                                plan: [track(5), track(3)]) == nil)
+        // Same for a plan that is already in place at the head of the tail.
+        #expect(PlayerService.queueSplicingPlan(queue, at: 1,
+                                                plan: [track(1), track(2)]) == nil)
+    }
+
+    @Test func splicingIgnoresTracksThatAreNotAheadOfThePlayhead() {
+        let queue = (0...5).map { track($0) }
+        // Track 0 is behind the playhead at target 3, and 99 is not in the
+        // queue at all: both are simply not part of the plan. A chain step
+        // whose track has left the queue can therefore never reorder anything.
+        #expect(PlayerService.queueSplicingPlan(
+            queue, at: 3, plan: [track(0), track(99), track(5)])?.map(\.id)
+            == [0, 1, 2, 5, 3, 4])
+        // A plan with nothing usable in it does not publish.
+        #expect(PlayerService.queueSplicingPlan(
+            queue, at: 3, plan: [track(0), track(99)]) == nil)
+        #expect(PlayerService.queueSplicingPlan(queue, at: 3, plan: []) == nil)
+        // Out-of-range targets are refused rather than trapping.
+        #expect(PlayerService.queueSplicingPlan(queue, at: 99, plan: [track(5)]) == nil)
+        #expect(PlayerService.queueSplicingPlan(queue, at: -1, plan: [track(5)]) == nil)
+        // A duplicate in the plan is placed once.
+        #expect(PlayerService.queueSplicingPlan(
+            queue, at: 1, plan: [track(4), track(4)])?.map(\.id) == [0, 4, 1, 2, 3, 5])
+    }
+
     // MARK: - Stem pre-render runway
 
     @Test func theRunwayEstimateScalesWithTheSeamRatherThanBeingOneFlatNumber() {
