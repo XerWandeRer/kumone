@@ -244,6 +244,9 @@ final class QueueOrderSelector {
         admitted.formUnion(opened.map(\.id))
         lastRoundSize = size
         rounds += 1
+        PlaybackJournal.note(
+            "order round \(rounds) opened size=\(size) admitted=\(opened.count) "
+            + "analyzed=\(analyses.count) refused=\(refused.count)")
         return true
     }
 
@@ -255,13 +258,16 @@ final class QueueOrderSelector {
         fetching = true
         downloadsThisPick += 1
         Task { [weak self] in
-            let analysis = await Self.scoringAnalysis(for: track)
+            let fetched = await Self.scoringAnalysis(for: track)
             guard let self else { return }
             self.fetching = false
-            if let analysis {
+            switch fetched {
+            case .analyzed(let analysis):
                 self.analyses[track.id] = analysis
-            } else {
+                PlaybackJournal.note("order fetch ok id=\(track.id)")
+            case .refused(let why):
                 self.refused.insert(track.id)
+                PlaybackJournal.note("order fetch refused id=\(track.id) why=\(why)")
             }
             self.onCandidateReady?()
         }
@@ -389,26 +395,34 @@ final class QueueOrderSelector {
     /// Trial fragments are refused: a 30-second excerpt has neither the
     /// structure nor the duration the planner needs, and scoring one would be
     /// scoring a different piece of music.
-    private static func scoringAnalysis(for track: Track) async -> TrackAnalysis? {
+    /// One fetch's outcome, with the refusal reason kept for the journal —
+    /// the mass-refusal failure mode is invisible without it.
+    private enum ScoringFetch {
+        case analyzed(TrackAnalysis)
+        case refused(String)
+    }
+
+    private static func scoringAnalysis(for track: Track) async -> ScoringFetch {
         guard let data = try? await NeteaseAPI.songURL(
-                ids: [track.id], level: scoringLevel).first,
-              data.freeTrialInfo == nil,
-              let urlString = data.url,
+                ids: [track.id], level: scoringLevel).first
+        else { return .refused("songURL failed") }
+        guard data.freeTrialInfo == nil else { return .refused("trial fragment") }
+        guard let urlString = data.url,
               let remote = URL(string: urlString.replacingOccurrences(
                   of: "http://", with: "https://"))
-        else { return nil }
+        else { return .refused("no url served") }
         let ext = remote.pathExtension.isEmpty ? "mp3" : remote.pathExtension.lowercased()
         let key = AudioCache.Key(trackID: track.id, level: data.level ?? scoringLevel,
                                  source: "netease", fileExtension: ext)
-        if let cached = await AudioCache.shared.loadAnalysis(for: key) { return cached }
-        guard let local = try? await AudioCache.shared.download(from: remote, key: key)
-        else { return nil }
-        let analyzed = await Task.detached(priority: .utility) {
-            try? TrackAnalyzer.analyze(fileAt: local)
-        }.value
-        if let analyzed {
-            await AudioCache.shared.storeAnalysis(analyzed, for: key)
+        if let cached = await AudioCache.shared.loadAnalysis(for: key) {
+            return .analyzed(cached)
         }
-        return analyzed
+        guard let local = try? await AudioCache.shared.download(from: remote, key: key)
+        else { return .refused("download failed") }
+        guard let analyzed = await Task.detached(priority: .utility, operation: {
+            try? TrackAnalyzer.analyze(fileAt: local)
+        }).value else { return .refused("analysis failed") }
+        await AudioCache.shared.storeAnalysis(analyzed, for: key)
+        return .analyzed(analyzed)
     }
 }

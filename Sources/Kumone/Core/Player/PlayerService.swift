@@ -1513,6 +1513,14 @@ final class PlayerService: ObservableObject {
         currentLyricLRC = nil
         pendingTransitionTrack = nil
         prefetchedNext = nil
+        // A hand-over is as much a "new track" as a manual start: without this
+        // the committed flag survives into the next song, `autoMixPickPending`
+        // never comes back up, and the mode silently degrades to list order
+        // for every track that arrives via a transition (which is all of them).
+        // `progress`/`duration`/`currentAnalysis` above are already this
+        // track's, so the deadline the next tick reads is not stale.
+        autoMixPickCommitted = false
+        queueOrderSelector?.beginPick()
         // The song that was "next" is now "now"; `schedulePrefetch` (via
         // transitionCompleted) fills the group in again a moment later.
         AutoMixDebugModel.shared.clearNext()
@@ -1943,7 +1951,9 @@ final class PlayerService: ObservableObject {
         let remaining = autoMixRemaining()
         // Nothing to choose between: let the ordinary pipeline have the track
         // the list already points at.
-        guard remaining.count > 1 else { return commitAutoMixPick(nil, pool: []) }
+        guard remaining.count > 1 else {
+            return commitAutoMixPick(nil, pool: [], reason: "trivial-queue")
+        }
 
         let atDeadline = duration > 0 && progress >= autoMixDeadline
         // Scoring against a missing outgoing analysis is not scoring: every
@@ -1967,14 +1977,15 @@ final class PlayerService: ObservableObject {
         // reshuffle inside this one — not worth another download and another
         // minute of waiting.
         if atDeadline || selector.lastPickSatisfies {
-            return commitAutoMixPick(winner, pool: pool)
+            return commitAutoMixPick(winner, pool: pool,
+                                     reason: atDeadline ? "deadline" : "satisfied")
         }
         // Nothing satisfies yet: open the next round, unless the queue is
         // spent — in which case the best analyzed candidate is the answer, and
         // a nil one honestly leaves the list order alone.
         if selector.acquire(remaining: remaining,
                             mayDownload: autoMixMayDownload) == .exhausted {
-            commitAutoMixPick(winner, pool: pool)
+            commitAutoMixPick(winner, pool: pool, reason: "exhausted")
         }
     }
 
@@ -2000,8 +2011,15 @@ final class PlayerService: ObservableObject {
     /// every index-based path downstream is untouched. A nil winner (nothing
     /// analyzed by the deadline) leaves the list exactly as it was: the mode
     /// never holds up a hand-over waiting for a download.
-    private func commitAutoMixPick(_ winner: Track?, pool: [Track]) {
+    private func commitAutoMixPick(_ winner: Track?, pool: [Track],
+                                   reason: String) {
         autoMixPickCommitted = true
+        let tier = queueOrderSelector?.lastPick.first?.score.tier.label ?? "-"
+        PlaybackJournal.note(
+            "order commit reason=\(reason) winner=\(winner?.id.description ?? "none") "
+            + "tier=\(tier) analyzed=\(pool.count) "
+            + "rounds=\(queueOrderSelector?.rounds ?? 0) "
+            + "downloads=\(queueOrderSelector?.downloadsThisPick ?? 0)")
         if let winner {
             queueOrderSelector?.noteRound(chosen: winner, pool: pool)
             spliceAutoMixNext(winner)
