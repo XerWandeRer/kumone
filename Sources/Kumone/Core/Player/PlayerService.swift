@@ -1253,10 +1253,17 @@ final class PlayerService: ObservableObject {
     /// and the re-render was then refused for being late even when there was
     /// ample time to do it. A 16 s overlap needs 47 s; being handed 49 s is not
     /// a problem, and now it is not treated as one.
+    /// `separatesStems` false is a **score-only** segment: whole-mix gain lanes,
+    /// no separator consulted on either side (`WholeMixLaneLayer`). The
+    /// separation term is then not small, it is *absent* — what is left is one
+    /// render pass, and the margin already covers that with room to spare. This
+    /// is why a cut-on-one costs the runway a 30 s overlap used to be refused
+    /// for and a `.vocalExchange` still does.
     nonisolated static func stemPrerenderRunway(
-        overlapDuration: TimeInterval
+        overlapDuration: TimeInterval, separatesStems: Bool = true
     ) -> TimeInterval {
-        stemPrerenderSidesPerSeam * max(0, overlapDuration) + stemPrerenderMargin
+        guard separatesStems else { return stemPrerenderMargin }
+        return stemPrerenderSidesPerSeam * max(0, overlapDuration) + stemPrerenderMargin
     }
 
     private enum StemPrerenderState {
@@ -1309,12 +1316,17 @@ final class PlayerService: ObservableObject {
                 .refused("force live path (debug override)"))
             return
         }
-        guard StemSeparation.isAvailable,
-              transitionArmed, let planned = armedPlan,
-              planned.style.stemTechnique != nil,
+        guard transitionArmed, let planned = armedPlan,
+              planned.style.stemTechnique != nil || planned.style.score != nil,
               let signature = TransitionSegment.Signature(plan: planned.plan),
               let outgoingURL = currentLocalURL, let next = prefetchedNext
         else { return }
+        // A stem technique needs a separator; a score does not touch one. That
+        // asymmetry is the whole cost story of P1 — a score-only segment is a
+        // render and nothing else — so it decides both the admission above and
+        // the runway below.
+        let separatesStems = planned.style.stemTechnique != nil
+        guard !separatesStems || StemSeparation.isAvailable else { return }
 
         // A re-plan (a late analysis, a degraded seam after a seek) moves the
         // splice; whatever was rendered for the old one is the wrong audio.
@@ -1347,7 +1359,8 @@ final class PlayerService: ObservableObject {
             // Too early is not a decision — come back next tick.
             guard remaining <= Self.stemPrerenderLead else { return }
             let runway = Self.stemPrerenderRunway(
-                overlapDuration: signature.overlapDuration)
+                overlapDuration: signature.overlapDuration,
+                separatesStems: separatesStems)
             guard remaining >= runway, remaining > Self.stemPrerenderGuard else {
                 // It genuinely does not fit. Say so with the numbers and settle
                 // — starting a render that cannot finish only burns Metal time
@@ -1371,12 +1384,18 @@ final class PlayerService: ObservableObject {
                     ? " late (seam moved)" : ""))
         }
 
-        guard let provider = StemSeparation.provider else { return }
+        // A score-only segment never calls this, so a machine with no separator
+        // installed still gets one: the provider it is handed throws if the
+        // render ever asks, which for a whole-mix score it cannot.
+        let provider: VocalStemProvider = StemSeparation.provider
+            ?? { _ in throw StemTechniqueLayer.StemError.noProvider }
+        if separatesStems, StemSeparation.provider == nil { return }
         let request = TransitionSegmentRenderer.Request(
             planned: planned, outgoingURL: outgoingURL, incomingURL: next.localURL,
             outgoingTrimDB: loudnessTrimDB(for: currentAnalysis),
             incomingTrimDB: loudnessTrimDB(for: next.analysis),
-            outgoingAnalysis: currentAnalysis, config: plannerConfig)
+            outgoingAnalysis: currentAnalysis, incomingAnalysis: next.analysis,
+            config: plannerConfig)
         let generation = resolveGeneration
         let stop = PrerenderCancel()
         stemPrerenderCancel = stop

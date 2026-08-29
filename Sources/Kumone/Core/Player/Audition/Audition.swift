@@ -436,6 +436,22 @@ public enum Audition {
         /// `stemEnvelope`. Nil for the three one-shot gestures and for no stem.
         public let stemEnvelope: StemEnvelope?
 
+        // --- Transition score (docs/automix-score-predev.md). Empty on every
+        // decision made without `scoreEnabled`, which is every shipped one.
+
+        /// The score the planner offered, named as the predev names it
+        /// ("cutOnOne+echoThrow"). Nil when none was.
+        public let scoreLabel: String?
+        /// Whether it compiled against the two beat grids. False with a
+        /// `scoreLabel` present means the render is the plain blend — a score
+        /// that cannot be placed is thrown away whole, never approximated.
+        public let scoreCompiled: Bool
+        /// The compile, in sentences: where the seam landed, what was thrown
+        /// where, and what degraded or refused. Empty when no score was offered.
+        public let scoreLines: [String]
+        /// The compiled lanes the render will actually perform.
+        let scoreLanes: WholeMixLanes?
+
         /// "timbre 0.31 vs clash line 0.30" — signals sitting close enough to a
         /// threshold that nudging the constant would flip this pair.
         public let nearMisses: [String]
@@ -497,6 +513,7 @@ public enum Audition {
         fade fadeOverride: TimeInterval? = nil,
         stem stemOverride: StemOverride? = nil,
         plan planOverride: PlanOverride? = nil,
+        score scoreOverride: TransitionScore? = nil,
         stems: StemAvailability = .none,
         config configOverrides: [String: Double] = [:],
         useCache: Bool = true
@@ -591,6 +608,22 @@ public enum Audition {
                                         rideDB: planned.rideDB)
             exchange = compiled.compilation
         }
+        // --- And the score, last of all, for the same reason: it is addressed
+        // in bars around the seam, so it cannot be placed until the seam is
+        // final. A hand-passed score wins over whatever the planner offered.
+        if let scoreOverride {
+            var style = planned.style
+            style.score = scoreOverride
+            planned = PlannedTransition(plan: planned.plan, style: style,
+                                        rideDB: planned.rideDB)
+        }
+        var scoreCompilation: ScoreCompiler.Compilation?
+        if let score = planned.style.score {
+            scoreCompilation = ScoreCompiler.compile(score, planned: planned,
+                                                     outgoing: out, incoming: inc,
+                                                     outgoingURL: outgoingURL)
+        }
+
         var envelope: StemEnvelope?
         if case .custom(let compiled) = planned.style.stemTechnique {
             // A hand-written envelope is only checked against the overlap here,
@@ -666,6 +699,10 @@ public enum Audition {
             stemBaselineOverlap: baselineOverlap,
             stemExchange: exchange,
             stemEnvelope: envelope,
+            scoreLabel: planned.style.score?.label,
+            scoreCompiled: scoreCompilation?.didCompile ?? false,
+            scoreLines: scoreCompilation.map(describe) ?? [],
+            scoreLanes: scoreCompilation?.lanes,
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
                                    outVocal: outVocal, inVocal: inVocal, config: config),
             planTrace: planTrace,
@@ -678,6 +715,33 @@ public enum Audition {
             planned: planned, outgoingURL: outgoingURL, incomingURL: incomingURL,
             outgoingAnalysis: out, incomingAnalysis: inc,
             resolvedConfig: config, signals: signals)
+    }
+
+    /// A compiled score, in sentences — the console and the CLI print these
+    /// verbatim. Kept here rather than in `ScoreCompiler` so the compiler stays
+    /// a pure placement problem with no opinions about phrasing.
+    static func describe(_ c: ScoreCompiler.Compilation) -> [String] {
+        if let refusal = c.refusalReason {
+            return ["乐谱 \(c.label) 没有上演：\(refusal)", "这次转场听到的是今天的 blend。"]
+        }
+        var lines = [String(format: "乐谱 %@：seam 落在叠加的 +%.3f 秒"
+                            + "（出曲 %.3f 秒 / 入曲 %.3f 秒），"
+                            + "相对低频交接点移了 %+.3f 秒以落到小节线上。",
+                            c.label, c.seamOffset, c.seamOutgoing, c.seamIncoming,
+                            c.seamSnapSeconds)]
+        for placed in c.events {
+            lines.append(String(format: "  %@ @ bar %d beat %.2f → +%.3f 秒",
+                                placed.event, placed.at.bar, placed.at.beat, placed.offset))
+        }
+        if let throwDirective = c.echoThrow {
+            lines.append(String(format: "  echo throw 从 +%.3f 秒起甩进 %.0f ms 的 delay%@",
+                                throwDirective.throwAt, throwDirective.delayTime * 1000,
+                                c.echoLine.map { "（末句：“\($0)”）" } ?? ""))
+        }
+        lines.append(contentsOf: c.degradations.map { "  ⚠︎ \($0)" })
+        lines.append(String(format: "  切边沿 %.0f ms（半余弦），逐样本施加，不做任何分离。",
+                            WholeMixLane.cutEdgeSeconds * 1000))
+        return lines
     }
 
     // MARK: - Rendering
@@ -722,6 +786,10 @@ public enum Audition {
         public let measuredLUFS: Double?
         public let normalizationGainDB: Double
         public let normalizationTargetLUFS: Double?
+        /// The render performed a score's whole-mix lanes, and — when it was
+        /// asked to and did not — why not.
+        public let scoreLanesApplied: Bool
+        public let scoreFallbackReason: String?
     }
 
     /// Render the decision's transition to a 44.1 kHz / 16-bit WAV.
@@ -756,6 +824,9 @@ public enum Audition {
         // …and at exactly the gain ride it would ride, release included.
         options.rideDB = decision.planned.rideDB
         options.rideReleaseDBPerSecond = rideReleaseDBPerSecond
+        // The compiled score, if this decision has one that placed. Nothing
+        // here consults `stemProvider`: whole-mix lanes separate nothing.
+        options.mixLanes = decision.scoreLanes
         let result = try OfflineTransitionRenderer.render(
             decision.planned,
             outgoing: decision.outgoingURL, incoming: decision.incomingURL,
@@ -779,7 +850,9 @@ public enum Audition {
                              rideReleaseSeconds: result.rideReleaseSeconds,
                              measuredLUFS: result.measuredLUFS,
                              normalizationGainDB: result.normalizationGainDB,
-                             normalizationTargetLUFS: result.normalizationTargetLUFS)
+                             normalizationTargetLUFS: result.normalizationTargetLUFS,
+                             scoreLanesApplied: result.scoreLanesApplied,
+                             scoreFallbackReason: result.scoreFallbackReason)
     }
 
     // Thresholds are no longer republished here: `Decision.config` carries

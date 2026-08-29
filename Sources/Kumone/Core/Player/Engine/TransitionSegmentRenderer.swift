@@ -50,14 +50,21 @@ enum TransitionSegmentRenderer {
         /// The outgoing track's analysis, needed only to compile a
         /// `.vocalExchange` marker. Without it the marker degrades to a duck.
         var outgoingAnalysis: TrackAnalysis?
+        /// The incoming track's analysis. Only a `TransitionScore` needs it —
+        /// the bar grid the score's non-negative bars are addressed on is the
+        /// incoming track's. Without it a score cannot compile and the seam
+        /// takes the live blend.
+        var incomingAnalysis: TrackAnalysis?
         var config: TransitionPlanner.Config = .standard
     }
 
     enum SegmentError: LocalizedError {
         case noOverlap
         case overlapTooLong(TimeInterval)
-        case noStemTechnique
+        case nothingToRender
         case stemsNotApplied(String?)
+        case scoreNotCompiled(String?)
+        case scoreNotApplied(String?)
         case emptyRender
 
         var errorDescription: String? {
@@ -67,10 +74,14 @@ enum TransitionSegmentRenderer {
             case .overlapTooLong(let seconds):
                 return String(format: "overlap of %.1fs is longer than the pre-render budget",
                               seconds)
-            case .noStemTechnique:
-                return "this hand-over asks for no stem technique"
+            case .nothingToRender:
+                return "this hand-over asks for neither a stem technique nor a score"
             case .stemsNotApplied(let reason):
                 return reason ?? "the stem layer did not run"
+            case .scoreNotCompiled(let reason):
+                return reason ?? "the score could not be placed on the beat grid"
+            case .scoreNotApplied(let reason):
+                return reason ?? "the score's whole-mix lanes did not run"
             case .emptyRender:
                 return "the pre-render produced no audio"
             }
@@ -90,7 +101,13 @@ enum TransitionSegmentRenderer {
         guard geometry.overlapDuration <= maxOverlap else {
             throw SegmentError.overlapTooLong(geometry.overlapDuration)
         }
-        guard planned.style.stemTechnique != nil else { throw SegmentError.noStemTechnique }
+        // Admission, one notch wider than S3's: a segment is worth rendering for
+        // a stem technique **or** for a score. A score-only segment separates
+        // nothing at all — it is ~1 s of rendering and no Metal time — which is
+        // why the runway it asks `PlayerService` for collapses to the margin.
+        guard planned.style.stemTechnique != nil || planned.style.score != nil else {
+            throw SegmentError.nothingToRender
+        }
 
         var options = OfflineTransitionRenderer.Options()
         options.preRoll = handoff
@@ -109,14 +126,42 @@ enum TransitionSegmentRenderer {
         options.stretchPostRollForRideRelease = false
         options.vocalStemProvider = provider
 
+        // `.score` is a marker too, and compiling it is the same job the
+        // exchange's compile is: turn an intent into the curves the final
+        // geometry actually implies. A score that will not place is refused
+        // *here*, before a sample is rendered, so the seam takes the live blend
+        // rather than a segment carrying half a gesture.
+        if let score = planned.style.score {
+            guard let outgoingAnalysis = request.outgoingAnalysis,
+                  let incomingAnalysis = request.incomingAnalysis else {
+                throw SegmentError.scoreNotCompiled(
+                    "乐谱要按两侧的小节网格落点，这次转场手里没有分析。")
+            }
+            let compiled = ScoreCompiler.compile(
+                score, planned: planned,
+                outgoing: outgoingAnalysis, incoming: incomingAnalysis,
+                outgoingURL: request.outgoingURL)
+            guard let lanes = compiled.lanes else {
+                throw SegmentError.scoreNotCompiled(compiled.refusalReason)
+            }
+            options.mixLanes = lanes
+        }
+
         let mix = try OfflineTransitionRenderer.renderMix(
             planned, outgoing: request.outgoingURL, incoming: request.incomingURL,
             options: options)
         // A segment that fell back to a whole-mix render is not worth splicing:
         // it is the live path with extra steps, and the live path can also be
         // seeked, paused and re-planned.
-        guard mix.stemApplied != nil else {
-            throw SegmentError.stemsNotApplied(mix.stemFallbackReason)
+        if planned.style.stemTechnique != nil {
+            guard mix.stemApplied != nil else {
+                throw SegmentError.stemsNotApplied(mix.stemFallbackReason)
+            }
+        }
+        if planned.style.score != nil {
+            guard mix.lanesApplied != nil else {
+                throw SegmentError.scoreNotApplied(mix.scoreFallbackReason)
+            }
         }
         guard let buffer = makeBuffer(mix) else { throw SegmentError.emptyRender }
 
