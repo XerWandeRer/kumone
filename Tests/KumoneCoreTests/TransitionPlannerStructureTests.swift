@@ -342,7 +342,8 @@ import Foundation
             context: context, trace: &trace)
         let gates = trace?.gates.filter { $0.stage == .structure } ?? []
         let ids = Set(gates.map(\.id))
-        #expect(ids == ["structureCandidates", "climaxGuard", "lyricSnap", "inPointSource"])
+        #expect(ids == ["structureCandidates", "climaxGuard", "climaxExtension",
+                        "vocalCliff", "lyricSnap", "inPointSource"])
         // Candidate provenance, the guard's kill count, the snap distance and
         // where the in point came from.
         #expect((gates.first { $0.id == "structureCandidates" }?.value ?? 0) > 0)
