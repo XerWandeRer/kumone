@@ -59,24 +59,34 @@ import Foundation
         (0..<count).map { $0 % 2 == 0 ? 0.5 * (1 - ratio) : 0.5 * (1 + ratio) }
     }
 
-    // MARK: - 1. Asymmetric ride cap
+    // MARK: - 1. The ride's two directions
 
-    /// The two directions are no longer the same number, and the gate sees the
-    /// difference. A −6 dB seam is now ridden shut; a +6 dB one is not.
-    @Test func theRideCutsDeeperThanItBoosts() {
+    /// The two directions share a depth cap and differ in how they are *let go
+    /// of*, which is where the asymmetry actually lives.
+    ///
+    /// The cut cap used to be the deeper of the two, on the reasoning that a
+    /// cut is free — no headroom spent, no artefact, applied under a closed
+    /// fader. All true, and all beside the point: a cut is released by walking
+    /// the new track back *up*, so its depth is also how long that track spends
+    /// under the level it was mastered at. 4 dB in both directions, and a cut
+    /// let go of four times faster than a boost, is what keeps that climb
+    /// inside the new song's first phrase instead of its first verse.
+    @Test func theRideCapsBothDirectionsAndReleasesThemDifferently() {
         let c = TransitionPlanner.Config.standard
-        #expect(c.rideMaxCutDB == 6)
+        #expect(c.rideMaxCutDB == 4)
         #expect(c.rideMaxDB == 4)
         let roomy = makeAnalysis(peakDBFS: -30)
 
-        // Exactly at the new cut cap: taken in full, where the old shared cap
-        // would have left 2 dB on the table.
+        // Cut side: bounded by its own cap, never by the incoming peak.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: -6, incoming: roomy,
-                                         incomingTrimDB: 0, config: c) == -6)
-        // Past it: clipped at the cut cap, not the boost one.
+                                         incomingTrimDB: 0, config: c) == -4)
+        // Past it: still clipped at the cap.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: -9, incoming: roomy,
-                                         incomingTrimDB: 0, config: c) == -6)
-        // The boost side is untouched: still 4, still peak-guarded on top.
+                                         incomingTrimDB: 0, config: c) == -4)
+        // A gap the cap does not reach is taken in full.
+        #expect(TransitionPlanner.rideDB(forTrimmedGapDB: -2.5, incoming: roomy,
+                                         incomingTrimDB: 0, config: c) == -2.5)
+        // The boost side: same cap, peak-guarded on top.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: 6, incoming: roomy,
                                          incomingTrimDB: 0, config: c) == 4)
         let hot = makeAnalysis(peakDBFS: -1)
@@ -84,6 +94,12 @@ import Foundation
                                                incomingTrimDB: 0, config: c)
         #expect(boosted < 4, "a hot master's headroom must still bite before the cap")
         #expect(boosted >= 0)
+
+        // And the release, which is the half that is actually asymmetric: the
+        // deepest cut is home in about three seconds, the deepest boost takes
+        // the unhurried thirteen.
+        #expect(TransitionAutomation.rideReleaseDuration(-c.rideMaxCutDB) < 3.5)
+        #expect(TransitionAutomation.rideReleaseDuration(c.rideMaxDB) > 13)
     }
 
     /// `rideMaxDB` is the feature's off switch for *both* directions — a config
@@ -104,8 +120,12 @@ import Foundation
     }
 
     /// The payoff, at the gate rather than at the knob: a 6 dB seam in the
-    /// direction the ride can absorb is a compatible pair now, and was a
-    /// demoted one when the cut shared the boost's 4 dB cap.
+    /// direction the ride can absorb is a compatible pair, where the raw gap
+    /// alone would have been demoted. The ride does not have to close the gap
+    /// *entirely* to do that — it has to leave a residual the gate can live
+    /// with, and 4 dB of ride leaves 2, comfortably inside `neutral`. The
+    /// remaining 2 dB is deliberately left on the table: the depth the ride
+    /// does not take is depth the new track does not have to climb out of.
     @Test func aSixDBCutSeamIsNoLongerDemoted() {
         let quietTail = [Float](repeating: 0.5 * 0.501, count: 200)   // −6 dB
         let loudOpening = [Float](repeating: 0.5, count: 200)
@@ -113,15 +133,18 @@ import Foundation
         let incoming = makeAnalysis(rmsEnvelope: loudOpening, referenceLoudness: -14)
 
         let now = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming)
-        #expect(now.loudnessGapDB < 0.3)
+        #expect(abs(now.rideDB - -4) < 1e-6)
+        #expect(abs(now.loudnessGapDB - 2) < 0.3)
         #expect(TransitionPlanner.tier(of: now) == .compatible)
 
-        var oldCaps = TransitionPlanner.Config.standard
-        oldCaps.rideMaxCutDB = 4
+        // Without the ride at all, the gate sees the whole 6 dB and demotes.
+        var noRide = TransitionPlanner.Config.standard
+        noRide.rideMaxDB = 0
         let before = TransitionPlanner.signals(outgoing: outgoing, incoming: incoming,
-                                               config: oldCaps)
-        #expect(abs(before.rideDB - -4) < 1e-6)
-        #expect(before.loudnessGapDB > 1.5, "the old cap left ~2 dB for the gate to judge")
+                                               config: noRide)
+        #expect(before.rideDB == 0)
+        #expect(before.loudnessGapDB > 5.5)
+        #expect(TransitionPlanner.tier(of: before, config: noRide) != .compatible)
     }
 
     // MARK: - Bent-rate headroom pad

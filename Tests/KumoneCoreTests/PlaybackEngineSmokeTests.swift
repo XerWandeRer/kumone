@@ -948,9 +948,9 @@ struct PlaybackEngineSmokeTests {
             }
             Thread.sleep(forTimeInterval: 0.3)
             o.justAfter = engine.effectSnapshot(of: .b)
-            // The release runs for 4 / 0.3 ≈ 13 s. Long before that is up the
-            // transition state machine must already have let go.
-            Thread.sleep(forTimeInterval: 2.0)
+            // A −4 dB cut releases at 1.2 dB/s, so it runs for ~3.3 s. Long
+            // before that is up the transition state machine must have let go.
+            Thread.sleep(forTimeInterval: 1.2)
             o.transitionCleared = !engine.hasPendingTransition
             o.laterStillGliding = engine.effectSnapshot(of: .b)
             return o
@@ -972,11 +972,14 @@ struct PlaybackEngineSmokeTests {
                 "the ride release must not block the transition state machine")
         #expect(later.rideDB > after.rideDB && later.rideDB < 0,
                 "the glide must keep climbing after the transition cleared (\(after.rideDB) → \(later.rideDB))")
-        // ~0.3 dB/s, give or take a slow timer's leeway.
-        let elapsed = 2.0
+        // ~1.2 dB/s — this is a *cut*, released upward, and the fast slope is
+        // the whole point: at the old 0.3 dB/s the new track spent its first
+        // dozen seconds under its own level. Tolerance scaled with the slope,
+        // since a slow timer's leeway now costs four times the dB.
+        let elapsed = 1.2
         let moved = later.rideDB - after.rideDB
-        #expect(abs(moved - 0.3 * elapsed) < 0.15,
-                "the release slope must be ~0.3 dB/s (moved \(moved) in \(elapsed)s)")
+        #expect(abs(moved - TransitionAutomation.rideReleaseCutDBPerSecond * elapsed) < 0.4,
+                "the release slope must be ~1.2 dB/s (moved \(moved) in \(elapsed)s)")
         // The ride is a *fader* multiplier and nothing else.
         #expect(later.effectsAreNeutral, "the ride must not touch EQ, rate or delay (\(later))")
         #expect(abs(later.volume
@@ -1020,6 +1023,73 @@ struct PlaybackEngineSmokeTests {
         #expect(abs(snapshots[1].volume - 1) < 0.001,
                 "a fully open, untrimmed, un-ridden fader is literally 1 (\(snapshots[1]))")
         #expect(snapshots[1].isNeutral)
+    }
+
+    /// The ride release says so in the journal, at both ends — and says nothing
+    /// at all when there is no ride.
+    ///
+    /// This class of defect was found *blind*: a release running at the wrong
+    /// slope leaves no trace anywhere else, because it lives on a deck timer
+    /// that outlives its transition and lands on a value indistinguishable from
+    /// "there was never a ride". The pair of lines is the only record that it
+    /// happened and how long it took, which makes the journal itself the thing
+    /// under test here. The silence matters just as much: most hand-overs carry
+    /// no ride, and a line per seam saying nothing happened would bury the ones
+    /// that mean something.
+    @Test func theRideReleaseIsJournalledAtBothEndsAndOnlyWhenItRuns() throws {
+        guard audioOutputAvailable else { return }
+        func runSeam(ride: Double, waitAfterComplete: TimeInterval) -> [String] {
+            let captured = PlaybackJournal.tap.capture {
+                _ = withWatchdog("rideJournal", timeout: 45) { () -> Bool in
+                    let engine = PlaybackEngine()
+                    let log = EventLog(engine)
+                    defer { engine.stopAll() }
+                    guard (try? engine.loadFile(at: Fixtures.eightSecondCAF, on: .a)) != nil,
+                          (try? engine.loadFile(at: Fixtures.sixSecondCAF, on: .b)) != nil
+                    else { return false }
+                    engine.outputVolume = 0
+                    engine.play(deck: .a, from: 4.7)
+                    engine.scheduleTransition(
+                        PlannedTransition(
+                            plan: .crossfade(duration: 2.0, outPoint: 5.2, inPoint: 0),
+                            style: .plain, rideDB: ride),
+                        from: .a, to: .b)
+                    let deadline = Date().addingTimeInterval(10)
+                    while Date() < deadline {
+                        if log.contains({
+                            if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                            return false
+                        }) { break }
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                    Thread.sleep(forTimeInterval: waitAfterComplete)
+                    return true
+                }
+            }
+            return captured.lines
+        }
+
+        // A −4 dB cut: one start line naming the slope and the duration, one
+        // DONE line, and the arithmetic between them agrees with the constant.
+        let ridden = runSeam(ride: -4, waitAfterComplete: 4.5)
+        let starts = ridden.filter { $0.hasPrefix("ride release start") }
+        let dones = ridden.filter { $0.hasPrefix("ride release DONE") }
+        #expect(starts.count == 1, "exactly one start line (\(starts))")
+        #expect(dones.count == 1, "exactly one DONE line (\(dones))")
+        #expect(starts.first?.contains("from=-4.00dB") == true, "\(starts)")
+        #expect(starts.first?.contains("slope=1.20dB/s") == true, "\(starts)")
+        #expect(starts.first?.contains("over=3.33s") == true, "\(starts)")
+        #expect(dones.first?.contains("slope=1.20dB/s") == true, "\(dones)")
+        // The completion line carries the ride too, so one grep answers "what
+        // was this seam holding when it handed over".
+        #expect(ridden.contains { $0.hasPrefix("transition complete") && $0.contains("ride=") })
+
+        // …and a seam with no ride writes neither line.
+        let flat = runSeam(ride: 0, waitAfterComplete: 1.0)
+        #expect(!flat.contains { $0.contains("ride release") },
+                "a rideless seam must not journal a release (\(flat))")
+        #expect(flat.contains { $0.hasPrefix("transition complete") },
+                "…but the seam itself must still be journalled (\(flat))")
     }
 
     /// Pause, seek and a re-issued play all settle a running release to its

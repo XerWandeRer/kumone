@@ -51,8 +51,9 @@ enum OfflineTransitionRenderer {
         /// The hand-over's gain ride for the incoming deck, in dB
         /// (`PlannedTransition.rideDB`), applied exactly as the live engine
         /// applies it: full value for the whole overlap, then released at
-        /// `TransitionAutomation.rideReleaseDBPerSecond`. 0 — the default — is
-        /// the un-ridden render, bit-identical to what this produced before.
+        /// `TransitionAutomation.rideReleaseDBPerSecond(for:)`. 0 — the default
+        /// — is the un-ridden render, bit-identical to what this produced
+        /// before.
         ///
         /// The post-roll is stretched when needed so the release finishes
         /// inside the rendered file: the whole point of auditioning a ride is
@@ -70,6 +71,17 @@ enum OfflineTransitionRenderer {
         /// track just to finish it would be 13 s of separation budget spent on
         /// audio the deck can play itself.
         var stretchPostRollForRideRelease = true
+
+        /// Release slope for the ride, in dB per second, overriding the shipped
+        /// `TransitionAutomation.rideReleaseDBPerSecond(for:)`.
+        ///
+        /// **Audition-only, and the reason it exists is A/B.** The slope is a
+        /// constant rather than a planner knob because the live engine reaches
+        /// it without a `Config` in hand — which is right, and which also means
+        /// "render this seam at the old slope and at the new one" cannot be
+        /// said with `--set`. Nil, the default, is the shipped constant, so
+        /// every path that does not ask for this is unchanged.
+        var rideReleaseDBPerSecond: Double? = nil
 
         /// Whether the pre-roll is stretched so a plan's **tempo ramp** starts
         /// inside the render (`TransitionAutomation.tempoRamp`).
@@ -289,7 +301,16 @@ enum OfflineTransitionRenderer {
         // its own level to land on.
         var rideDB: Double = 0
         if case .gapless = planned.plan {} else { rideDB = options.rideDB }
-        let rideRelease = TransitionAutomation.rideReleaseDuration(rideDB)
+        // One local pair of closures rather than the statics, so an audition
+        // A/B can move the slope without any of it leaking into the player.
+        let rideSlope = options.rideReleaseDBPerSecond
+            ?? TransitionAutomation.rideReleaseDBPerSecond(for: rideDB)
+        func rideAt(_ elapsed: TimeInterval) -> Double {
+            guard rideDB != 0, rideDB.isFinite, rideSlope > 0 else { return 0 }
+            let released = rideSlope * max(0, elapsed)
+            return rideDB > 0 ? max(0, rideDB - released) : min(0, rideDB + released)
+        }
+        let rideRelease = (rideDB != 0 && rideSlope > 0) ? abs(rideDB) / rideSlope : 0
         let postRoll = (rideRelease > 0 && options.stretchPostRollForRideRelease)
             ? max(options.postRoll, rideRelease + 1)
             : options.postRoll
@@ -614,8 +635,7 @@ enum OfflineTransitionRenderer {
             var sinceOverlap: TimeInterval = 0
             func rideStep() {
                 guard rideDB != 0 else { return }
-                to.setRide(db: TransitionAutomation.rideDB(
-                    rideDB, secondsAfterOverlap: sinceOverlap))
+                to.setRide(db: rideAt(sinceOverlap))
             }
 
             if restoringRate || tailRinging {
@@ -662,8 +682,7 @@ enum OfflineTransitionRenderer {
             // write below is therefore only ever reached with the release
             // already spent (`postFrames > 0` implies `post < postRoll`, which
             // implies the loop stopped because `sinceOverlap >= rideRelease`).
-            let rideDBAtEnd = TransitionAutomation.rideDB(
-                rideDB, secondsAfterOverlap: sinceOverlap)
+            let rideDBAtEnd = rideAt(sinceOverlap)
             if rideDB != 0 { to.setRide(db: 0) }
             let postFrames = AVAudioFrameCount(
                 (max(0, postRoll - post) * sampleRate).rounded())

@@ -704,17 +704,27 @@ import Foundation
     /// The release envelope, as a pure function: full value at the seam, a
     /// constant dB-per-second slope, and a hard floor at unity in both
     /// directions (a ride never overshoots past 0 into the other sign).
+    ///
+    /// **The slope is chosen by sign**, which is the whole point: releasing a
+    /// cut walks the new track *up* to its own level and must not take a verse
+    /// to do it, while releasing a boost walks it *down* and is the move that
+    /// has to stay hidden.
     @Test func theRideReleasesAtAConstantSlopeAndStopsAtUnity() {
-        let rate = TransitionAutomation.rideReleaseDBPerSecond
-        #expect(rate == 0.3)
+        #expect(TransitionAutomation.rideReleaseBoostDBPerSecond == 0.3)
+        #expect(TransitionAutomation.rideReleaseCutDBPerSecond == 1.2)
+        #expect(TransitionAutomation.rideReleaseDBPerSecond(for: -4) == 1.2)
+        #expect(TransitionAutomation.rideReleaseDBPerSecond(for: 2) == 0.3)
+        // A zero ride has no release to have a slope for; the boost side is the
+        // harmless answer, and `rideDB` short-circuits before ever using it.
+        #expect(TransitionAutomation.rideReleaseDBPerSecond(for: 0) == 0.3)
 
-        // A cut: −4 dB unwinds upward and lands exactly on 0.
+        // A cut: −4 dB unwinds upward at 1.2 dB/s and lands exactly on 0.
         #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 0) == -4)
-        #expect(abs(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 1) - -3.7) < 1e-9)
-        #expect(abs(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 10) - -1) < 1e-9)
-        #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 13.334) == 0)
+        #expect(abs(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 1) - -2.8) < 1e-9)
+        #expect(abs(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 2) - -1.6) < 1e-9)
+        #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 3.334) == 0)
         #expect(TransitionAutomation.rideDB(-4, secondsAfterOverlap: 60) == 0)
-        // A boost unwinds downward, and also stops at 0.
+        // A boost unwinds downward at 0.3 dB/s, and also stops at 0.
         #expect(abs(TransitionAutomation.rideDB(2, secondsAfterOverlap: 1) - 1.7) < 1e-9)
         #expect(TransitionAutomation.rideDB(2, secondsAfterOverlap: 7) == 0)
         // Before the seam is the seam.
@@ -722,9 +732,10 @@ import Foundation
         // No ride, no envelope.
         #expect(TransitionAutomation.rideDB(0, secondsAfterOverlap: 3) == 0)
 
-        // The cap's worth takes just over 13 s — the number the post-roll and
-        // the engine's glide are both sized against.
-        #expect(abs(TransitionAutomation.rideReleaseDuration(-4) - 4 / 0.3) < 1e-9)
+        // The deepest cut the planner may ask for is home inside one phrase;
+        // the deepest boost still takes the unhurried 13 s.
+        #expect(abs(TransitionAutomation.rideReleaseDuration(-4) - 4 / 1.2) < 1e-9)
+        #expect(abs(TransitionAutomation.rideReleaseDuration(4) - 4 / 0.3) < 1e-9)
         #expect(TransitionAutomation.rideReleaseDuration(0) == 0)
     }
 
@@ -772,28 +783,35 @@ import Foundation
         #expect(abs(flat.duration - 10) < 0.2, "3 + 4 + 3 (\(flat.duration))")
 
         // −4 dB: the incoming deck is held down for the whole overlap, then
-        // let go of over 4 / 0.3 ≈ 13.3 s, which the post-roll stretches to fit.
+        // let go of over 4 / 1.2 ≈ 3.3 s (a cut climbs back fast, so the new
+        // track is not left in a level pit), which the post-roll holds easily.
         let (ridden, tones) = try render(ride: -4, name: "ridden")
         #expect(abs(ridden.rideDB - -4) < 1e-9)
-        #expect(abs(ridden.rideReleaseSeconds - 4 / 0.3) < 1e-9)
-        #expect(ridden.duration > 20, "the release must fit inside the file (\(ridden.duration))")
+        #expect(abs(ridden.rideReleaseSeconds - 4 / 1.2) < 1e-9)
+        #expect(ridden.duration > 4 + ridden.rideReleaseSeconds,
+                "the release must fit inside the file (\(ridden.duration))")
 
         // The overlap runs 3…7 s into the file. Sample just past its end, where
         // the incoming fader is fully open and the release has barely begun.
-        let heldFlat = flatTones(7.05, 7.45).at880
-        let held = tones(7.05, 7.45).at880
+        // (A cut releases at 1.2 dB/s, so "barely" is a shorter window than it
+        // used to be — 200 ms is 0.24 dB.)
+        let heldFlat = flatTones(7.02, 7.22).at880
+        let held = tones(7.02, 7.22).at880
         let ratio = Double(held / heldFlat)
         #expect(abs(20 * log10(ratio) - -4) < 0.6,
                 "the incoming deck should sit ~4 dB down at the seam (\(ratio))")
 
-        // …and back at its own level once the release has run out.
-        let released = tones(19.5, 20.3).at880
-        #expect(abs(20 * log10(Double(released / heldFlat))) < 0.5,
-                "the ride must be fully released by then (\(released) vs \(heldFlat))")
+        // …and back at its own level once the release has run out (7 + 3.33 s).
+        let released = tones(10.6, 11.2).at880
+        // The un-ridden render is only 10 s long, so its reference window is a
+        // different second of the same steady tone.
+        let releasedFlat = flatTones(9.0, 9.6).at880
+        #expect(abs(20 * log10(Double(released / releasedFlat))) < 0.5,
+                "the ride must be fully released by then (\(released) vs \(releasedFlat))")
 
         // Monotone in between: a ride that wandered would be audible.
-        let mid1 = tones(10.0, 10.5).at880
-        let mid2 = tones(15.0, 15.5).at880
+        let mid1 = tones(8.0, 8.4).at880
+        let mid2 = tones(9.3, 9.7).at880
         #expect(held < mid1 && mid1 < mid2 && mid2 <= released * 1.02,
                 "the release should climb steadily (\(held) \(mid1) \(mid2) \(released))")
 

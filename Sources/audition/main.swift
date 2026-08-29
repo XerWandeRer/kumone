@@ -55,7 +55,8 @@ usage:
   audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
   audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged] [--fade N]
                                   [--stem acapella|instrumental|duck[:9]|exchange]
-                                  [--pre N] [--post N] [--set name=value,...]
+                                  [--pre N] [--post N] [--ride-release N]
+                                  [--set name=value,...]
   audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                               [--style ...] [--fade N] [--pre N] [--post N]
                               [--set name=value,...]
@@ -131,6 +132,11 @@ usage:
             beside the audio as <file>.stems-v1-<start>-<len>.caf.
   --fade    override the overlap length (seconds)
   --pre/--post  context before / after the hand-over (default 12s each)
+  --ride-release  dB/s the gain ride is let go of at, overriding the shipped
+            slope (1.2 for a cut, 0.3 for a boost). Render only, and the one
+            knob that is not a `--set` name: the player reaches that constant
+            without a planner config, so this is how the two slopes are A/B'd
+            out of one binary.
   --json    print the full decision — signals, thresholds, derivation chain — as JSON
   --set     override planner thresholds for this run, e.g.
             --set clashTimbreDistance=0.35,neutralLoudnessDB=4
@@ -383,6 +389,7 @@ func runRender(_ args: Arguments) {
     let opts = renderOptions(args)
     do {
         let r = try Audition.render(d, to: out, preRoll: opts.pre, postRoll: opts.post,
+                                    rideReleaseDBPerSecond: args.double("ride-release"),
                                     stemProvider: StemService.shared.provider)
         var stemLine = ""
         if let technique = r.stemTechnique {

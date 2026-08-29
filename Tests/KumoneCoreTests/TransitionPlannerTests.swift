@@ -392,14 +392,16 @@ import Foundation
         #expect(abs(s.rawLoudnessGapDB - 6) < 0.2)
         #expect(abs(s.trimmedLoudnessGapDB - 6) < 0.2)
         // Stage 3: a quiet outro meeting a hot opening — the incoming deck is
-        // held *down*, so the ride is negative, and the 6 dB cut cap is deep
-        // enough to take all of it. (It clipped at −4 when both directions
-        // shared the boost cap, leaving 2 dB on the table for the gate.)
+        // held *down*, so the ride is negative, and it takes as much of the gap
+        // as `rideMaxCutDB` allows. That cap is 4 dB, not the gap's 6: a deeper
+        // cut buys a smaller residual but costs the new track a longer climb
+        // out of it, and the climb is what a listener hears as "muffled, then
+        // it got better".
         #expect(s.rideDB < 0)
-        #expect(abs(s.rideDB) >= 5.8 && abs(s.rideDB) <= 6.0 + 1e-6)
-        #expect(s.loudnessGapDB < 0.3)
-        // 6 dB alone would have been a clash; the ride removes essentially all
-        // of it, which is the whole point of judging the residual.
+        #expect(abs(s.rideDB - -TransitionPlanner.Config.standard.rideMaxCutDB) < 1e-6)
+        // 2 dB is left for the gate to judge — and 2 dB is not a clash, which
+        // is the point of judging the residual rather than the raw gap.
+        #expect(abs(s.loudnessGapDB - 2) < 0.3)
         #expect(TransitionPlanner.tier(of: s) == .compatible)
     }
 
@@ -412,7 +414,9 @@ import Foundation
         // Cut side: unbounded by peaks, bounded by its own — deeper — cap.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: -20, incoming: roomy,
                                          incomingTrimDB: 0, config: c) == -c.rideMaxCutDB)
-        #expect(c.rideMaxCutDB > c.rideMaxDB, "a cut costs less than a boost, so it may go deeper")
+        // The two caps match: a cut costs no headroom, but it costs *time* —
+        // the release has to walk back up — and that is what bounds it.
+        #expect(c.rideMaxCutDB == c.rideMaxDB)
         // Boost side: the cap bites first when there is plenty of headroom.
         #expect(TransitionPlanner.rideDB(forTrimmedGapDB: 20, incoming: roomy,
                                          incomingTrimDB: 0, config: c) == c.rideMaxDB)
@@ -473,7 +477,8 @@ import Foundation
         let outgoing = makeAnalysis(bpm: 120, rmsEnvelope: quietTail, referenceLoudness: -14)
         let incoming = makeAnalysis(bpm: 120, rmsEnvelope: loudOpening, referenceLoudness: -14)
         let planned = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming)
-        #expect(planned.rideDB < 0 && abs(planned.rideDB) >= 5.8)
+        #expect(planned.rideDB
+                == -TransitionPlanner.Config.standard.rideMaxCutDB)
 
         // No analysis at all → gapless → no ride.
         #expect(TransitionPlanner.plan(outgoing: nil, incoming: incoming).rideDB == 0)

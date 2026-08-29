@@ -270,9 +270,22 @@ enum TransitionPlanner {
         /// `boostHeadroomDB` is for, and gains nothing from being deeper.
         ///
         /// The tier gate sees the smaller residual automatically, which is the
-        /// point: pairs whose seam is 5–6 dB apart in the direction the ride
-        /// can absorb stop being demoted for a difference the player removes.
-        var rideMaxCutDB: Double = 6
+        /// point: pairs whose seam is several dB apart in the direction the
+        /// ride can absorb stop being demoted for a difference the player
+        /// removes.
+        ///
+        /// **Why 4 and not the 6 this shipped at.** "A cut is free" was true of
+        /// everything except its length. The release is a walk back to unity at
+        /// a fixed dB/s, so the cap *is* how long the new track spends under
+        /// the level its mastering engineer chose — and at 6 dB that was long
+        /// enough for listeners to hear the arrival as muffled and the recovery
+        /// as the track "getting better". The release slope is the other half
+        /// of that fix (`TransitionAutomation.rideReleaseCutDBPerSecond`), and
+        /// capping the depth here is the half that works at the source: it
+        /// bounds the pit rather than climbing out of it faster. 4 dB matches
+        /// the boost cap, which makes the ride one number in both directions
+        /// again, and at 1.2 dB/s unwinds in ~3.3 s.
+        var rideMaxCutDB: Double = 4
         /// Out-point search window for beat-matched plans: candidates must sit
         /// past `max(duration * tailWindowShare, outLimit - tailWindowSeconds)`.
         var tailWindowSeconds: TimeInterval = 60
@@ -985,13 +998,14 @@ enum TransitionPlanner {
     /// closes the gap. The two directions are clipped **asymmetrically**,
     /// because they are not the same operation:
     ///
-    ///   - A **cut** (`-rideMaxCutDB`, 6 dB) is applied to a deck whose fader
+    ///   - A **cut** (`-rideMaxCutDB`, 4 dB) is applied to a deck whose fader
     ///     is still at 0 when the offset goes on, so there is nothing audible
-    ///     for it to step on; it costs no headroom and introduces no artefact;
-    ///     and it is let go of while that deck is the only thing playing. The
-    ///     only real limit is editorial — far enough down and the ride stops
-    ///     being a level match and starts being a mix decision — which is
-    ///     where 6 dB sits, not where the mechanism gives out.
+    ///     for it to step on; it costs no headroom and introduces no artefact.
+    ///     What it does cost is *time*: it is let go of at a fixed dB/s while
+    ///     that deck is the only thing playing, so the cap is also how long the
+    ///     new track sits under its own level. That, and the editorial limit —
+    ///     far enough down and the ride stops being a level match and starts
+    ///     being a mix decision — is where 4 dB sits.
     ///   - A **boost** (`+rideMaxDB`, 4 dB) is the direction that costs
     ///     something. It pushes a real signal towards its own peak ceiling, so
     ///     it is additionally held to whatever headroom the incoming track's

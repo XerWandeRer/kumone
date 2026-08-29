@@ -28,7 +28,55 @@ enum PlaybackJournal {
 
     static func note(_ message: String) {
         log.log("\(message, privacy: .public)")
+        tap.deliver(message)
     }
+
+    // MARK: - Capture, for tests
+
+    /// A tap on the journal, so a test can assert on the lines a seam wrote —
+    /// including the ones it must *not* write.
+    ///
+    /// The journal is the only record of several things the engine does and
+    /// nothing else observes (a ride release runs on a deck timer, outlives its
+    /// transition and touches no state a snapshot exposes once it lands), so
+    /// "did the engine say it did this, and did it say it exactly once" is a
+    /// real assertion with no other way to make it. Locked rather than
+    /// queue-confined because journal lines come from the engine's serial queue
+    /// while the test reads from its own thread; nil is the shipping state and
+    /// costs one uncontended lock per line, which is a handful per seam.
+    final class Tap: @unchecked Sendable {
+        private let lock = NSLock()
+        private var sink: (([String]) -> Void)?
+        private var lines: [String] = []
+
+        fileprivate func deliver(_ message: String) {
+            lock.lock()
+            if sink != nil { lines.append(message) }
+            lock.unlock()
+        }
+
+        /// Run `body` with the journal captured, and hand back everything it
+        /// wrote. Not re-entrant, and deliberately not: two overlapping
+        /// captures would each see the other's lines.
+        func capture<T>(_ body: () throws -> T) rethrows -> (result: T, lines: [String]) {
+            lock.lock()
+            lines = []
+            sink = { _ in }
+            lock.unlock()
+            defer {
+                lock.lock()
+                sink = nil
+                lock.unlock()
+            }
+            let result = try body()
+            lock.lock()
+            let captured = lines
+            lock.unlock()
+            return (result, captured)
+        }
+    }
+
+    static let tap = Tap()
 
     /// `a=×1.0000 b=×1.0630` — the two rates, on every line where a stuck one
     /// would be the story.

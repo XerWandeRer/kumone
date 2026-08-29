@@ -154,27 +154,56 @@ enum TransitionAutomation {
     }
 
     /// How fast a transition gain ride (`PlannedTransition.rideDB`) is let go
-    /// of once the overlap is over, in dB per second.
+    /// of once the overlap is over, in dB per second — the **boost** side,
+    /// where the ride is positive and releasing it walks the track back down.
     ///
-    /// This is the "and then push it back up" half of the DJ's gesture, and it
-    /// only works if nobody notices it happening. 0.3 dB/s is an order of
+    /// This is the "and then push it back down" half of the DJ's gesture, and
+    /// it only works if nobody notices it happening. 0.3 dB/s is an order of
     /// magnitude under the ~1 dB just-noticeable step and slow enough that the
-    /// change never presents itself as an *event*: the full ±4 dB ride takes
-    /// just over 13 s to unwind, so the new track arrives at its own level
+    /// change never presents itself as an *event*: the full +4 dB lift takes
+    /// just over 13 s to unwind, so the new track settles to its own level
     /// somewhere in its first verse without a single audible move.
     ///
     /// It is deliberately far longer than the `.echoOut` tail or the rate
     /// restore, which is why the ride is **not** part of the settling phase —
     /// the transition state machine must be free to finish and clear while the
     /// release is still running. The engine carries it on the deck instead.
-    static let rideReleaseDBPerSecond: Double = 0.3
+    static let rideReleaseBoostDBPerSecond: Double = 0.3
+
+    /// …and how fast a transition gain **cut** (`rideDB` < 0) is let go of.
+    ///
+    /// **The two directions are not the same gesture, and sharing one slope was
+    /// a bug you could hear.** Releasing a boost means walking the track *down*
+    /// — the music sags, and a sag is the thing 0.3 dB/s exists to hide.
+    /// Releasing a cut means walking it *up*: the new track arrives held down
+    /// and climbs to its own level, which is not a defect being concealed, it
+    /// is a fade-in, and the ear reads a slow rise as arrival rather than as a
+    /// mistake. What it does *not* forgive is the rise taking too long: at
+    /// 0.3 dB/s the deepest cut the planner could ask for spent its first 20 s
+    /// under the level the mastering engineer chose, which listeners reported
+    /// as the new track sounding muffled and then "getting better" — the level
+    /// pit that motivated this constant existing at all.
+    ///
+    /// 1.2 dB/s puts the deepest cut (`rideMaxCutDB`, 4 dB) home in ~3.3 s —
+    /// inside the first phrase rather than across the first verse. It is still
+    /// four times slower than a fader move a listener would call a fade, and
+    /// well under the ~3 dB/s at which a rise starts to read as an automation
+    /// gesture rather than as the mix settling.
+    static let rideReleaseCutDBPerSecond: Double = 1.2
+
+    /// The release slope for a ride of this sign — the only place the choice is
+    /// made, so the engine's tick, the offline render and the journal cannot
+    /// disagree about how long a release takes.
+    static func rideReleaseDBPerSecond(for ride: Double) -> Double {
+        ride < 0 ? rideReleaseCutDBPerSecond : rideReleaseBoostDBPerSecond
+    }
 
     /// How fast the bent-rate headroom pad
     /// (`LoudnessCompensation.timePitchPadDB`) is glided on, in dB per second.
     ///
-    /// The same number as the ride's release and for the same reason — it is
-    /// the rate at which a level change stops presenting itself as an event —
-    /// but it buys something different: the pad has to be **completely in
+    /// The same number as the ride's *boost* release and for the same reason —
+    /// it is the rate at which a level change stops presenting itself as an
+    /// event — but it buys something different: the pad has to be **completely in
     /// before the deck's rate leaves unity**, because the time-pitch overshoot
     /// does not scale with the bend. A pad that faded in alongside the glide
     /// would be covering a third of the overshoot for the first half of it.
@@ -192,17 +221,18 @@ enum TransitionAutomation {
 
     /// The ride level, in dB, `elapsed` seconds after the overlap ended.
     /// A linear-in-dB release to 0, which is a constant-slope fader move —
-    /// the shape a hand on a trim knob makes.
+    /// the shape a hand on a trim knob makes. The slope depends on the sign;
+    /// see `rideReleaseCutDBPerSecond`.
     static func rideDB(_ ride: Double, secondsAfterOverlap elapsed: TimeInterval) -> Double {
         guard ride != 0, ride.isFinite else { return 0 }
-        let released = rideReleaseDBPerSecond * Swift.max(0, elapsed)
+        let released = rideReleaseDBPerSecond(for: ride) * Swift.max(0, elapsed)
         return ride > 0 ? Swift.max(0, ride - released) : Swift.min(0, ride + released)
     }
 
     /// How long `ride` takes to unwind to unity.
     static func rideReleaseDuration(_ ride: Double) -> TimeInterval {
-        guard ride.isFinite else { return 0 }
-        return abs(ride) / rideReleaseDBPerSecond
+        guard ride.isFinite, ride != 0 else { return 0 }
+        return abs(ride) / rideReleaseDBPerSecond(for: ride)
     }
 
     // MARK: - Output

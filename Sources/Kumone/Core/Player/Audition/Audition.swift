@@ -729,9 +729,16 @@ public enum Audition {
     /// `stemProvider` is only consulted when the decision's style carries a
     /// stem technique; without one, a stem render degrades to a whole-mix
     /// render and says so in `RenderSummary.stemFallbackReason`.
+    ///
+    /// `rideReleaseDBPerSecond` overrides how fast the gain ride is let go of,
+    /// for A/B-ing that slope against the shipped one; nil renders what the
+    /// player does. It is the one render parameter with no counterpart in a
+    /// planner knob, because the slope is a constant the engine reaches without
+    /// a `Config` in hand — see `OfflineTransitionRenderer.Options`.
     public static func render(_ decision: Decision, to outputURL: URL,
                               preRoll: TimeInterval = 12,
                               postRoll: TimeInterval = 12,
+                              rideReleaseDBPerSecond: Double? = nil,
                               stemProvider: VocalStemProvider? = nil) throws -> RenderSummary {
         var options = OfflineTransitionRenderer.Options()
         options.preRoll = preRoll
@@ -748,6 +755,7 @@ public enum Audition {
         options.incomingPeakDBFS = decision.incomingAnalysis.peakDBFS
         // …and at exactly the gain ride it would ride, release included.
         options.rideDB = decision.planned.rideDB
+        options.rideReleaseDBPerSecond = rideReleaseDBPerSecond
         let result = try OfflineTransitionRenderer.render(
             decision.planned,
             outgoing: decision.outgoingURL, incoming: decision.incomingURL,

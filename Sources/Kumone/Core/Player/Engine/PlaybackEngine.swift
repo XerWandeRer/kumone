@@ -1287,6 +1287,10 @@ final class PlaybackEngine: @unchecked Sendable {
     /// `transition == nil`. By the time it finishes the hand-over is long over
     /// and this deck simply *is* the current track.
     private func releaseRideLocked(_ state: DeckState) {
+        // Deliberately silent for a deck that is not riding: `releaseRide` is
+        // called on every completion path, and most hand-overs carry no ride at
+        // all — a line here would be one per seam saying nothing happened, and
+        // would bury the ones that mean something.
         guard abs(state.rideDB) > 0.0001 else {
             setRideLocked(state, db: 0)
             return
@@ -1294,6 +1298,11 @@ final class PlaybackEngine: @unchecked Sendable {
         state.rideTargetDB = 0
         state.rideReleaseFromDB = state.rideDB
         state.rideReleaseElapsed = 0
+        PlaybackJournal.note(String(
+            format: "ride release start deck=%@ from=%+.2fdB slope=%.2fdB/s over=%.2fs",
+            journalDeckName(state), state.rideDB,
+            TransitionAutomation.rideReleaseDBPerSecond(for: state.rideDB),
+            TransitionAutomation.rideReleaseDuration(state.rideDB)))
         startRideTimerLocked()
     }
 
@@ -1351,6 +1360,20 @@ final class PlaybackEngine: @unchecked Sendable {
                     state.rideReleaseFromDB, secondsAfterOverlap: state.rideReleaseElapsed)
                 state.rideDB = db
                 state.ride = LoudnessCompensation.gain(fromDB: db)
+                // The release is over the moment it lands, not when the timer
+                // next fires: the pair of lines is what makes "how long did the
+                // new track spend under its own level" greppable out of a
+                // journal, which is the number this whole release exists to
+                // keep small.
+                if abs(db - state.rideTargetDB) <= 0.0001 {
+                    PlaybackJournal.note(String(
+                        format: "ride release DONE deck=%@ from=%+.2fdB after=%.2fs "
+                            + "slope=%.2fdB/s",
+                        journalDeckName(state), state.rideReleaseFromDB,
+                        state.rideReleaseElapsed,
+                        TransitionAutomation.rideReleaseDBPerSecond(
+                            for: state.rideReleaseFromDB)))
+                }
             }
             if paddingHome {
                 // A plain constant-slope walk towards the target, in dB. The
@@ -2383,7 +2406,8 @@ final class PlaybackEngine: @unchecked Sendable {
         if from.isPlaying { retireOutgoingForSegmentLocked(from) }
         resetDeckLocked(from)
         PlaybackJournal.note("transition complete via=splice "
-                             + "\(tr.from.rawValue)→\(tr.to.rawValue) \(journalRates)")
+                             + "\(tr.from.rawValue)→\(tr.to.rawValue) "
+                             + String(format: "ride=%+.2fdB ", to.rideDB) + journalRates)
         eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
         transition = nil
         stopTransitionTimerLocked()
@@ -2590,6 +2614,7 @@ final class PlaybackEngine: @unchecked Sendable {
         to.band(.highPass).bypass = true
         PlaybackJournal.note("transition complete via=overlap "
                              + "\(tr.from.rawValue)→\(tr.to.rawValue) "
+                             + String(format: "ride=%+.2fdB ", to.rideDB)
                              + "echoTail=\(tailRinging ? "ringing" : "none") \(journalRates) "
                              + "eq \(tr.from.rawValue)=\(deckStates[tr.from].map(journalEQ) ?? "?") "
                              + "\(tr.to.rawValue)=\(deckStates[tr.to].map(journalEQ) ?? "?")")
