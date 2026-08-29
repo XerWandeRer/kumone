@@ -55,7 +55,7 @@ usage:
   audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
   audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged] [--fade N]
                                   [--stem acapella|instrumental|duck[:9]|exchange]
-                                  [--pre N] [--post N] [--ride-release N]
+                                  [--score] [--pre N] [--post N] [--ride-release N]
                                   [--set name=value,...]
   audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                               [--style ...] [--fade N] [--pre N] [--post N]
@@ -130,6 +130,12 @@ usage:
                           both decks, so it pays for two separation passes.
             First use downloads a 64 MiB model; the separated window is cached
             beside the audio as <file>.stems-v1-<start>-<len>.caf.
+  --score   offer this pair a transition score (docs/automix-score-predev.md):
+            正拍直切 + 末句甩延时, compiled onto the two beat grids and rendered
+            through the whole-mix lanes. Shorthand for `--set scoreEnabled=1`;
+            a pair whose grids are not confident enough is still refused, and a
+            score that cannot be placed is thrown away whole (you get the blend,
+            and the report says why). Separates nothing.
   --fade    override the overlap length (seconds)
   --pre/--post  context before / after the hand-over (default 12s each)
   --ride-release  dB/s the gain ride is let go of at, overriding the shipped
@@ -207,6 +213,9 @@ func explain(_ d: Audition.Decision) -> String {
         mechanics += String(format: ", rates %.4f/%.4f", outRate, inRate)
     }
     if d.overridden { mechanics += "  [OVERRIDDEN by --style/--fade]" }
+    if !d.scoreLines.isEmpty {
+        mechanics += "\n  " + d.scoreLines.joined(separator: "\n  ")
+    }
     lines.append(mechanics)
     // Which gate on the beat-match chain this pair lost, and by how much.
     if let blocker = d.planTrace.blocker {
@@ -287,11 +296,16 @@ func decide(_ args: Arguments, a: URL, b: URL) -> Audition.Decision {
     for file in [a, b] where !Audition.hasCachedAnalysis(for: file) {
         FileHandle.standardError.write(Data("  analyzing \(file.lastPathComponent)…\n".utf8))
     }
+    var overrides = configOverrides(args)
+    // `--score` is exactly the planner knob, spelled as a flag: the score is a
+    // planner decision, so forcing one here rather than through the config
+    // would render something the planner would never have offered.
+    if args.flags["score"] != nil { overrides["scoreEnabled"] = 1 }
     do {
         return try Audition.decide(outgoing: a, incoming: b,
                                    style: style, fade: args.double("fade"), stem: stem,
                                    stems: stems,
-                                   config: configOverrides(args))
+                                   config: overrides)
     } catch {
         fail("\(a.lastPathComponent) → \(b.lastPathComponent): \(error.localizedDescription)")
     }
@@ -433,6 +447,19 @@ func runRender(_ args: Arguments) {
                 }
             }
         }
+        // The score: what it compiled to, or why the file you are about to
+        // play is the plain blend after all.
+        var scoreLine = ""
+        if !d.scoreLines.isEmpty {
+            scoreLine = "\n    " + d.scoreLines.joined(separator: "\n    ")
+            if d.scoreCompiled, !r.scoreLanesApplied {
+                scoreLine += "\n    ⚠︎ 乐谱编译了但渲染没有施加："
+                    + (r.scoreFallbackReason ?? "未知原因")
+            }
+        } else if args.flags["score"] != nil {
+            scoreLine = "\n    --score 没有生效：这一对没拿到乐谱"
+                + "（不是 beatMatched，或者两侧的拍子把握不够，见 scoreMinBPMConfidence）。"
+        }
         // The hand-over's gain ride, envelope and all — the render carries the
         // release too, so it is in the file you are about to play.
         var rideLine = ""
@@ -453,7 +480,7 @@ func runRender(_ args: Arguments) {
             \(f(r.duration))s of audio, hand-over at \(mmss(r.overlapStart)) \
           (overlap \(f(r.overlapDuration))s)
             rendered in \(f(r.renderSeconds))s — \(f(r.realtimeFactor, 1))× real time
-            deck trims \(f(r.outgoingTrimDB)) / \(f(r.incomingTrimDB)) dB (as the player would)\(rideLine)\(normLine)\(stemLine)
+            deck trims \(f(r.outgoingTrimDB)) / \(f(r.incomingTrimDB)) dB (as the player would)\(rideLine)\(normLine)\(stemLine)\(scoreLine)
             afplay \(r.outputURL.path)
           """)
     } catch {
