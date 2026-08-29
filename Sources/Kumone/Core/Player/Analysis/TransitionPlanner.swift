@@ -469,6 +469,50 @@ enum TransitionPlanner {
         /// it is a corpus question and corpus questions are P3's.
         var scoreAimMaxLeadSeconds: TimeInterval = 120
 
+        // --- Gesture library (P4, predev §2.5). Every knob below is read only
+        // from inside `ScoreTemplate`, which is only reached when a family was
+        // offered, which needs `scoreEnabled`. So with the score layer down
+        // none of them decides anything, and each one is independently
+        // switchable because the predev's first mitigation for "a bad score is
+        // worse than a good blend" is per-gesture roll-back.
+
+        /// Offer the tension cut: N beats of full silence ending on the seam,
+        /// then the cut and the slam.
+        ///
+        /// On *within the score path*, off is the A/B's control. The gesture
+        /// gates itself hard — it is offered only into a drop or a chorus — so
+        /// the knob is for turning it off after a listening session, not for
+        /// keeping it out of trouble.
+        var scoreTensionCutEnabled: Bool = true
+        /// How long the silence is, in beats.
+        ///
+        /// One beat, and the default is an opinion rather than a starting
+        /// point. A single beat of nothing is a held breath; two is a mistake
+        /// the listener has time to notice, and four is the player having
+        /// stopped. The model refuses anything past a bar outright.
+        var scoreTensionCutBeats: Double = TransitionScore.defaultTensionCutBeats
+
+        /// Offer the accompaniment bed on `dropAlign` hand-overs.
+        var scoreBedIntroEnabled: Bool = true
+        /// How many bars of bed, at most. On an aimed hand-over this is a cap
+        /// on the *overlap*, not a length the bed is padded to: the bed runs
+        /// from the instant the incoming deck starts to the instant its singer
+        /// joins, and both of those are already decided. See
+        /// `TransitionScore.defaultBedIntroBars` for why the number is eight
+        /// and the predev's is four.
+        var scoreBedIntroBars: Int = TransitionScore.defaultBedIntroBars
+        /// How sung the incoming track's entry window has to be, relative to
+        /// its own mean, before a bed is worth making.
+        ///
+        /// This is the gesture's whole reason to exist as a *gate*: a bed is
+        /// the incoming track with its vocal lane held down, so on an
+        /// instrumental entry the bed is the mix, the render is identical, and
+        /// a separation pass has been spent on nothing. 0.9 — just under the
+        /// track's own average — is "there is a singer here", which is a much
+        /// weaker claim than `stemVocalActiveRatio`'s and the right one: what
+        /// matters is that muting the lane *changes* something.
+        var scoreBedIntroMinIncomingVocal: Double = 0.9
+
         // --- Intent layer (P3, predev §2.4). See `TransitionIntent`.
         //
         // Ships dark: `intentEnabled` is **false**, and with it false the whole
@@ -946,12 +990,12 @@ enum TransitionPlanner {
             // deck up to it would be holding it up to nothing in particular.
             style.dominantDeck = config.dominantDeckBlend
             style.preSwapPlateau = Float(config.preSwapPlateau)
-            // …and a score layers over *that*, as an alternative the segment
-            // path may perform. Off by default, so this is nil on every
-            // shipped decision and the style is field-for-field what it was.
-            style.score = score(outgoing: outgoing, incoming: incoming,
-                                context: context, intent: intent, config: config)
             style.intent = intent
+            // …and a score layers over *that*, as an alternative the segment
+            // path may perform. Chosen at the end of this block, once the aim
+            // is settled, because two of the four gestures depend on it. Off by
+            // default, so it is nil on every shipped decision and the style is
+            // field-for-field what it was.
             // Deliberately *not* a `PlanTrace` gate: the trace's stages are the
             // chain that decides whether a pair hands over at all, and a score
             // decides nothing — it is offered on top of a plan already made.
@@ -974,8 +1018,22 @@ enum TransitionPlanner {
             // tail lies over the build and the hand-over completes on the drop
             // (predev §2.3). Same aiming machinery, same gates re-run, two
             // landings.
+            //
+            // **The order changed in P4, and only the order.** P1 chose the
+            // score first and let its existence pick the landing; P4 has four
+            // gestures to choose between and two of them — the tension cut and
+            // the bed — cannot be chosen without knowing what the hand-over
+            // aims at and where the incoming deck ends up entering. So the
+            // *family* is settled first (which is what P1's `score()` really
+            // decided: gates and intent class, neither of which needs a plan),
+            // the aim runs on that, and the template is picked last, against
+            // the aimed geometry. With `scoreEnabled` down the family is nil
+            // and every line below is a nil check, so this reshuffle is
+            // invisible to every shipped decision.
             var plan = matched.plan
-            let landing: TransitionAim.Landing? = style.score != nil
+            let family = scoreFamily(outgoing: outgoing, incoming: incoming,
+                                     intent: intent, config: config)
+            let landing: TransitionAim.Landing? = family == .cutCulture
                 ? .seam
                 : (intent?.class == .dropAlign ? .overlapEnd : nil)
             if let landing {
@@ -990,6 +1048,21 @@ enum TransitionPlanner {
                          TransitionAim.report(aimed.aim,
                                               reason: aimed.aim == nil ? aimed.detail : nil)
                              + " — " + aimed.detail)
+            }
+            if let family {
+                let selection = ScoreTemplate.select(
+                    family: family,
+                    material: ScoreTemplate.Material(
+                        outgoing: outgoing, incoming: incoming, plan: plan, aim: style.aim,
+                        hasLyrics: !context.outgoingLyricLineEnds.isEmpty,
+                        stemsReady: stems == .ready,
+                        hasStemTechnique: matched.stem != nil),
+                    config: config)
+                style.score = selection?.score
+                _ = note(&trace, .structure, "scoreTemplate", selection != nil,
+                         selection.map { Double($0.score.events.count) }, nil,
+                         selection?.label
+                             ?? "no template in the \(family.rawValue) ladder qualified")
             }
             return finish(PlannedTransition(plan: .beatMatched(plan), style: style,
                                             rideDB: s.rideDB))
@@ -1043,24 +1116,35 @@ enum TransitionPlanner {
     ///
     /// `restrained` and `standDown` never get a score (`standDown` never
     /// reaches here at all — it returned gapless at the front door), and
-    /// neither do `blend` and `dropAlign`: `dropAlign` is the blend family with
-    /// an aimed overlap end, and a drop worth landing on is not by itself
-    /// permission to cut into it.
-    static func score(outgoing: TrackAnalysis, incoming: TrackAnalysis,
-                      context: PlanContext, intent: TransitionIntent? = nil,
-                      config: Config) -> TransitionScore? {
+    /// neither does `blend`.
+    ///
+    /// **P4 gave `dropAlign` one gesture**, and it is worth being precise about
+    /// why that is not a loosening of the rule above. `cutCulture` is still the
+    /// only class that may *cut*. What `dropAlign` may now have is a score that
+    /// does not cut at all: `bedIntro` writes one muted stem lane over the
+    /// blend the class was already getting, leaves the fader law, the staged EQ
+    /// and the aimed overlap end exactly where they were, and cannot make the
+    /// hand-over more abrupt than it already was. The family a pair belongs to
+    /// decides which ladder of gestures it is shown, and the two ladders do not
+    /// overlap by a single event.
+    static func scoreFamily(outgoing: TrackAnalysis, incoming: TrackAnalysis,
+                            intent: TransitionIntent? = nil,
+                            config: Config) -> ScoreTemplate.Family? {
         guard config.scoreEnabled else { return nil }
-        if config.intentEnabled, intent?.class != .cutCulture { return nil }
-        // Both grids confident enough to cut on, and long enough to address:
-        // a cut half a beat out is the one error the gesture cannot survive.
+        // Both grids confident enough to address on the bar line, and long
+        // enough to address at all: a gesture half a beat out is the one error
+        // none of them survives.
         guard outgoing.bpmConfidence >= config.scoreMinBPMConfidence,
               incoming.bpmConfidence >= config.scoreMinBPMConfidence,
               outgoing.downbeats.count > TransitionScore.maxPreBars,
               incoming.downbeats.count > TransitionScore.maxPostBars
         else { return nil }
-        // An echo throw needs a last line to throw; with no `.lrc` the score is
-        // the plain cut, which is the same gesture without the tail.
-        return .cutOnOne(throwingEcho: !context.outgoingLyricLineEnds.isEmpty)
+        guard config.intentEnabled else { return .cutCulture }
+        switch intent?.class {
+        case .cutCulture: return .cutCulture
+        case .dropAlign: return .dropAlign
+        default: return nil
+        }
     }
 
     // MARK: - Aiming (P2, predev §2.3)

@@ -15,7 +15,9 @@ import Foundation
 
 // MARK: - Fixtures
 
-private enum ScoreFixtures {
+/// Shared with `ScoreGestureLibraryTests` (P4), which builds its gestures on
+/// exactly these grids so the two files cannot disagree about what a bar is.
+enum ScoreFixtures {
 
     static let dir: URL = {
         let d = FileManager.default.temporaryDirectory
@@ -58,7 +60,7 @@ private enum ScoreFixtures {
     static func analysis(bpm: Double, duration: TimeInterval = 30,
                          confidence: Double = 0.95,
                          jitterAt: Int? = nil, jitter: Double = 0,
-                         rms: [Float]? = nil) -> TrackAnalysis {
+                         rms: [Float]? = nil, vocal: [Float]? = nil) -> TrackAnalysis {
         let beat = 60 / bpm
         var beats: [TimeInterval] = []
         var t: TimeInterval = 0
@@ -75,25 +77,26 @@ private enum ScoreFixtures {
             rmsEnvelope: rms ?? [Float](repeating: 0.5, count: Int(duration)),
             outroFadeStart: nil, introEnd: 0, duration: duration,
             melProfile: [], keyPitchClass: nil, keyIsMinor: false, keyConfidence: 0,
-            vocalActivity: [Float](repeating: 0.5, count: Int(duration)))
+            vocalActivity: vocal ?? [Float](repeating: 0.5, count: Int(duration)))
     }
 }
 
 /// A beat-matched plan whose grids line up: 120 BPM both sides, 2 s bars, the
 /// out point and the in point both on a downbeat.
-private func matchedPlan(overlap: TimeInterval = 16,
+func matchedPlan(overlap: TimeInterval = 16,
                          outPoint: TimeInterval = 8, inPoint: TimeInterval = 0,
+                         outgoingRate: Float = 1,
                          incomingRate: Float = 1, glideBack: Bool = false,
                          bassSwapOffset: TimeInterval = 8) -> BeatMatchedPlan {
     var plan = BeatMatchedPlan(
         outPoint: outPoint, inPoint: inPoint, overlapBars: Int(overlap / 2),
-        outgoingRate: 1, incomingRate: incomingRate,
+        outgoingRate: outgoingRate, incomingRate: incomingRate,
         bassSwapOffset: bassSwapOffset, overlapDuration: overlap)
     plan.rampGlideBackFromSwap = glideBack
     return plan
 }
 
-private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
+func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
     var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
     style.dominantDeck = true
     style.score = score
@@ -115,11 +118,25 @@ private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
         #expect(thrown.seamOwner?.event == .echoThrow)
     }
 
-    @Test func aScoreNeedsExactlyOneEventThatEndsTheOutgoingSide() {
-        // None: nothing stops the outgoing deck, so this is not a hand-over.
+    @Test func aScoreNeedsAtMostOneEventThatEndsTheOutgoingSide() {
+        // A slam with nothing cut is not a gesture, it is a level jump: the
+        // incoming deck arrives full-band while the outgoing one is still
+        // blending underneath it. Same for a beat of silence in the middle of a
+        // crossfade that then resumes.
         let noOwner = TransitionScore(preBars: 1, postBars: 1,
                                       events: [ScoredEvent(at: .seam, .slamIn)])
-        #expect(throws: TransitionScore.ValidationFailure.noSeamOwner) { try noOwner.validate() }
+        #expect(throws: TransitionScore.ValidationFailure
+            .gestureNeedsASeamOwner(event: "slamIn")) { try noOwner.validate() }
+        let orphanSilence = TransitionScore(preBars: 1, postBars: 1,
+                                            events: [ScoredEvent(at: .seam, .silence(beats: 1))])
+        #expect(throws: TransitionScore.ValidationFailure.self) { try orphanSilence.validate() }
+
+        // But a score with **no** owner and nothing that needs one is legal,
+        // and P4 needed it to be: a bed decorates the blend the planner already
+        // made and has no opinion about how the outgoing track leaves.
+        #expect(throws: Never.self) { try TransitionScore.bedIntro(bars: 4).validate() }
+        #expect(!TransitionScore.bedIntro(bars: 4).ownsSeam)
+        #expect(TransitionScore.cutOnOne().ownsSeam)
 
         // Two: two ways of stopping the same deck at the same instant.
         let twoOwners = TransitionScore(preBars: 1, postBars: 1, events: [
@@ -171,26 +188,52 @@ private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
         #expect(throws: TransitionScore.ValidationFailure.self) { try doubled.validate() }
     }
 
-    @Test func theModelExpressesGesturesTheCompilerCannotYetPlay() {
-        // The point of naming them now is that adding them later must not
-        // rewrite the type — but a score carrying one has to be refused, out
-        // loud, rather than half-played.
-        #expect(!ScoreEvent.silence(beats: 1).isSupportedInV1)
-        #expect(!ScoreEvent.bedIntro(bars: 2).isSupportedInV1)
+    @Test func theWholeVocabularyIsPerformableNow() {
+        // P1 named five gestures and could play three. P4 built the other two,
+        // so this property — which the compiler still guards on, for the
+        // gestures the model has yet to grow — is uniformly true.
+        #expect(ScoreEvent.silence(beats: 1).isSupportedInV1)
+        #expect(ScoreEvent.bedIntro(bars: 2).isSupportedInV1)
         #expect(ScoreEvent.cutOut.isSupportedInV1 && ScoreEvent.echoThrow.isSupportedInV1)
+    }
 
-        let tension = TransitionScore(preBars: 1, postBars: 1, events: [
-            ScoredEvent(at: GridPosition(bar: -1, beat: 3), .silence(beats: 1)),
-            ScoredEvent(at: .seam, .cutOut),
-        ])
-        #expect(throws: Never.self) { try tension.validate() }
-        let compiled = ScoreCompiler.compile(
-            tension, planned: PlannedTransition(plan: .beatMatched(matchedPlan()),
-                                                style: scoredStyle(tension)),
-            outgoing: ScoreFixtures.analysis(bpm: 120),
-            incoming: ScoreFixtures.analysis(bpm: 120), outgoingURL: nil)
-        #expect(!compiled.didCompile)
-        #expect(compiled.refusalReason?.contains("silence") == true)
+    @Test func theSpansHaveSizesThatAreGestures() {
+        // A span is only a gesture inside a range. Four beats of nothing is the
+        // player having stopped; a nine-bar bed is the arrangement.
+        for beats in [0.0, -1, 5, Double.nan] {
+            #expect(throws: TransitionScore.ValidationFailure.self) {
+                try TransitionScore.tensionCut(beats: beats).validate()
+            }
+        }
+        #expect(throws: Never.self) { try TransitionScore.tensionCut(beats: 1).validate() }
+        for bars in [0, TransitionScore.maxBedIntroBars + 1] {
+            #expect(throws: TransitionScore.ValidationFailure
+                .bedIntroOutOfRange(bars: bars)) {
+                try TransitionScore.bedIntro(bars: bars).validate()
+            }
+        }
+    }
+
+    @Test func everyTemplateNamesItselfAfterTheGestureNotTheEvents() {
+        // Nobody hears "a cutOut and a slamIn at the same grid point"; the
+        // listening notes are written in gestures, so the labels are too.
+        #expect(TransitionScore.cutOnly().label == "cutOnly")
+        #expect(TransitionScore.cutOnly(throwingEcho: true).label == "cutOnly+echoThrow")
+        #expect(TransitionScore.tensionCut(beats: 1).label == "tensionCut(1)+cutOnOne")
+        #expect(TransitionScore.bedIntro(bars: 4).label == "bedIntro(4)")
+    }
+
+    @Test func onlyTheBedCostsASeparationPass() {
+        // The runway class is the whole cost story of the library, and it is a
+        // property of the score rather than a derivation, so the arming path
+        // and the compiler cannot disagree about the bill.
+        for score in [TransitionScore.cutOnOne(), .cutOnOne(throwingEcho: true),
+                      .cutOnly(), .tensionCut(beats: 1)] {
+            #expect(score.runwayClass == .scoreOnly)
+            #expect(!score.needsIncomingStems)
+        }
+        #expect(TransitionScore.bedIntro(bars: 4).runwayClass == .incomingStems)
+        #expect(TransitionScore.bedIntro(bars: 4).needsIncomingStems)
     }
 }
 
@@ -878,24 +921,30 @@ private func aimable(bpm: Double = 120, duration: TimeInterval = 120,
         // "byte-identical fall-back" claim is a test's promise rather than a
         // structural one.
         let confident = ScoreFixtures.analysis(bpm: 120, duration: 240, confidence: 0.99)
-        #expect(TransitionPlanner.score(outgoing: confident, incoming: confident,
-                                        context: TransitionPlanner.PlanContext(),
-                                        config: .standard) == nil)
+        #expect(TransitionPlanner.scoreFamily(outgoing: confident, incoming: confident,
+                                              config: .standard) == nil)
         var enabled = TransitionPlanner.Config.standard
         enabled.scoreEnabled = true
-        #expect(TransitionPlanner.score(outgoing: confident, incoming: confident,
-                                        context: TransitionPlanner.PlanContext(),
-                                        config: enabled) == .cutOnOne())
-        // …and the echo throw only when there are words to throw.
-        #expect(TransitionPlanner.score(
-            outgoing: confident, incoming: confident,
-            context: TransitionPlanner.PlanContext(outgoingLyricLineEnds: [12, 20]),
-            config: enabled) == .cutOnOne(throwingEcho: true))
-        // A grid the tracker is unsure about gets no score however keen the knob.
+        #expect(TransitionPlanner.scoreFamily(outgoing: confident, incoming: confident,
+                                              config: enabled) == .cutCulture)
+        // A grid the tracker is unsure about gets no family however keen the knob.
         let vague = ScoreFixtures.analysis(bpm: 120, duration: 240, confidence: 0.5)
-        #expect(TransitionPlanner.score(outgoing: vague, incoming: confident,
-                                        context: TransitionPlanner.PlanContext(),
-                                        config: enabled) == nil)
+        #expect(TransitionPlanner.scoreFamily(outgoing: vague, incoming: confident,
+                                              config: enabled) == nil)
+        // With the intent layer on, the class picks the ladder — and only two
+        // of the five classes have one.
+        enabled.intentEnabled = true
+        for (klass, family) in [(TransitionIntent.Class.cutCulture, ScoreTemplate.Family.cutCulture),
+                                (.dropAlign, .dropAlign)] {
+            #expect(TransitionPlanner.scoreFamily(
+                outgoing: confident, incoming: confident,
+                intent: TransitionIntent(klass, reasons: []), config: enabled) == family)
+        }
+        for klass in [TransitionIntent.Class.blend, .restrained, .standDown] {
+            #expect(TransitionPlanner.scoreFamily(
+                outgoing: confident, incoming: confident,
+                intent: TransitionIntent(klass, reasons: []), config: enabled) == nil)
+        }
     }
 
     @Test func theShippedPlannerAimsAtNothingBecauseItScoresNothing() {

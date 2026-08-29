@@ -283,6 +283,33 @@ extension TransitionPlanner.Config {
               "瞄准点最多可以落在入曲 introEnd 之后多少秒。瞄准会跳过目标之前的一切，"
                   + "所以这是“为了落在那个 drop 上，愿意丢掉入曲多少”的上限。",
               0, 240, 5, 0, \.scoreAimMaxLeadSeconds),
+        boolField("scoreTensionCutEnabled", "stem",
+                  "开（默认，只在出谱时有意义）= 允许“张力切”：落拍前 N 拍全场静默，然后直切 + slam。"
+                      + "只在这一刀确实落在 drop / 副歌上时才给——切进主歌前的静默不是张力，是故障。"
+                      + "关 = 这一档从模板梯子上摘掉，退回 echo throw / 直切。",
+                  \.scoreTensionCutEnabled),
+        field("scoreTensionCutBeats", "stem",
+              "张力切静默几拍。1 拍是一口屏住的气；2 拍听众已经来得及觉得不对；"
+                  + "一小节以上模型直接拒收。",
+              0.25, 4, 0.25, 2, \.scoreTensionCutBeats),
+        boolField("scoreBedIntroEnabled", "stem",
+                  "开（默认，只在意图层判为 dropAlign 时有意义）= 允许“伴奏垫”："
+                      + "入曲先只出伴奏（人声 lane 压到 −60 dB）垫在出曲的退场底下，"
+                      + "人声到 drop 那一拍才进来。底下的 blend 一个字段都不改。"
+                      + "这是手势库里唯一要跑人声分离的一个，所以它要付单边分离的跑道。",
+                  \.scoreBedIntroEnabled),
+        intField("scoreBedIntroBars", "stem",
+                 "伴奏垫最长铺几小节——这其实是对【叠加长度】的上限，不是把垫子补到这个长度："
+                     + "瞄准之后入曲的进点本来就是从落点倒推出来的，"
+                     + "垫子就是“进点到人声进入点”这一整段。"
+                     + "叠加比这个长出半小节以上，整谱作废（从头压住人声就不是这个手势了）。"
+                     + "默认 8 = 规划器自己最常给的叠加长度；预研写的 4 在真实计划上一次都够不着。",
+                 1, 16, \.scoreBedIntroBars),
+        field("scoreBedIntroMinIncomingVocal", "stem",
+              "入曲进点窗口里的人声密度要到自己平常的这个倍数，才值得给它做伴奏垫。"
+                  + "低于这条线的入曲开头本来就没人唱——垫子就等于原混音，"
+                  + "手势听不出来，分离却照付。",
+              0.3, 1.5, 0.05, 2, \.scoreBedIntroMinIncomingVocal),
         field("vocalCarryWindowSeconds", "stem",
               "出曲人声最多可以越过低频交接点 S 多少秒去把一句唱完；这个窗口里找得到歌词行末"
                   + "就是 vocalCarryover，找不到就退成 vocalYield（在 S 之前唱完）。"

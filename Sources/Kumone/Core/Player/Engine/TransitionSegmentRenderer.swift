@@ -92,7 +92,10 @@ enum TransitionSegmentRenderer {
     /// main thread, on a task the caller is willing to throw away.
     static func render(_ request: Request,
                        provider: @escaping VocalStemProvider) throws -> TransitionSegment {
-        let planned = try compilingExchange(request)
+        var planned = try compilingExchange(request)
+        // Set when the compiled score turned out to need the incoming deck
+        // split (`bedIntro`); it changes what "the score played" means below.
+        var scoreSeparates = false
         guard let signature = TransitionSegment.Signature(plan: planned.plan) else {
             throw SegmentError.noOverlap
         }
@@ -145,6 +148,24 @@ enum TransitionSegmentRenderer {
                 throw SegmentError.scoreNotCompiled(compiled.refusalReason)
             }
             options.mixLanes = lanes
+            // **The one gesture that separates.** A `bedIntro` compiles to a
+            // stem envelope rather than to whole-mix gain, and the way it
+            // reaches the renderer is the way every envelope reaches it: as a
+            // `.custom` technique on the style. Which also means it cannot
+            // share a hand-over with a stem technique of its own — two
+            // producers writing the same four lanes — so that combination is
+            // refused here as well as filtered out by `ScoreTemplate`.
+            if let envelope = compiled.stemEnvelope {
+                guard planned.style.stemTechnique == nil else {
+                    throw SegmentError.scoreNotCompiled(
+                        "这次转场已经带着 stem 技法，伴奏垫会跟它抢同一批 lane。")
+                }
+                var style = planned.style
+                style.stemTechnique = .custom(envelope)
+                planned = PlannedTransition(plan: planned.plan, style: style,
+                                            rideDB: planned.rideDB)
+                scoreSeparates = true
+            }
         }
 
         let mix = try OfflineTransitionRenderer.renderMix(
@@ -158,7 +179,11 @@ enum TransitionSegmentRenderer {
                 throw SegmentError.stemsNotApplied(mix.stemFallbackReason)
             }
         }
-        if planned.style.score != nil {
+        // A score that owns the gain law has to have had its lanes applied; a
+        // decorating one wrote no lanes at all and is proved by its stem
+        // envelope instead. Asking the wrong question of either would reject a
+        // segment that is exactly right.
+        if let score = planned.style.score, score.ownsSeam, !scoreSeparates {
             guard mix.lanesApplied != nil else {
                 throw SegmentError.scoreNotApplied(mix.scoreFallbackReason)
             }

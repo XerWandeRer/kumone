@@ -308,10 +308,10 @@ struct AutoMixDebugPanel: View {
             overrideToggle("Disable tempo ramp", \.disableTempoRamp)
             overrideToggle("Disable dominant-deck blend", \.disableDominantDeckBlend)
             overrideToggle("Disable two-clock exchange", \.disableTwoClockExchange)
-            overrideToggle("Transition score (P1: cut-on-one)", \.enableScore)
+            overrideToggle("Transition score (cut / throw / tension cut / bed)", \.enableScore)
             if model.overrides.enableScore {
-                DebugRow("score", "offered on confident grids; the live path still blends"
-                         + " unless the segment arms")
+                DebugRow("score", "one template off the ladder its intent class allows;"
+                         + " the live path still blends unless the segment arms")
             }
             overrideToggle("Force live path (no stem pre-render)", \.forceLivePath)
 

@@ -1397,10 +1397,13 @@ final class PlayerService: ObservableObject {
 
     /// Separation runs at roughly realtime **per side**, and a segment wants
     /// both sides of the seam.
-    private static let stemPrerenderSidesPerSeam: Double = 2
+    // `nonisolated` because `stemPrerenderRunway` is, and a default argument is
+    // evaluated at the call site: leaving these main-actor-isolated makes the
+    // new `sides:` default an actor hop the compiler has to complain about.
+    nonisolated private static let stemPrerenderSidesPerSeam: Double = 2
     /// Slack on top of the separation estimate: the render pull loop, the file
     /// writes, and a machine that is doing other things at the same time.
-    private static let stemPrerenderMargin: TimeInterval = 15
+    nonisolated private static let stemPrerenderMargin: TimeInterval = 15
 
     /// How much runway one seam's pre-render actually needs.
     ///
@@ -1423,11 +1426,22 @@ final class PlayerService: ObservableObject {
     /// render pass, and the margin already covers that with room to spare. This
     /// is why a cut-on-one costs the runway a 30 s overlap used to be refused
     /// for and a `.vocalExchange` still does.
+    ///
+    /// `sides` is how many decks get separated, and P4 gave it a second value.
+    /// A stem technique rewrites the outgoing deck and, for a four-lane
+    /// envelope, the incoming one too — two passes, which is the flat 2 this
+    /// has always assumed. A score's `bedIntro` splits the **incoming deck
+    /// only**: the bed is the incoming track minus its singer and the outgoing
+    /// track is not touched at all. So it pays one pass, not two, and a 16 s
+    /// hand-over that would need 47 s of runway with stems on both sides needs
+    /// 31 s with a bed — which is what keeps the one stem-bearing gesture
+    /// inside the 120 s decision lead the predev budgets for (§2.2).
     nonisolated static func stemPrerenderRunway(
-        overlapDuration: TimeInterval, separatesStems: Bool = true
+        overlapDuration: TimeInterval, separatesStems: Bool = true,
+        sides: Double = stemPrerenderSidesPerSeam
     ) -> TimeInterval {
         guard separatesStems else { return stemPrerenderMargin }
-        return stemPrerenderSidesPerSeam * max(0, overlapDuration) + stemPrerenderMargin
+        return max(0, sides) * max(0, overlapDuration) + stemPrerenderMargin
     }
 
     /// Internal rather than private only so the reuse rule below can be tested
@@ -1514,11 +1528,20 @@ final class PlayerService: ObservableObject {
               let signature = TransitionSegment.Signature(plan: planned.plan),
               let outgoingURL = currentLocalURL, let next = prefetchedNext
         else { return }
-        // A stem technique needs a separator; a score does not touch one. That
-        // asymmetry is the whole cost story of P1 — a score-only segment is a
-        // render and nothing else — so it decides both the admission above and
-        // the runway below.
-        let separatesStems = planned.style.stemTechnique != nil
+        // A stem technique needs a separator; four of the five gestures in the
+        // score library do not touch one. That asymmetry is the whole cost
+        // story of the score model — a score-only segment is a render and
+        // nothing else — so it decides both the admission above and the runway
+        // below. The fifth gesture, `bedIntro`, is the exception and says so
+        // itself: `RunwayClass` is a property of the score, read here at arming
+        // time and again by the compiler, so the bill and the work cannot
+        // disagree.
+        let scoreSeparates = planned.style.score?.runwayClass == .incomingStems
+        let separatesStems = planned.style.stemTechnique != nil || scoreSeparates
+        // One deck for a bed, two for a stem technique that may write all four
+        // lanes.
+        let separatedSides = planned.style.stemTechnique != nil
+            ? Self.stemPrerenderSidesPerSeam : 1
         guard !separatesStems || StemSeparation.isAvailable else { return }
 
         // A re-plan (a late analysis, a degraded seam after a seek) moves the
@@ -1553,7 +1576,7 @@ final class PlayerService: ObservableObject {
         case .idle:
             let runway = Self.stemPrerenderRunway(
                 overlapDuration: signature.overlapDuration,
-                separatesStems: separatesStems)
+                separatesStems: separatesStems, sides: separatedSides)
             let stableFor = stemPrerenderStable.map { livePlaybackTime - $0.since } ?? 0
             guard let trigger = Self.stemPrerenderTrigger(
                 remaining: remaining, stableFor: stableFor, runway: runway) else {
@@ -1579,9 +1602,11 @@ final class PlayerService: ObservableObject {
                 trigger.rawValue, remaining, runway, signature.overlapDuration, stableFor))
         }
 
-        // A score-only segment never calls this, so a machine with no separator
+        // A whole-mix score never calls this, so a machine with no separator
         // installed still gets one: the provider it is handed throws if the
-        // render ever asks, which for a whole-mix score it cannot.
+        // render ever asks, which for a whole-mix score it cannot. A `bedIntro`
+        // score *does* ask, which is why it is counted in `separatesStems`
+        // above and refused here alongside the stem techniques.
         let provider: VocalStemProvider = StemSeparation.provider
             ?? { _ in throw StemTechniqueLayer.StemError.noProvider }
         if separatesStems, StemSeparation.provider == nil { return }

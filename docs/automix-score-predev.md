@@ -121,6 +121,8 @@ struct TransitionScore: Codable, Equatable {
 
 **v1 手势库的可表达性**,逐条对账:
 
+> P4 之后此表全部落地:`isSupportedInV1` 对五个 case 一律为真,编译器上的那道守门留给下一个只被命名、尚未实现的手势(spinback)。
+
 | 手势 | 今天能否表达 | 途径 | 缺口 / 诚实条款 |
 |---|---|---|---|
 | cut-on-one(cutOut+slamIn 同格点) | segment 内**可** | 编译成整混 lane 的阶跃(见 2.2),逐样本施加,边沿 5–10 ms 半余弦(DJ 推子的物理速度;0 ms 是爆音不是切) | live 路径**不可**:20 ms tick 切不齐,不做近似 |
@@ -192,7 +194,13 @@ PlaybackEngine ──splice──▶ 听众
 | P1 | 乐谱模型 + 编译器 + 整混 lane + segment 准入放宽;**一张谱端到端**:cut-on-one(出侧 echo throw 收尾) | club 对(hiphop×hiphop)8 对 A/B:谱版 vs 现 blend 版盲听;回退 byte 级一致性测试;拒绝路径演练(拆 segment 听 live 回退) | 无 |
 | P2 | 瞄准层(T 选取 + seam 放置 + 倒推),含吸收 P4 的 drop 对齐 | EDM 歌单专项;出入点位移分布报告;climax guard 回归测试 | P1 验收 |
 | P3 | 意图层:手势预算 + 克制端(吸收 #4) | rock/live 语料 stand-down 命中率人工核对;误切率(格点错半拍)统计;全库 sweep 谱触发率 | P2 验收 |
-| P4 | 手势库扩张:tension cut、bedIntro,逐手势 S1 式盲听 | 每手势独立 A/B(仿 stems S1 的三技法盲测) | P3 验收 |
+| P4 | 手势库扩张:slam、tension cut、bedIntro + **模板层**,逐手势 S1 式盲听 | 每手势独立 A/B(仿 stems S1 的三技法盲测) | P3 验收 |
+
+**P4 实现后的三条修订**(代码为准,此处记账):
+
+1. **slam 不是自由事件,是模板的决定。** `slamIn` 在 P1 里被编译器忽略(入侧 lane 的抬升写死在 seam 上),P4 让它真正决定入侧 lane 在哪抬升;而"单独的 slam"——出曲还在 blend、入曲全频带砸进来——不是手势,是电平跳变。所以词汇表落成一对模板:`cutOnOne`(cutOut+slamIn)与 `cutOnly`(只切,入侧用一小节升上来)。后者规划器永远不选,它是 slam 的**对照组**,只能由 `audition render --template cutOnly` 取到。
+2. **乐谱分两种形状。** P1 要求每张谱恰好有一个结束出曲的事件;`bedIntro` 是第一个对"出曲怎么走"没有意见的手势,它只压住入曲的一条 lane,底下的 blend 一个字段都不改。所以"没有 seam owner"成为合法形状(`ownsSeam == false`,`ownsGainLaw == false`),但"没有 owner 却带着 slamIn / silence"仍然非法——那两个是电平跳变和掉电,不是更小的手势。装饰型谱的 bar 0 锚在 `TransitionAim.Landing.overlapEnd` 上,不是 seam。
+3. **伴奏垫的默认长度是 8 小节,不是预研写的 4。** 预研设想的是垫子滑进一个别处发生的进点底下,"提前 4 小节"是在说进点提前了多少;P2 的瞄准之后,入曲进点本来就是从落点倒推出来的,**叠加就是垫子的窗口**,所以这个数必须按叠加的量级取。规划器自己给的叠加是 8 或 16 小节,4 小节的上限会拒绝掉它遇到的每一个计划——那是"上线即死"而不是"上线即谨慎"。
 
 P1 刻意选 cut-on-one + echo throw:前者是"离散事件"最纯的检验(表达不出一拍边沿,整个模型就是空谈),后者复用最多现有件(delay 单元、`.lrc`、echoOut)。两者都**不需要 stems**——P1 全程零分离成本,跑道无压力,失败了也只赔一个渲染选项。
 

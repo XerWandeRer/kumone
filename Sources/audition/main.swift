@@ -55,7 +55,8 @@ usage:
   audition plan   <fileA> <fileB> [--json] [--stems on|off] [--set name=value,...]
   audition render <fileA> <fileB> [-o out.wav] [--style plain|sweep|echo|staged] [--fade N]
                                   [--stem acapella|instrumental|duck[:9]|exchange]
-                                  [--score] [--pre N] [--post N] [--ride-release N]
+                                  [--score] [--template cut|cutOnly|throwCut|tensionCut|bedIntro]
+                                  [--pre N] [--post N] [--ride-release N]
                                   [--set name=value,...]
   audition batch  <corpusDir> [-o outDir] [--pairs a.flac:b.flac,...]
                               [--style ...] [--fade N] [--pre N] [--post N]
@@ -151,6 +152,23 @@ usage:
             a pair whose grids are not confident enough is still refused, and a
             score that cannot be placed is thrown away whole (you get the blend,
             and the report says why). Separates nothing.
+  --template  force one gesture from the P4 library instead of letting the
+            planner pick off its own ladder. Implies --score. This is the
+            per-gesture A/B lever: two renders of the same pair differing in one
+            template and nothing else.
+            cut         cut on the one + slam on the one
+            cutOnly     the same cut with a one-bar entry instead of the slam —
+                        the slam's control arm
+            throwCut    cut, with the outgoing track's last line thrown into a
+                        beat-synced delay (degrades to `cut` without an .lrc
+                        line landing on the seam)
+            tensionCut  N beats of full silence ending on the seam, then the
+                        cut and the slam (degrades to `cut` unless the seam is
+                        aimed at a drop or a chorus)
+            bedIntro    N bars of the incoming track's accompaniment under the
+                        exit, its singer joining on the landing. **The one
+                        gesture that separates** — it needs `--stems on` and
+                        pays one incoming-side pass.
   --fade    override the overlap length (seconds)
   --pre/--post  context before / after the hand-over (default 12s each)
   --ride-release  dB/s the gain ride is let go of at, overriding the shipped
@@ -323,9 +341,33 @@ func decide(_ args: Arguments, a: URL, b: URL) -> Audition.Decision {
     // planner decision, so forcing one here rather than through the config
     // would render something the planner would never have offered.
     if args.flags["score"] != nil { overrides["scoreEnabled"] = 1 }
+    // `--template` is the per-gesture A/B lever (P4). It implies `--score`,
+    // because a hand-passed score with the layer off would render a gesture no
+    // planner could ever offer and call it evidence; and it *replaces* whatever
+    // the planner chose off its own ladder, which is the whole point — the
+    // question a listening session asks is "this gesture against that one on
+    // the same pair", not "whatever each pair happened to qualify for".
+    var template: TransitionScore?
+    if let raw = args.flags["template"], raw != "true" {
+        overrides["scoreEnabled"] = 1
+        let beats = overrides["scoreTensionCutBeats"] ?? TransitionScore.defaultTensionCutBeats
+        let bars = overrides["scoreBedIntroBars"].map { Int($0.rounded()) }
+            ?? TransitionScore.defaultBedIntroBars
+        switch raw {
+        case "cut": template = .cutOnOne()
+        case "cutOnly": template = .cutOnly()
+        case "throwCut": template = .cutOnOne(throwingEcho: true)
+        case "tensionCut": template = .tensionCut(beats: beats)
+        case "bedIntro": template = .bedIntro(bars: bars)
+        default:
+            fail("unknown --template '\(raw)'; expected one of "
+                 + "cut|cutOnly|throwCut|tensionCut|bedIntro")
+        }
+    }
     do {
         return try Audition.decide(outgoing: a, incoming: b,
                                    style: style, fade: args.double("fade"), stem: stem,
+                                   score: template,
                                    stems: stems,
                                    config: overrides)
     } catch {
@@ -474,7 +516,9 @@ func runRender(_ args: Arguments) {
         var scoreLine = ""
         if !d.scoreLines.isEmpty {
             scoreLine = "\n    " + d.scoreLines.joined(separator: "\n    ")
-            if d.scoreCompiled, !r.scoreLanesApplied {
+            // Only a score that owns the gain law *has* lanes to apply; a
+            // decorating one (`bedIntro`) is proved by its stem line above.
+            if d.scoreCompiled, d.scoreOwnsGainLaw, !r.scoreLanesApplied {
                 scoreLine += "\n    ⚠︎ 乐谱编译了但渲染没有施加："
                     + (r.scoreFallbackReason ?? "未知原因")
             }

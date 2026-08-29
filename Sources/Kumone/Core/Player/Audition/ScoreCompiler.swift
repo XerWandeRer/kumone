@@ -56,6 +56,27 @@ enum ScoreCompiler {
     /// How many bars either side of the seam the self-check looks at.
     static let gridCheckBars = 4
 
+    /// **How much looser the self-check is for a score that does not cut.**
+    ///
+    /// The check above exists for one reason, and the predev states it as one:
+    /// a cut on a drifting grid lands on the wrong beat, and half a beat out is
+    /// the error the gesture cannot survive. Every number in it is calibrated
+    /// against an 8 ms edge landing on the one.
+    ///
+    /// A decorating score has no such edge. `bedIntro`'s only event is a
+    /// singer joining over 30 ms on a bar line the **aim** already chose and
+    /// the aim's own half-bar snap already vetted; a 5 % wobble in the bars
+    /// either side of it moves that instant by tens of milliseconds inside a
+    /// gesture whose whole shape is bars long. Holding it to the cut's
+    /// tolerance is not caution, it is measuring the wrong thing — and
+    /// measurably so: over the user's 121-track cache the three pairs that
+    /// ever reach a bed compile were refused at 3.3 %, 3.3 % and 4.3 %, which
+    /// is the check rejecting a gesture it was not written about.
+    ///
+    /// Twice the cut's line, and no looser: past ~6 % the bar grid is not a bar
+    /// grid, and an aim placed on it is pointing at nothing in particular.
+    static let decoratingJitterMultiple: Double = 2
+
     /// One phrase, in bars — the unit the slam prefers to land on (see the seam
     /// placement below), and the length nearly all of this repertoire's
     /// sections are built out of.
@@ -82,6 +103,43 @@ enum ScoreCompiler {
     /// admits everything, which is P1's behaviour and the thing being fixed.
     static let echoThrowQualifyBeats: Double = 1.0
 
+    // MARK: - P4 gestures
+
+    /// How long the incoming track takes to come up when a score cuts the
+    /// outgoing one and does **not** slam — one bar, on the incoming song's own
+    /// clock.
+    ///
+    /// This is the slam's control arm made concrete. A `cutOut` with no
+    /// `slamIn` is not "a cut with the incoming lane left at whatever the
+    /// automation was doing" — the score owns the gain law, so there *is* no
+    /// automation to leave it to. It is a cut followed by a one-bar raised
+    /// cosine, which is the mildest honest thing an owned gain law can do, and
+    /// the thing a slam has to prove itself against.
+    static let softEntryBars: Double = 1
+
+    /// Vocals joining a bed are given this long to arrive.
+    ///
+    /// Not zero: the lane is a gain on a separated stem, and a hard step on a
+    /// signal that already has a room tail in it clicks. Not long either — 30 ms
+    /// is under a thirty-second note at any tempo in this repertoire, so the
+    /// singer still lands *on* the bar line rather than around it. The ramp runs
+    /// **into** the landing point rather than out of it, so the first sample of
+    /// the drop is the first sample at full voice.
+    static let bedVocalRampSeconds: TimeInterval = 0.03
+
+    /// How much longer than the bed it asked for a hand-over may be before the
+    /// bed is refused, in bars.
+    ///
+    /// A bed is written as "N bars of accompaniment ending on the landing", and
+    /// the bed's start is not negotiable: it is the instant the incoming deck
+    /// starts, because that is the first moment there is anything to hold down.
+    /// So on an overlap longer than N bars the gesture cannot be performed as
+    /// written — muting from the start would be a longer bed than asked for,
+    /// and muting from N bars back would put the incoming singer on the air,
+    /// off again, and back, which is a fault rather than a gesture. Half a bar
+    /// of slack absorbs the planner's own rounding; past that, refuse.
+    static let bedOverrunBars: Double = 0.5
+
     // MARK: - Output
 
     /// One event, placed.
@@ -96,7 +154,16 @@ enum ScoreCompiler {
     /// say why it landed where it did, or why it did not land at all.
     struct Compilation: Sendable, Equatable {
         var label: String
-        /// Seconds into the overlap where the seam ("the one") sits.
+        /// **Which instant of the hand-over `bar 0 beat 0` was pinned to.**
+        ///
+        /// `.seam` for every score that ends the outgoing track: bar 0 is the
+        /// bass-swap point, the one the cut lands on. `.overlapEnd` for a
+        /// decorating score (`bedIntro`) riding a `dropAlign` blend, where the
+        /// arrival the gesture is built around is the end of the overlap rather
+        /// than the middle of it. One field so a report never has to guess
+        /// which of the two `seamOffset` below is measuring.
+        var origin: TransitionAim.Landing = .seam
+        /// Seconds into the overlap where the origin (`origin`) sits.
         var seamOffset: TimeInterval = 0
         /// The same instant on the two songs' own clocks.
         var seamOutgoing: TimeInterval = 0
@@ -120,8 +187,19 @@ enum ScoreCompiler {
         /// throw with no lyrics to aim at degrades to a plain cut. Never
         /// silent: a listener has to be able to tell which gesture they heard.
         var degradations: [String] = []
-        /// The compiled lanes; nil exactly when `refusalReason` is set.
+        /// The compiled lanes; nil exactly when `refusalReason` is set. A
+        /// decorating score's lanes are pass-through — it says everything it
+        /// has to say through `stemEnvelope`.
         var lanes: WholeMixLanes?
+        /// **The stem side of the compile**, written by `bedIntro` and by
+        /// nothing else: the incoming deck's vocal lane, held at −60 dB until
+        /// the singer joins. Non-nil is what makes this score's segment pay a
+        /// separation pass.
+        var stemEnvelope: StemEnvelope?
+        /// What this score costs the pre-render's runway. Read off the score
+        /// rather than derived here, so the arming path and the render path
+        /// cannot disagree about the bill.
+        var runwayClass: TransitionScore.RunwayClass = .scoreOnly
         /// Why the whole score was thrown away. Non-nil means the hand-over is
         /// the plain blend it would have been without a score at all.
         var refusalReason: String?
@@ -146,7 +224,8 @@ enum ScoreCompiler {
             // to land on, and why did it not" is one question, and a report
             // that dropped half of it would be answering the easier one.
             Compilation(label: score.label, aim: planned.style.aim,
-                        aimNote: planned.style.aimDetail, refusalReason: reason)
+                        aimNote: planned.style.aimDetail,
+                        runwayClass: score.runwayClass, refusalReason: reason)
         }
 
         do { try score.validate() } catch {
@@ -155,8 +234,7 @@ enum ScoreCompiler {
                              ?? error.localizedDescription))
         }
         if let unsupported = score.events.first(where: { !$0.event.isSupportedInV1 }) {
-            return refuse("\(unsupported.event.label) 还没有编译器实现（P1 只做 cut-on-one 与 "
-                          + "echo throw），整谱作废。")
+            return refuse("\(unsupported.event.label) 还没有编译器实现，整谱作废。")
         }
         guard case .beatMatched(let p) = planned.plan else {
             return refuse("乐谱只在 beatMatched 的转场上有格子可以落。")
@@ -222,7 +300,21 @@ enum ScoreCompiler {
         // Nothing constrains the seam's position beyond that, because a score
         // that owns the gain law replaces the crossfade rather than sitting on
         // it — there is no fader to compensate at any offset.
-        let swapSource = incomingSource(geometry.swapOffset)
+        //
+        // **Where bar 0 is, before it is snapped to anything.**
+        //
+        // A score that ends the outgoing track pins bar 0 to the bass swap —
+        // the seam, the one, the instant the cut happens. A score that only
+        // *decorates* a blend has no seam to pin to: `bedIntro` is built around
+        // the moment the incoming singer joins, and on a `dropAlign` hand-over
+        // that moment is the end of the overlap, where P2's aim put the drop.
+        // Same machinery, same snapping, same self-checks; one different
+        // anchor, taken from the aim rather than invented here.
+        let origin: TransitionAim.Landing = score.ownsSeam
+            ? .seam
+            : (planned.style.aim?.landing ?? .seam)
+        let originOffsetWanted = origin == .seam ? geometry.swapOffset : overlap
+        let swapSource = incomingSource(originOffsetWanted)
         guard var seamIndex = nearestIndex(inDownbeats, to: swapSource) else {
             return refuse("入曲没有小节线可以对齐。")
         }
@@ -262,25 +354,44 @@ enum ScoreCompiler {
             if let phrased { seamIndex = phrased }
         }
         let seamIncoming = inDownbeats[seamIndex]
-        let seamOffset = incomingOverlapTime(seamIncoming)
-        guard seamOffset > WholeMixLane.cutEdgeSeconds * 4,
-              seamOffset < overlap - WholeMixLane.cutEdgeSeconds * 4 else {
-            return refuse(String(format: "对齐后的 seam 落在 +%.2f 秒，贴着叠加的边缘，切不出来。",
+        let edge = WholeMixLane.cutEdgeSeconds
+        // A decorating score's origin is *supposed* to sit on the far edge of
+        // the overlap — that is what "the singer joins on the drop, and the
+        // drop is where the blend completes" means — so the trailing guard is
+        // a cut's guard and applies to cuts only. It still has to be inside the
+        // window, and snapping to a bar line can push it a hair past the end.
+        let seamOffset = min(incomingOverlapTime(seamIncoming), overlap)
+        guard seamOffset > edge * 4 else {
+            return refuse(String(format: "对齐后的 bar 0 落在 +%.2f 秒，贴着叠加的开头，摆不下手势。",
                                  seamOffset))
+        }
+        if score.ownsSeam {
+            guard seamOffset < overlap - edge * 4 else {
+                return refuse(String(format: "对齐后的 seam 落在 +%.2f 秒，贴着叠加的边缘，切不出来。",
+                                     seamOffset))
+            }
+        } else {
+            guard incomingOverlapTime(seamIncoming) <= overlap + inBar * 0.5 else {
+                return refuse(String(format: "落点 +%.2f 秒落在叠加（%.2f 秒）之外，"
+                                     + "垫子没有可以铺的地方。",
+                                     incomingOverlapTime(seamIncoming), overlap))
+            }
         }
         let seamOutgoing = outgoingSource(seamOffset)
 
         // --- Grid self-check, both sides: a cut on a drifting grid is a cut on
         // the wrong beat, and the drift is measurable before anything is
         // rendered.
+        let jitterLimit = gridJitterTolerance
+            * (score.ownsSeam ? 1 : decoratingJitterMultiple)
         for (label, grid, at) in [("出曲", outDownbeats, seamOutgoing),
                                   ("入曲", inDownbeats, seamIncoming)] {
             guard let jitter = worstJitter(grid, around: at, bars: gridCheckBars)
             else { continue }
-            guard jitter <= gridJitterTolerance else {
-                return refuse(String(format: "%@在交接点附近的小节长度抖动 %.1f%%，超过 %.0f%% 的上限，"
+            guard jitter <= jitterLimit else {
+                return refuse(String(format: "%@在交接点附近的小节长度抖动 %.1f%%，超过 %.1f%% 的上限，"
                                      + "格点不可信。", label, jitter * 100,
-                                     gridJitterTolerance * 100))
+                                     jitterLimit * 100))
             }
         }
 
@@ -297,6 +408,11 @@ enum ScoreCompiler {
         /// A grid position, in overlap-relative seconds. Nil when the grid does
         /// not reach it — which invalidates the score, not just the event.
         func place(_ position: GridPosition) -> TimeInterval? {
+            // Bar 0 beat 0 *is* the origin, and the origin has already been
+            // resolved (and, for a decorating score, clamped to the end of the
+            // window). Re-deriving it here would be a second answer to a
+            // question that has one.
+            if position == .seam { return seamOffset }
             if position.bar >= 0 {
                 let index = seamIndex + position.bar
                 guard index >= 0, index < inDownbeats.count else { return nil }
@@ -309,8 +425,31 @@ enum ScoreCompiler {
             return outgoingOverlapTime(outDownbeats[index] + beat)
         }
 
+        // --- The tension cut's one rule, re-checked where the aim is final.
+        //
+        // `ScoreTemplate` only offered this score because the planner's aim
+        // said drop or chorus. Between there and here the aim can be dropped —
+        // a plan override moved the seam, and the compiler fell back to phrase
+        // placement above — and a beat of silence in front of a bar line
+        // nobody was waiting for is the predev's malfunction, not a smaller
+        // gesture. So the silence degrades out and the cut plays alone, said
+        // out loud, exactly as an unearned echo throw does.
+        func isSilence(_ scored: ScoredEvent) -> Bool {
+            if case .silence = scored.event { return true }
+            return false
+        }
+        var events = score.events
+        if events.contains(where: isSilence),
+           aim?.target != .drop, aim?.target != .chorus {
+            events.removeAll(where: isSilence)
+            degradations.append(
+                "这一刀最后没有落在 drop / 副歌上（\(TransitionAim.report(aim, reason: aimNote))），"
+                + "一拍静默降级掉——落拍前的空白只有在听众等着什么的时候才是张力，"
+                + "否则那是播放器坏了。")
+        }
+
         var placed: [Placed] = []
-        for scored in score.events {
+        for scored in events {
             guard let offset = place(scored.at) else {
                 return refuse("格点 bar \(scored.at.bar) 落在拍网格之外，整谱作废。")
             }
@@ -341,7 +480,7 @@ enum ScoreCompiler {
         // is a cut, cleanly and by name.
         var directive: EchoThrowDirective?
         var echoLine: String?
-        if score.events.contains(where: { $0.event == .echoThrow }) {
+        if events.contains(where: { $0.event == .echoThrow }) {
             let sourceBeat = outBar / Double(TransitionScore.beatsPerBar)
             let delayTime = min(max(sourceBeat / outRate * echoDelayBeatFraction, 0.05), 2.0)
             let window = sourceBeat * echoThrowQualifyBeats
@@ -365,38 +504,120 @@ enum ScoreCompiler {
             }
         }
 
-        // --- The lanes.
-        let edge = WholeMixLane.cutEdgeSeconds
-        var lanes = WholeMixLanes(ownsGainLaw: true)
-        lanes.outgoing = WholeMixLane([
-            .init(t: 0, gainDB: 0),
-            .init(t: seamOffset - edge, gainDB: 0),
-            .init(t: seamOffset, gainDB: WholeMixLane.minGainDB),
-            .init(t: overlap, gainDB: WholeMixLane.minGainDB),
-        ])
-        lanes.incoming = WholeMixLane([
-            .init(t: 0, gainDB: WholeMixLane.minGainDB),
-            .init(t: seamOffset - edge, gainDB: WholeMixLane.minGainDB),
-            .init(t: seamOffset, gainDB: 0),
-            .init(t: overlap, gainDB: 0),
-        ])
-        lanes.echoThrow = directive
+        // A throw that did not qualify leaves a **cut**, and it is named as
+        // one: a report that still said "cutOnOne+echoThrow" would be
+        // describing a gesture the listener did not hear. Same for a silence
+        // that degraded out above — so the label is built from what is actually
+        // going to be performed rather than from what was asked for.
+        if directive == nil {
+            events = events.map {
+                $0.event == .echoThrow ? ScoredEvent(at: $0.at, .cutOut) : $0
+            }
+        }
+        let performed = TransitionScore(preBars: score.preBars, postBars: score.postBars,
+                                        events: events)
 
-        // A throw that did not qualify leaves a **cut-only score**, and it is
-        // named as one: a report that still said "cutOnOne+echoThrow" would be
-        // describing a gesture the listener did not hear.
-        let asked = score.events.contains { $0.event == .echoThrow }
-        let label = asked && directive == nil
-            ? TransitionScore.cutOnOne().label
-            : score.label
+        // --- The gain law.
+        //
+        // Two shapes, and which one a score gets is decided by whether it ends
+        // the outgoing track (`ownsSeam`), not by which gestures are in it. A
+        // cut replaces the blend: both decks' automation is neutralized and
+        // these two lanes say everything. A bed rides on top of the blend the
+        // planner already made, so it writes no whole-mix lane at all — its
+        // whole content is one muted stem lane, below.
+        var lanes = WholeMixLanes(ownsGainLaw: score.ownsSeam)
+        var stemEnvelope: StemEnvelope?
+
+        if score.ownsSeam {
+            // **The tension cut, as arithmetic.** The silence is a span ending
+            // on the seam, so performing it is not a new mechanism — it is the
+            // outgoing lane's cut edge, moved back N beats. The beat is the
+            // outgoing song's own bar over four, divided by the rate it is bent
+            // to, which is what makes "exactly one beat" true in the rendered
+            // file rather than in the score's intentions.
+            var cutAt = seamOffset
+            var silenceBeats: Double?
+            for scored in events {
+                guard case .silence(let beats) = scored.event else { continue }
+                let outBeat = outBar / Double(TransitionScore.beatsPerBar)
+                cutAt = outgoingOverlapTime(seamOutgoing - beats * outBeat)
+                silenceBeats = beats
+            }
+            if let silenceBeats, cutAt - edge <= 0 {
+                return refuse(String(format: "%g 拍的静默要从 +%.2f 秒开始，那时候叠加还没开始，"
+                                     + "整谱作废。", silenceBeats, cutAt))
+            }
+            lanes.outgoing = WholeMixLane([
+                .init(t: 0, gainDB: 0),
+                .init(t: cutAt - edge, gainDB: 0),
+                .init(t: cutAt, gainDB: WholeMixLane.minGainDB),
+                .init(t: overlap, gainDB: WholeMixLane.minGainDB),
+            ])
+
+            // **The slam, as arithmetic.** The incoming lane rises where the
+            // `slamIn` event says and nowhere else. With no slam in the score
+            // the same lane rises over a bar starting at the cut — the control
+            // arm — so the difference between the two renders is one lane's
+            // middle two breakpoints and nothing else in the whole pipeline.
+            let slamAt = placed.first { $0.event == ScoreEvent.slamIn.label }?.offset
+            if let slamAt {
+                lanes.incoming = WholeMixLane([
+                    .init(t: 0, gainDB: WholeMixLane.minGainDB),
+                    .init(t: slamAt - edge, gainDB: WholeMixLane.minGainDB),
+                    .init(t: slamAt, gainDB: 0),
+                    .init(t: overlap, gainDB: 0),
+                ])
+            } else {
+                let rise = min(softEntryBars * inBar / inRate, max(0, overlap - cutAt))
+                lanes.incoming = WholeMixLane([
+                    .init(t: 0, gainDB: WholeMixLane.minGainDB),
+                    .init(t: cutAt, gainDB: WholeMixLane.minGainDB),
+                    .init(t: cutAt + rise, gainDB: 0),
+                    .init(t: overlap, gainDB: 0),
+                ])
+            }
+            lanes.echoThrow = directive
+        }
+
+        // **The bed, as a stem lane.** The only gesture in the library that
+        // needs a separator, and the only one whose compile can hand back
+        // something other than gain on a whole mix.
+        for scored in events {
+            guard case .bedIntro(let bars) = scored.event,
+                  let landing = placed.first(where: { $0.at == scored.at
+                                                      && $0.event == scored.event.label })?.offset
+            else { continue }
+            let barSecondsOnTheClock = inBar / inRate
+            guard landing >= barSecondsOnTheClock * 0.99 else {
+                return refuse(String(format: "人声进入点落在 +%.2f 秒，连一小节垫子都铺不下，整谱作废。",
+                                     landing))
+            }
+            let wanted = Double(bars) * barSecondsOnTheClock
+            guard landing <= wanted + bedOverrunBars * barSecondsOnTheClock else {
+                return refuse(String(format: "这次叠加要垫 %.2f 秒，比 %d 小节的伴奏垫（%.2f 秒）"
+                                     + "长得多；从头压住入曲人声就不是这个手势了，整谱作废。",
+                                     landing, bars, wanted))
+            }
+            var envelope = StemEnvelope()
+            var points: [StemEnvelope.Breakpoint] = [
+                .init(t: 0, gainDB: StemEnvelope.minGainDB),
+                .init(t: max(0, landing - bedVocalRampSeconds), gainDB: StemEnvelope.minGainDB),
+                .init(t: landing, gainDB: 0),
+            ]
+            if landing < overlap - 1e-6 { points.append(.init(t: overlap, gainDB: 0)) }
+            envelope.incomingVocal = points
+            stemEnvelope = envelope
+        }
 
         return Compilation(
-            label: label, seamOffset: seamOffset,
+            label: performed.label, origin: origin, seamOffset: seamOffset,
             seamOutgoing: seamOutgoing, seamIncoming: seamIncoming,
-            seamSnapSeconds: seamOffset - geometry.swapOffset,
+            seamSnapSeconds: seamOffset - originOffsetWanted,
             aim: aim, aimNote: aimNote,
             events: placed, echoThrow: directive, echoLine: echoLine,
-            degradations: degradations, lanes: lanes, refusalReason: nil)
+            degradations: degradations, lanes: lanes,
+            stemEnvelope: stemEnvelope, runwayClass: score.runwayClass,
+            refusalReason: nil)
     }
 
     // MARK: - Grid helpers

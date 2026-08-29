@@ -451,6 +451,20 @@ public enum Audition {
         public let scoreLines: [String]
         /// The compiled lanes the render will actually perform.
         let scoreLanes: WholeMixLanes?
+        /// **Whether this score is the one deciding the hand-over's gain.**
+        ///
+        /// True for every score that ends the outgoing track — those write two
+        /// whole-mix lanes and the render must apply them or it is playing
+        /// something else. False for a decorating score (`bedIntro`), which
+        /// writes no whole-mix gain at all: its lanes are pass-through by
+        /// construction, so "the render did not apply any lanes" is the correct
+        /// outcome there rather than a fault worth warning about.
+        ///
+        /// A compiled `bedIntro`'s stem side is deliberately *not* a second
+        /// field here: it is mounted on the style as a `.custom` technique
+        /// before this decision is built, so it arrives in `stemEnvelope` like
+        /// every other envelope and the render path needs no special case.
+        public let scoreOwnsGainLaw: Bool
 
         // --- Intent layer (P3, predev §2.4). Nil on every decision made
         // without `intentEnabled`, which is every shipped one.
@@ -631,6 +645,17 @@ public enum Audition {
             scoreCompilation = ScoreCompiler.compile(score, planned: planned,
                                                      outgoing: out, incoming: inc,
                                                      outgoingURL: outgoingURL)
+            // A `bedIntro` compiles to a stem envelope, and an envelope reaches
+            // the renderer exactly one way: mounted on the style. Done here,
+            // before the `.custom` validation below, so a compiled bed is
+            // checked against the final overlap like any hand-written one.
+            if let envelope = scoreCompilation?.stemEnvelope,
+               planned.style.stemTechnique == nil {
+                var style = planned.style
+                style.stemTechnique = .custom(envelope)
+                planned = PlannedTransition(plan: planned.plan, style: style,
+                                            rideDB: planned.rideDB)
+            }
         }
 
         var envelope: StemEnvelope?
@@ -712,6 +737,7 @@ public enum Audition {
             scoreCompiled: scoreCompilation?.didCompile ?? false,
             scoreLines: scoreCompilation.map(describe) ?? [],
             scoreLanes: scoreCompilation?.lanes,
+            scoreOwnsGainLaw: scoreCompilation?.lanes?.ownsGainLaw ?? false,
             intentClass: planned.style.intent?.class.rawValue,
             intentReasons: planned.style.intent?.reasons ?? [],
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
@@ -741,10 +767,11 @@ public enum Audition {
             return ["乐谱 \(c.label) 没有上演：\(refusal)", "  \(aimLine)",
                     "这次转场听到的是今天的 blend。"]
         }
-        var lines = [String(format: "乐谱 %@：seam 落在叠加的 +%.3f 秒"
+        let originName = c.origin == .seam ? "seam" : "落点（叠加终点）"
+        var lines = [String(format: "乐谱 %@：%@ 落在叠加的 +%.3f 秒"
                             + "（出曲 %.3f 秒 / 入曲 %.3f 秒），"
-                            + "相对低频交接点移了 %+.3f 秒以落到小节线上。",
-                            c.label, c.seamOffset, c.seamOutgoing, c.seamIncoming,
+                            + "相对原定位置移了 %+.3f 秒以落到小节线上。",
+                            c.label, originName, c.seamOffset, c.seamOutgoing, c.seamIncoming,
                             c.seamSnapSeconds),
                      "  " + aimLine]
         for placed in c.events {
@@ -756,9 +783,20 @@ public enum Audition {
                                 throwDirective.throwAt, throwDirective.delayTime * 1000,
                                 c.echoLine.map { "（末句：“\($0)”）" } ?? ""))
         }
+        if let envelope = c.stemEnvelope, let bed = envelope.incomingVocal.last(
+            where: { $0.gainDB <= StemEnvelope.minGainDB + 1e-3 }) {
+            lines.append(String(format: "  伴奏垫：入曲人声从 +0.000 秒压到 %.0f dB，"
+                                + "到 +%.3f 秒（人声进入点）才放开。",
+                                StemEnvelope.minGainDB,
+                                bed.t + ScoreCompiler.bedVocalRampSeconds))
+        }
         lines.append(contentsOf: c.degradations.map { "  ⚠︎ \($0)" })
-        lines.append(String(format: "  切边沿 %.0f ms（半余弦），逐样本施加，不做任何分离。",
-                            WholeMixLane.cutEdgeSeconds * 1000))
+        // The cost line, and it is the gesture's own cost: a cut has an edge
+        // and no separator, a bed has a separator and no edge.
+        lines.append(c.runwayClass == .scoreOnly
+            ? String(format: "  切边沿 %.0f ms（半余弦），逐样本施加，不做任何分离。",
+                     WholeMixLane.cutEdgeSeconds * 1000)
+            : "  逐样本施加，另付入曲单边人声分离（跑道 = 1×overlap+15 s）。")
         return lines
     }
 
