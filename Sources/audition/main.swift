@@ -67,7 +67,22 @@ usage:
   audition order  <cacheOrCorpusDir> [-o report.md] [--window 4] [--limit N]
                   [--candidates 6] [--low-dir DIR] [--bench]
                   [--set ...] [--order-set ...]
+  audition intent <cacheOrCorpusDir> [--limit N] [--set ...]
   audition knobs  [--json]
+
+  intent    classify the material (docs/automix-score-predev.md §2.4). Two
+            tables: one row per cached track — downbeat-interval CV, spectral
+            flatness, energy occupancy, vocal density, drop presence, and the
+            bucket they add up to — and one row per adjacent pair of the
+            schedule with the intent class the planner would act on, its
+            gesture budget, every reason that chose it, and the plan it
+            produced next to the plan the same pair gets with the layer off.
+            `intentEnabled` is forced on for the run regardless of `--set`;
+            every other knob is honoured, which is how a threshold is
+            calibrated. Offline and read-only: sidecars only, never analyzes,
+            never renders. This is the gate to read **before** listening — a
+            wrong bucket is cheap on paper and expensive in the ears.
+            --limit   use only the first N tracks of the schedule
 
   order     run the AutoMix queue-reorder greedy over a directory of locally
             cached, already analyzed tracks and table what it did to the tier
@@ -213,6 +228,13 @@ func explain(_ d: Audition.Decision) -> String {
         mechanics += String(format: ", rates %.4f/%.4f", outRate, inRate)
     }
     if d.overridden { mechanics += "  [OVERRIDDEN by --style/--fade]" }
+    // What the pair was *for*, when the intent layer ran at all — printed
+    // before the score, because it is the layer that decided whether there
+    // could be a score.
+    if let intentClass = d.intentClass {
+        mechanics += "\n  intent=\(intentClass)"
+            + d.intentReasons.map { "\n    · \($0)" }.joined()
+    }
     if !d.scoreLines.isEmpty {
         mechanics += "\n  " + d.scoreLines.joined(separator: "\n  ")
     }
@@ -1300,6 +1322,95 @@ func escalationCostLine(_ e: Audition.OrderEscalation) -> String {
         e.satisfied, e.picks, orderShare(e.satisfied, e.picks), e.satisfyingTier, e.budgeted)
 }
 
+// MARK: - intent
+
+/// `audition intent <dir>` — the P3 acceptance gate.
+///
+/// Prints two tables and their histograms: what each cached track's *material*
+/// looks like, and what the intent layer makes of each adjacent pair of the
+/// schedule. This is what gets read before anybody listens: a class is cheap to
+/// check on paper and expensive to hear go wrong.
+func runIntent(_ args: Arguments) {
+    guard let dirArg = args.positional.first else { fail(usage) }
+    let corpus = url(dirArg)
+    let all = analyzedCorpus(corpus)
+    guard all.count >= 2 else {
+        fail("need at least two analyzed tracks in \(corpus.path) (found \(all.count)); "
+             + "`intent` never analyzes — it reads `.analysis.json` sidecars")
+    }
+    // One row per *track*, at its best cached quality: a cache holds the same
+    // song at several bitrates, and three rows for one song would skew every
+    // bucket count. Same rule `order` uses.
+    var byTrack: [String: [(level: String, url: URL)]] = [:]
+    var schedule: [URL] = []
+    for file in all {
+        if let parts = cacheKeyParts(file) {
+            byTrack[parts.trackID, default: []].append((parts.level, file))
+        } else {
+            schedule.append(file)
+        }
+    }
+    for (_, entries) in byTrack {
+        schedule.append(entries.sorted { levelRank($0.level) < levelRank($1.level) }.last!.url)
+    }
+    schedule.sort { $0.lastPathComponent < $1.lastPathComponent }
+    if let limit = args.double("limit").map({ Int($0) }), limit > 0, limit < schedule.count {
+        schedule = Array(schedule.prefix(limit))
+    }
+
+    let report: Audition.IntentReport
+    do {
+        report = try Audition.intentReport(files: schedule, config: configOverrides(args))
+    } catch {
+        fail("intent: \(error.localizedDescription)")
+    }
+
+    // `String(format: "%-30@")` does not pad a Swift `String`, so the columns
+    // are padded by hand — a table nobody can read down is not a table.
+    func pad(_ s: String, _ width: Int) -> String {
+        let clipped = String(s.prefix(width))
+        return clipped + String(repeating: " ", count: max(0, width - clipped.count))
+    }
+    func padLeft(_ s: String, _ width: Int) -> String {
+        String(repeating: " ", count: max(0, width - s.count)) + String(s.prefix(width))
+    }
+    func num(_ v: Double?, _ digits: Int, _ width: Int) -> String {
+        padLeft(v.map { String(format: "%.\(digits)f", $0) } ?? "—", width)
+    }
+
+    print("\nmaterial profile — \(report.tracks.count) tracks")
+    print("  " + pad("track", 34) + padLeft("bpm", 6) + padLeft("conf", 6)
+          + padLeft("gridCV", 8) + padLeft("flat", 6) + padLeft("occ", 6)
+          + padLeft("vocal", 6) + padLeft("drop", 6) + "  bucket")
+    for row in report.tracks {
+        print("  " + pad(row.name, 34) + num(row.bpm, 1, 6) + num(row.bpmConfidence, 2, 6)
+              + num(row.gridCV, 3, 8) + num(row.flatness, 2, 6) + num(row.occupancy, 2, 6)
+              + num(row.vocalMean, 2, 6) + padLeft(row.hasDrop ? "yes" : "—", 6)
+              + "  " + row.bucket)
+    }
+    print("\n  buckets: " + report.trackBuckets
+        .filter { $0.count > 0 }
+        .map { "\($0.name) \($0.count)" }.joined(separator: " · "))
+
+    print("\nintent per adjacent pair — \(report.pairs.count) seams")
+    for pair in report.pairs {
+        print("  " + pad(pair.outgoing, 30) + " → " + pad(pair.incoming, 30) + "  "
+              + pad(pair.intentClass, 12)
+              + String(format: "budget %.2f  %@ out %@ in %@ %.1fs (was %@ %.1fs)%@",
+                       pair.budget, pair.planKind,
+                       optional(pair.outPoint, 1), optional(pair.inPoint, 1), pair.overlap,
+                       pair.baselineKind, pair.baselineOverlap,
+                       pair.moved ? "  ← moved" : ""))
+        for reason in pair.reasons { print("      · \(reason)") }
+    }
+    print("\n  classes: " + report.pairClasses
+        .map { "\($0.name) \($0.count)" }.joined(separator: " · "))
+    print(String(format: "  the layer moved %d of %d plans (%.0f %%)",
+                 report.movedPairs, report.pairs.count,
+                 report.pairs.isEmpty ? 0
+                     : 100 * Double(report.movedPairs) / Double(report.pairs.count)))
+}
+
 func runOrder(_ args: Arguments) {
     guard let dirArg = args.positional.first else { fail(usage) }
     let corpus = url(dirArg)
@@ -1596,6 +1707,7 @@ case "batch": runBatch(args)
 case "serve": runServe(args)
 case "sweep": runSweep(args)
 case "order": runOrder(args)
+case "intent": runIntent(args)
 case "knobs": runKnobs(args)
 case "-h", "--help", "help": print(usage)
 default: fail("unknown command '\(command)'\n\n" + usage)

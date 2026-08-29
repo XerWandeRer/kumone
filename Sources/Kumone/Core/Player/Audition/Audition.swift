@@ -452,6 +452,15 @@ public enum Audition {
         /// The compiled lanes the render will actually perform.
         let scoreLanes: WholeMixLanes?
 
+        // --- Intent layer (P3, predev §2.4). Nil on every decision made
+        // without `intentEnabled`, which is every shipped one.
+
+        /// `cutCulture` / `restrained` / … — the class this pair was planned
+        /// under.
+        public let intentClass: String?
+        /// Every rule that fired and the numbers it fired on.
+        public let intentReasons: [String]
+
         /// "timbre 0.31 vs clash line 0.30" — signals sitting close enough to a
         /// threshold that nudging the constant would flip this pair.
         public let nearMisses: [String]
@@ -703,6 +712,8 @@ public enum Audition {
             scoreCompiled: scoreCompilation?.didCompile ?? false,
             scoreLines: scoreCompilation.map(describe) ?? [],
             scoreLanes: scoreCompilation?.lanes,
+            intentClass: planned.style.intent?.class.rawValue,
+            intentReasons: planned.style.intent?.reasons ?? [],
             nearMisses: nearMisses(signals: signals, keyDistance: keyDistance,
                                    outVocal: outVocal, inVocal: inVocal, config: config),
             planTrace: planTrace,
