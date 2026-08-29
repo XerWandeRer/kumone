@@ -946,6 +946,13 @@ final class PlayerService: ObservableObject {
             Task { [weak self] in
                 guard let final = try? await AudioCache.shared.commitPartFile(for: key),
                       let self, generation == self.resolveGeneration else { return }
+                // The complete file just landed — which is exactly what
+                // `currentLocalURL` means. The deck keeps playing its stream
+                // source (so `hasLocalFile` stays honest), but everything that
+                // reads the *file* — the stem pre-render's outgoing side, the
+                // pick's lyric line-ends, and the queue-order politeness gate —
+                // can start now instead of waiting for the next track.
+                self.currentLocalURL = final
                 self.ensureCurrentAnalysis(key: key, fileURL: final)
                 // The progressive mirror just became a complete file: the words
                 // fetched at the start of the song now have something to sit by.
@@ -2089,11 +2096,14 @@ final class PlayerService: ObservableObject {
     /// or is playing. `prefetchTask` is the playback-quality fetch of the
     /// *chosen* next track — while the pick is pending `schedulePrefetch` has
     /// already stood it down, so this is nil then by construction — and
-    /// `hasLocalFile` is false exactly while the current track is still
-    /// streaming into the cache. Both resume the escalation on their own: the
-    /// progress tick calls back in every second.
+    /// `currentLocalURL` is nil exactly while the current track is still
+    /// streaming into the cache (not `hasLocalFile`, which describes the
+    /// deck's *source* and stays false for a streamed track even after its
+    /// download completes — that read kept the escalation deferred for the
+    /// whole first song of a fresh playlist). Both resume the escalation on
+    /// their own: the progress tick calls back in every second.
     private var autoMixMayDownload: Bool {
-        prefetchTask == nil && hasLocalFile
+        prefetchTask == nil && currentLocalURL != nil
     }
 
     /// Freeze the decision for this track and hand the pipeline the result.
