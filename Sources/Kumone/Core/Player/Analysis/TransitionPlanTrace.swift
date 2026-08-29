@@ -45,6 +45,16 @@ public struct PlanGate: Sendable, Equatable {
         /// designed path for most of the library, not a failure. Which source a
         /// point came from lives in `value` and `detail`.
         case structure
+        /// **What this pair is culturally for** (P3, predev §2.4) — the intent
+        /// class, its gesture budget, and the material numbers that chose it.
+        ///
+        /// Unlike every other stage this one *can* end a pair's hand-over:
+        /// `standDown` returns a gapless seam and `restrained` takes the
+        /// beat-match off the table. So `passed` here means "the layer did not
+        /// stand this pair down", and the class is in `detail`. Absent
+        /// entirely while `intentEnabled` is false, which is every shipped
+        /// decision.
+        case intent
         /// The beat-match rule proper: tempo confidence through out point.
         case beatMatch
         /// The 16 / 8-bar upgrade search. These never cost a pair its

@@ -172,6 +172,19 @@ struct TransitionStyle: Sendable, Equatable {
     /// refusal is never silent: `aim=none (no structure)` is the interesting
     /// half of the A/B, and a bare `aim=none` reads as a missing feature.
     var aimDetail: String? = nil
+    /// **What this hand-over was for** (`TransitionIntent`, P3, predev §2.4).
+    ///
+    /// An *annotation*, exactly like `aim`: by the time it is written the
+    /// decision it records has already been taken — a `standDown` pair is
+    /// already gapless, a `restrained` one already carries the short staged
+    /// crossfade — so a style stripped of this field plays identically. What it
+    /// buys is that the panel, the seam history, the journal and the feedback
+    /// corpus can all say *which rule* produced the seam they are looking at,
+    /// in the planner's own words, instead of guessing from the geometry.
+    ///
+    /// Nil is "the intent layer never ran", which is every shipped seam
+    /// (`Config.intentEnabled` is false).
+    var intent: TransitionIntent? = nil
 
     static let plain = TransitionStyle(outroEffect: .fade, stagedEQ: false)
 }

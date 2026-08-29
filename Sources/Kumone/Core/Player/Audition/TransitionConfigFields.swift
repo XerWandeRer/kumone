@@ -290,6 +290,82 @@ extension TransitionPlanner.Config {
                   + "补偿到顶（+6 dB）之后人声还是会跟着推子一起走。",
               0, 20, 0.5, 1, \.vocalCarryWindowSeconds),
 
+        // --- Intent layer (P3). 默认整层关闭；关着的时候一个信号都不算，逐字段回到今天。
+        boolField("intentEnabled", "intent",
+                  "开 = 先问“这一对在文化上该怎么接”，再决定允许哪一类手法："
+                      + "专辑连播站下（gapless）、摇滚类克制（只给短的分段交叉淡入）、"
+                      + "无拍子的古典站下、EDM 把叠加终点对到 drop、"
+                      + "硬网格且两头都没人唱才允许切。存疑一律 blend（今天的行为）。"
+                      + "关（默认）= 整层不运行。",
+                  \.intentEnabled),
+        boolField("intentStandDownEnabled", "intent",
+                  "开 = 允许“站下”这一类：同专辑且在原队列里相邻的一对、"
+                      + "以及两边都数不准拍子的一对，直接按没有 AutoMix 的方式交接。"
+                      + "关 = 这条规则跳过，落到下一条。",
+                  \.intentStandDownEnabled),
+        boolField("intentRestrainedEnabled", "intent",
+                  "开 = 允许“克制”这一类：网格像真人鼓手一样漂、或者一堵墙声配上"
+                      + "不够硬的网格时，不对拍、叠加压到 neutral 档、且绝不出谱。",
+                  \.intentRestrainedEnabled),
+        boolField("intentDropAlignEnabled", "intent",
+                  "开 = 允许“对 drop”这一类：入曲有 drop 且两边网格都硬时，"
+                      + "仍然是 blend，但把叠加的终点对到 drop 上（出曲的尾巴叠在 build 上）。",
+                  \.intentDropAlignEnabled),
+        boolField("intentCutCultureEnabled", "intent",
+                  "开 = 允许“切的文化”这一类：两边网格都硬、且交接窗口里两边都基本没人唱时，"
+                      + "才允许给这一对写转场乐谱（正拍直切）。这是唯一能拿到谱的一类。",
+                  \.intentCutCultureEnabled),
+        field("intentEdgeWindowSeconds", "intent",
+              "意图层的各项统计取多长的“边缘窗口”：出曲取退场点之前这么多秒，"
+                  + "入曲取进点之后这么多秒。整首歌的平均值回答的是另一个问题。",
+              5, 90, 1, 0, \.intentEdgeWindowSeconds),
+        field("intentDrummerDriftCV", "intent",
+              "小节间隔的变异系数到这个数就算“真人在打拍子”，判为克制。"
+                  + "注意是【小节】不是【拍】：量化制作的小节网格在 0.7–3.4 %，"
+                  + "同一批歌的拍网格却有 5–13 %（掉一拍就少一整个间隔）。"
+                  + "调小 = 更容易判成摇滚、更克制。",
+              0.005, 0.2, 0.005, 3, \.intentDrummerDriftCV),
+        field("intentHardGridCV", "intent",
+              "小节间隔的变异系数低到这个数才算“网格够硬，可以在格点上动手”。"
+                  + "和上面那条之间故意留了一条模糊带，落在带子里的素材一律给今天的 blend。",
+              0.002, 0.1, 0.002, 3, \.intentHardGridCV),
+        field("intentWallFlatness", "intent",
+              "音色指纹的“平坦度”（0 = 形状集中在少数几个频带，1 = 均匀铺满 40 个带）"
+                  + "到这个数就算一堵墙声。墙声 + 网格不够硬 = 摇滚代理信号。"
+                  + "调小 = 更多曲子被判成墙、更克制。",
+              0.3, 1, 0.01, 2, \.intentWallFlatness),
+        field("intentWallOccupancy", "intent",
+              "还要求边缘窗口里有这么大比例的秒数是“响的”（≥ 窗口峰值的一半），"
+                  + "免得把安静的噪声段落当成吉他墙。",
+              0.3, 1, 0.01, 2, \.intentWallOccupancy),
+        field("intentInstrumentalEdgeRatio", "intent",
+              "交接窗口里的人声密度低于自己平常的这个倍数，才算“这头没人在唱”——"
+                  + "切的前提。比 vocalClashRatio 严得多：“没人唱”比“不会打架”强得多。",
+              0.1, 1.2, 0.05, 2, \.intentInstrumentalEdgeRatio),
+
+        // --- 高潮延长 + 人声悬崖。**不属于意图层**：这是选点上的修正，
+        // 意图层开不开都生效（语料证据见 `climaxExtendPostChorus` 的注释）。
+        boolField("climaxExtendPostChorus", "structure",
+                  "开 = 末段副歌之后如果紧跟着一个“只出现过一次、而且人声很密”的段落，"
+                      + "把禁切区一路延到那个段落结束——歌还没唱完。"
+                      + "末段副歌自己的结尾仍然是合法出点（区间在低端是开的）。",
+                  \.climaxExtendPostChorus),
+        field("climaxExtendVocalDensity", "structure",
+              "上面那个段落的人声密度要到这个数（1 = 这首歌的平均水平）才算“还在唱”。"
+                  + "纯器乐的尾巴不算，走都可以走。",
+              0.3, 2, 0.05, 2, \.climaxExtendVocalDensity),
+        boolField("preferVocalCliffOutPoints", "structure",
+                  "开 = 出点候选里，坐在“人声悬崖”上的（往后看人声密度掉下去）整体提到前面，"
+                      + "组内顺序不变。只重排、绝不删除，所以兜底列表原封不动。",
+                  \.preferVocalCliffOutPoints),
+        field("vocalCliffWindowSeconds", "structure",
+              "判断人声悬崖时，候选点前后各取多少秒来比。",
+              1, 20, 0.5, 1, \.vocalCliffWindowSeconds),
+        field("vocalCliffDrop", "structure",
+              "人声密度要跌掉这么多（以这首歌自己的平均值为单位）才算一道悬崖。"
+                  + "调小 = 更多候选被认成悬崖，重排更激进。",
+              0.05, 1.5, 0.05, 2, \.vocalCliffDrop),
+
         // --- Structure layer. 只在这首歌的分析里带着段落（v7 sidecar、分段器够有把握）
         // 时才被读到；没有段落的歌整块都不参与判断。
         boolField("useStructureOutPoints", "structure",

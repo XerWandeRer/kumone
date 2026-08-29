@@ -469,6 +469,114 @@ enum TransitionPlanner {
         /// it is a corpus question and corpus questions are P3's.
         var scoreAimMaxLeadSeconds: TimeInterval = 120
 
+        // --- Intent layer (P3, predev §2.4). See `TransitionIntent`.
+        //
+        // Ships dark: `intentEnabled` is **false**, and with it false the whole
+        // block is one nil check at the front door — no profile is computed, no
+        // rule is evaluated, and every decision, curve and rendered sample is
+        // field-for-field what it was before the layer existed.
+        //
+        // The thresholds below are all corpus questions (predev risk #6), and
+        // every one of them is set on the restrained side of what the cache
+        // says: a class that fires too rarely costs a missed gesture, a class
+        // that fires too often costs an offence.
+
+        /// Run the intent layer at all.
+        var intentEnabled: Bool = false
+        /// Per-class switches. A class turned off is *skipped*, so its pairs
+        /// fall through to the next rule — which is what makes each rule
+        /// independently sweepable and independently revertible. `blend` has no
+        /// switch because it is the fall-through itself.
+        var intentStandDownEnabled: Bool = true
+        var intentRestrainedEnabled: Bool = true
+        var intentDropAlignEnabled: Bool = true
+        var intentCutCultureEnabled: Bool = true
+        /// Seconds of material the edge statistics are taken over, ending at
+        /// the outgoing exit and starting at the incoming entry.
+        ///
+        /// 30 s is about ten to fifteen bars: long enough that a downbeat CV
+        /// has a dozen intervals to work with, short enough that it is still a
+        /// statement about *this* part of the song rather than about the album
+        /// it came from.
+        var intentEdgeWindowSeconds: TimeInterval = 30
+        /// Downbeat-interval CV at or above which the grid reads as a human
+        /// keeping time rather than a machine.
+        ///
+        /// **Bar intervals, not beat intervals**, and the whole threshold hangs
+        /// on the difference: P1 measured 5–13 % CV on the *beats* of rigidly
+        /// quantized dance tracks (a dropped beat costs a whole interval) and
+        /// 0.7–3.4 % on the same tracks' *bars*. The owner's cache agrees from
+        /// the other end: over 214 edge windows the bar CV runs 0.0 … 5.1 %
+        /// with a median of 1.0 % and a 95th percentile of 3.3 %, so 4 % sits
+        /// past where a produced pop library's grids end (1.4 % of windows
+        /// reach it) and well inside where a person keeping time lives. The
+        /// error is biased towards calling a drifting grid steady — which costs
+        /// a missed cut, not a mis-timed one.
+        var intentDrummerDriftCV: Double = 0.04
+        /// …and the CV at or below which a grid is hard enough to place a
+        /// gesture on. Deliberately far below the drift line rather than its
+        /// complement: between the two lies a band of material the layer
+        /// refuses to have an opinion about, and that band gets today's blend.
+        var intentHardGridCV: Double = 0.02
+        /// Normalized participation ratio of `melProfile` at or above which the
+        /// spectrum reads as a wall (see `MaterialProfile.flatness`).
+        ///
+        /// **Calibrated, and provisionally so.** Over the owner's 108-track
+        /// cache the statistic runs 0.29 … 0.75 with a median of 0.56 and a
+        /// 90th percentile of 0.69, so 0.70 is "flatter than nine tracks in
+        /// ten of this library". That cache contains no rock, which is exactly
+        /// the material the line is *for* — so this number is where a pop
+        /// distribution ends, not where a wall of guitars begins, and the
+        /// honest re-check is `audition intent` pointed at a rock-bearing
+        /// corpus. It is reachable rather than validated. The branch it feeds
+        /// also demands a grid we already mistrust, which is what keeps a
+        /// provisional line from doing provisional damage.
+        var intentWallFlatness: Double = 0.70
+        /// …and the share of the edge window that must be loud with it, so a
+        /// quiet noisy passage is not mistaken for a wall of guitars.
+        var intentWallOccupancy: Double = 0.85
+        /// Vocal activity, relative to the track's own mean, at or below which
+        /// an edge counts as instrumental — the precondition for cutting.
+        /// Well under `vocalClashRatio`: "nobody is singing here" is a much
+        /// stronger claim than "these two will not fight".
+        var intentInstrumentalEdgeRatio: Double = 0.5
+
+        // --- Climax extension + vocal cliff.
+        //
+        // **Not the intent layer.** These two are a correctness fix in cue
+        // selection and they apply to every class, intent on or off. They come
+        // from a marked-bad seam in the field corpus (track 476081904, cut at
+        // 204.7 s): the segmenter had `chorus 131.5–174.3`, then a *unique*,
+        // vocally dense passage 174.3–208.6, then the outro. The climax guard
+        // protected the sixteen bars before the last chorus and then stood
+        // aside, so the cut landed in the middle of the passage the singer was
+        // still finishing. The song's climax does not end where the chorus
+        // cluster does.
+
+        /// Extend the climax guard's forbidden window forward over a unique,
+        /// vocally dense section that follows the final chorus immediately.
+        var climaxExtendPostChorus: Bool = true
+        /// How dense that section's vocal has to be, in `vocalDensity` units
+        /// (1 = an average passage for this track). 0.9 keeps the extension to
+        /// passages the singer is genuinely still working in — an instrumental
+        /// tag or a repeat-out is not the climax and stays cuttable.
+        var climaxExtendVocalDensity: Double = 0.9
+        /// Prefer out-point candidates that sit on a **vocal cliff** — a drop
+        /// in `vocalActivity` looking forward across the candidate. This is the
+        /// same lesson from the other side: the right cut on that seam was
+        /// 208.6 s, where the voice stops, and the machinery had no way to
+        /// prefer it over 204.7 s where the voice is mid-phrase.
+        ///
+        /// A **stable** re-ordering, never a filter: candidates that sit on a
+        /// cliff move ahead of ones that do not, each group keeping its own
+        /// order, so nothing is ever removed and the fall-back list is intact.
+        var preferVocalCliffOutPoints: Bool = true
+        /// Seconds either side of a candidate the cliff is measured over.
+        var vocalCliffWindowSeconds: TimeInterval = 4
+        /// How far `vocalActivity` must fall across the candidate — in units of
+        /// the track's own mean — to count as a cliff.
+        var vocalCliffDrop: Double = 0.35
+
         // --- Structure layer (predev §2.3). Read *only* when the analysis on
         // the relevant side carries `sections` — a v7 sidecar the segmenter was
         // confident about. Every other track (older sidecar, ambient material,
@@ -559,6 +667,27 @@ enum TransitionPlanner {
         /// Ascending line-end timestamps of the **outgoing** track
         /// (`Audition.Lyrics.lineEnds`). Empty = no snapping.
         var outgoingLyricLineEnds: [TimeInterval] = []
+
+        /// The two tracks are on the same album (a real album, not the empty
+        /// `AlbumRef` a search result carries).
+        ///
+        /// Queue metadata, which is why it arrives here rather than being
+        /// sniffed: the planner sees two `TrackAnalysis` values and neither of
+        /// them knows what record it came from. Nothing but the intent layer
+        /// reads it, and with `intentEnabled` false nothing reads it at all.
+        var sameAlbum: Bool = false
+        /// …and the incoming track is the very next entry after the outgoing
+        /// one in the **listed** queue — the order as the user sees it, not the
+        /// shuffled or AutoMix-reordered one.
+        ///
+        /// Both halves are required for `standDown`: two tracks from one album
+        /// that a shuffle happened to put together are not an album in
+        /// sequence, and two adjacent playlist entries from different records
+        /// are not a work.
+        var listedAdjacent: Bool = false
+
+        /// The album-sequential test the intent layer's first rule turns on.
+        var albumSequential: Bool { sameAlbum && listedAdjacent }
 
         static let none = PlanContext()
     }
@@ -700,11 +829,72 @@ enum TransitionPlanner {
                                 ? " — every candidate was, so the guard stood down"
                                 : "")
                  } ?? "no final chorus to protect, so the guard never fires")
+        _ = note(&trace, .structure, "climaxExtension",
+                 candidates.climaxExtensionWindow == nil, nil, nil,
+                 candidates.climaxExtensionDetail
+                     ?? "nothing unique and vocally dense follows the final chorus, "
+                     + "so the no-cut zone ends where it always did")
+        _ = note(&trace, .structure, "vocalCliff", true,
+                 Double(candidates.vocalCliffPromoted), nil,
+                 candidates.vocalCliffPromoted > 0
+                     ? String(format: "%d candidate(s) sit where the voice stops and were "
+                              + "moved ahead of the ones that do not",
+                              candidates.vocalCliffPromoted)
+                     : "no candidate sits on a vocal cliff, so the order is unchanged")
         _ = note(&trace, .structure, "inPointSource", true, inChoice.point, nil,
                  (inChoice.section == nil ? "introEnd: " : "section: ") + inChoice.detail)
 
+        // --- Intent (P3, predev §2.4). The front door: what this pair is
+        // culturally *for*, decided before any family is chosen, so it can say
+        // which families and parameters are allowed at all.
+        //
+        // **Gates still win inside a family**, exactly as they win over aiming.
+        // Intent can take a family off the table (`restrained` refuses the
+        // beat-match, `standDown` refuses everything); it can never hand a pair
+        // a geometry the five signals, the tier or the climax guard refused.
+        // The reason the layer is allowed to *subtract* where aiming may only
+        // *choose* is that subtraction is the safe direction: the worst a wrong
+        // restraint can do is play today's shorter hand-over.
+        let intent: TransitionIntent? = config.intentEnabled
+            ? TransitionIntent.classify(
+                outgoing: outgoing, incoming: incoming,
+                // The edge windows, anchored on the geometry the candidate
+                // layer has already proposed — the best out-point candidate and
+                // the chosen in point. Not the final seam (that is what the
+                // beat-match search is about to decide), but the same part of
+                // each song to within a bar or two, and a whole-track statistic
+                // would answer a different question entirely.
+                outgoingEdge: .outgoing(outgoing,
+                                        exitAt: candidates.points.first
+                                            ?? outgoing.outroFadeStart ?? outgoing.duration,
+                                        config: config),
+                incomingEdge: .incoming(incoming, entryAt: inChoice.point, config: config),
+                context: context, config: config)
+            : nil
+        if let intent {
+            _ = note(&trace, .intent, "intentClass", intent.class != .standDown,
+                     intent.budget, nil, intent.label)
+        }
+        // `standDown` **is** the plain path, not a shorter version of the
+        // AutoMix one: `.plain(.gapless)` is precisely what this function
+        // returns for a pair with no analysis and for a track under the
+        // duration floor, and it is what the iOS build and the AutoMix-off
+        // player do for every seam. Tail to head, no overlap, no ride, no
+        // style — the most conservative path that already exists, reused rather
+        // than re-invented.
+        if intent?.class == .standDown {
+            var style = TransitionStyle.plain
+            style.intent = intent
+            return PlannedTransition(plan: .gapless, style: style)
+        }
+        // `restrained` keeps the crossfade family only. It does not demote the
+        // tier — a compatible pair still gets the staged EQ crossfade, which is
+        // the "staged crossfade" half of the rule — it simply refuses the
+        // beat-match and caps the window at the neutral overlap.
+        let restrained = intent?.class == .restrained
+
         var matched: (plan: BeatMatchedPlan, stem: StemTechnique?)?
-        if tier == .compatible {
+        if tier == .compatible, !restrained {
             matched = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
                                       candidates: candidates.points, inAnchor: inChoice.point,
                                       stems: stems, config: config, trace: &trace)
@@ -760,7 +950,8 @@ enum TransitionPlanner {
             // path may perform. Off by default, so this is nil on every
             // shipped decision and the style is field-for-field what it was.
             style.score = score(outgoing: outgoing, incoming: incoming,
-                                context: context, config: config)
+                                context: context, intent: intent, config: config)
+            style.intent = intent
             // Deliberately *not* a `PlanTrace` gate: the trace's stages are the
             // chain that decides whether a pair hands over at all, and a score
             // decides nothing — it is offered on top of a plan already made.
@@ -773,10 +964,23 @@ enum TransitionPlanner {
             // seam instead of some number of phrase lines past it. It runs
             // only under a score, so with `scoreEnabled` down this whole block
             // is a nil check and the plan is what it was.
+            //
+            // Aiming runs under a score (P2) — and, since P3, under
+            // `dropAlign` too, where the pair gets no score at all. The
+            // difference between the two is one word: a scored seam wants the
+            // target *on* the seam, because a cut is only motivated if the
+            // thing it cuts to is the thing the listener came for; a blend
+            // wants the target on the **end of the overlap**, so the outgoing
+            // tail lies over the build and the hand-over completes on the drop
+            // (predev §2.3). Same aiming machinery, same gates re-run, two
+            // landings.
             var plan = matched.plan
-            if style.score != nil {
+            let landing: TransitionAim.Landing? = style.score != nil
+                ? .seam
+                : (intent?.class == .dropAlign ? .overlapEnd : nil)
+            if let landing {
                 let aimed = aim(plan: plan, outgoing: outgoing, incoming: incoming,
-                                config: config)
+                                landing: landing, config: config)
                 style.aim = aimed.aim
                 style.aimDetail = aimed.detail
                 if aimed.aim != nil, aimed.inPoint != plan.inPoint {
@@ -790,12 +994,17 @@ enum TransitionPlanner {
             return finish(PlannedTransition(plan: .beatMatched(plan), style: style,
                                             rideDB: s.rideDB))
         }
-        let cap: TimeInterval
+        var cap: TimeInterval
         switch tier {
         case .compatible: cap = config.maxOverlap
         case .neutral: cap = config.neutralOverlapCap
         case .clash: cap = config.clashOverlapCap
         }
+        // Restraint's second half: the neutral cap, whatever the tier says.
+        // A rock pair that clears every signal is exactly the pair this rule
+        // exists for — the gates are about damage, and dissolving a rock track
+        // does no damage the signals can see.
+        if restrained { cap = Swift.min(cap, config.neutralOverlapCap) }
         let crossfade = crossfadePlan(outgoing: outgoing, incoming: incoming,
                                       candidates: candidates.points, inPoint: inChoice.point,
                                       tierCap: cap, tier: tier, stems: stems, config: config)
@@ -806,6 +1015,7 @@ enum TransitionPlanner {
         var style = crossfadeStyle(tier: tier, outgoing: outgoing,
                                    plan: crossfade.plan, config: config)
         style.stemTechnique = crossfade.stem
+        style.intent = intent
         // The ride only makes sense over an overlap — it *is* the seconds the
         // two decks share, held at a corrected level. A `.gapless` seam has no
         // such window (and `.plain(.gapless)`, the AutoMix-off / iOS path, must
@@ -824,12 +1034,23 @@ enum TransitionPlanner {
     /// as a marker and `ScoreCompiler` places it — the same division of labour
     /// `.vocalExchange` has, one level up.
     ///
-    /// P1 keeps the selection rule deliberately thin: gates only, no material
-    /// semantics. The gesture budget the predev's §2.4 describes is P3's, and
-    /// inventing half of it here would be a rule nobody has listened to yet.
+    /// P1 kept the selection rule deliberately thin: gates only, no material
+    /// semantics. P3 adds the semantics as a **veto, never a licence** — the
+    /// gates below are unchanged and still have to pass, and on top of them the
+    /// intent layer must have said `cutCulture`. So turning the intent layer on
+    /// can only ever *remove* scores, which is the direction a layer nobody has
+    /// listened to yet is allowed to move things in.
+    ///
+    /// `restrained` and `standDown` never get a score (`standDown` never
+    /// reaches here at all — it returned gapless at the front door), and
+    /// neither do `blend` and `dropAlign`: `dropAlign` is the blend family with
+    /// an aimed overlap end, and a drop worth landing on is not by itself
+    /// permission to cut into it.
     static func score(outgoing: TrackAnalysis, incoming: TrackAnalysis,
-                      context: PlanContext, config: Config) -> TransitionScore? {
+                      context: PlanContext, intent: TransitionIntent? = nil,
+                      config: Config) -> TransitionScore? {
         guard config.scoreEnabled else { return nil }
+        if config.intentEnabled, intent?.class != .cutCulture { return nil }
         // Both grids confident enough to cut on, and long enough to address:
         // a cut half a beat out is the one error the gesture cannot survive.
         guard outgoing.bpmConfidence >= config.scoreMinBPMConfidence,
@@ -873,7 +1094,9 @@ enum TransitionPlanner {
     /// failure means no aim rather than an aim that overrode them. An aim is a
     /// preference among geometries the gates already pass.
     static func aim(plan p: BeatMatchedPlan, outgoing: TrackAnalysis,
-                    incoming: TrackAnalysis, config: Config) -> AimOutcome {
+                    incoming: TrackAnalysis,
+                    landing: TransitionAim.Landing = .seam,
+                    config: Config) -> AimOutcome {
         func unaimed(_ why: String) -> AimOutcome {
             AimOutcome(aim: nil, inPoint: p.inPoint, detail: why)
         }
@@ -938,7 +1161,11 @@ enum TransitionPlanner {
         let glide = TransitionAutomation.incomingGlide(for: .beatMatched(p), geometry: geometry)
         let clock = StemTechniqueLayer.SourceClock(
             rate: Double(max(0.5, min(2, p.incomingRate))), glide: glide)
-        let advance = clock.sourceAdvance(to: geometry.swapOffset)
+        // Which instant of the *hand-over* the target is being made to land on:
+        // the swap point for a cut (the seam), the end of the overlap for a
+        // blend. Read on the incoming deck's own clock either way.
+        let landingOffset = landing == .seam ? geometry.swapOffset : geometry.overlapDuration
+        let advance = clock.sourceAdvance(to: landingOffset)
         let leadBars = max(1, Int((advance / max(bar, 0.05)).rounded()))
         guard index - leadBars >= 0 else {
             return unaimed(String(format: "the %@ at %.2f s is fewer than %d bars into the track",
@@ -968,11 +1195,13 @@ enum TransitionPlanner {
         }
 
         return AimOutcome(
-            aim: TransitionAim(target: target.0, time: aimTime, leadBars: leadBars),
+            aim: TransitionAim(target: target.0, time: aimTime, leadBars: leadBars,
+                               landing: landing),
             inPoint: entry,
-            detail: String(format: "%@ at %.2f s lands on the seam; the incoming deck is "
+            detail: String(format: "%@ at %.2f s lands on %@; the incoming deck is "
                            + "entered %d bars earlier at %.2f s (was %.2f s)",
-                           target.0.rawValue, aimTime, leadBars, entry, p.inPoint))
+                           target.0.rawValue, aimTime, landing.label,
+                           leadBars, entry, p.inPoint))
     }
 
     // MARK: - Decision ledger
@@ -1453,6 +1682,17 @@ enum TransitionPlanner {
         /// The forbidden window, and how many candidates fell inside it.
         var guardWindow: (start: TimeInterval, end: TimeInterval)?
         var guardRejected = 0
+        /// **The climax extension**: the second forbidden window, covering a
+        /// unique, vocally dense passage that follows the final chorus
+        /// immediately — the song still finishing what it came to say. Open at
+        /// the low end, so the final chorus's own end (the best candidate there
+        /// is) stays legal and only the passage after it is protected.
+        var climaxExtensionWindow: (start: TimeInterval, end: TimeInterval)?
+        /// One sentence about why the extension is what it is, for the trace.
+        var climaxExtensionDetail: String?
+        /// How many candidates were moved up because they sit on a vocal
+        /// cliff, and how many were considered.
+        var vocalCliffPromoted = 0
         /// Every candidate was inside the guard window, so the guard was
         /// dropped: a transition still has to happen somewhere.
         var guardFellBack = false
@@ -1530,16 +1770,23 @@ enum TransitionPlanner {
         var result = OutPointCandidates()
         let sections = config.useStructureOutPoints ? usableSections(a, config: config) : nil
         let lineEnds = config.lyricSnapMaxSeconds > 0 ? context.outgoingLyricLineEnds : []
-        // Nothing to add and nothing to move: hand back the exact array the
-        // three searches have always filtered, in its exact order.
-        guard sections != nil || !lineEnds.isEmpty else {
-            result.points = a.phraseBoundaries
-            return result
-        }
-
         let tolerance = a.bpmConfidence >= config.bpmConfidenceThreshold && a.bpm > 0
             ? 60 / a.bpm : 1.0
         var candidates: [(time: TimeInterval, structural: Bool)] = []
+        // Nothing to add and nothing to move: hand back the exact array the
+        // three searches have always filtered, in its exact order.
+        //
+        // The vocal-cliff pass still runs over it — that is the point of the
+        // pass. It is not a structure feature: it reads `vocalActivity`, which
+        // every v5 sidecar carries, so a track with no sections and no lyrics
+        // is exactly the track that most needs somebody to notice where the
+        // singing stops. Nothing is added or removed either way.
+        guard sections != nil || !lineEnds.isEmpty else {
+            result.points = preferringVocalCliffs(
+                a.phraseBoundaries.map { (time: $0, structural: false) },
+                of: a, into: &result, config: config).map(\.time)
+            return result
+        }
         func push(_ t: TimeInterval, structural: Bool) {
             guard t.isFinite, t > 0 else { return }
             guard !candidates.contains(where: { abs($0.time - t) <= tolerance }) else { return }
@@ -1582,13 +1829,37 @@ enum TransitionPlanner {
             candidates = snapped
         }
 
+        // --- The climax extension. Computed before the guard because the two
+        // are filtered together: a hand-over still has to happen, so if the two
+        // windows between them leave nothing, both stand down rather than one.
+        if config.climaxExtendPostChorus, let sections, let final = finalClimax(sections) {
+            let extension_ = climaxExtension(sections, after: final, config: config)
+            if let extension_ {
+                result.climaxExtensionWindow = (start: final.end, end: extension_.end)
+                result.climaxExtensionDetail = extension_.detail
+            }
+        }
+
         if let climaxStart = result.climaxStart,
-           config.climaxGuardBarsBefore > 0 || config.climaxGuardBarsAfter > 0 {
+           config.climaxGuardBarsBefore > 0 || config.climaxGuardBarsAfter > 0
+               || result.climaxExtensionWindow != nil {
             let bar = barLength(a, config: config)
             let window = (start: climaxStart - Double(config.climaxGuardBarsBefore) * bar,
                           end: climaxStart + Double(config.climaxGuardBarsAfter) * bar)
             result.guardWindow = window
-            let kept = candidates.filter { !($0.time >= window.start && $0.time < window.end) }
+            let tolerance2 = tolerance
+            let extended = result.climaxExtensionWindow
+            let kept = candidates.filter { candidate in
+                let t = candidate.time
+                if t >= window.start && t < window.end { return false }
+                // Open at the low end: `final.end` itself is the one cut nobody
+                // argues with, and the extension exists to protect what comes
+                // *after* it, not to take it away.
+                if let extended, t > extended.start + tolerance2, t < extended.end - tolerance2 {
+                    return false
+                }
+                return true
+            }
             result.guardRejected = candidates.count - kept.count
             // A hand-over has to happen: if the guard would leave the search
             // with nothing, it loses. Traced, because "we cut right before the
@@ -1600,9 +1871,103 @@ enum TransitionPlanner {
             }
         }
 
+        candidates = preferringVocalCliffs(candidates, of: a, into: &result, config: config)
+
         result.points = candidates.map(\.time)
         result.structuralCount = candidates.filter(\.structural).count
         return result
+    }
+
+    /// **Vocal cliff preference.** A *stable partition*, never a filter:
+    /// candidates that sit where the voice stops move ahead of ones that do
+    /// not, each group keeping its own order. Nothing is removed, so the
+    /// fall-back list is intact and no gate can see this layer at all — the
+    /// same safety argument the rest of the structure layer makes.
+    private static func preferringVocalCliffs(
+        _ candidates: [(time: TimeInterval, structural: Bool)], of a: TrackAnalysis,
+        into result: inout OutPointCandidates, config: Config
+    ) -> [(time: TimeInterval, structural: Bool)] {
+        guard config.preferVocalCliffOutPoints, !a.vocalActivity.isEmpty else { return candidates }
+        var cliffs: [(time: TimeInterval, structural: Bool)] = []
+        var rest: [(time: TimeInterval, structural: Bool)] = []
+        for candidate in candidates {
+            if vocalCliff(a, at: candidate.time, config: config) != nil {
+                cliffs.append(candidate)
+            } else {
+                rest.append(candidate)
+            }
+        }
+        guard !cliffs.isEmpty, !rest.isEmpty else { return candidates }
+        result.vocalCliffPromoted = cliffs.count
+        return cliffs + rest
+    }
+
+    /// **The climax does not end where the chorus cluster does.**
+    ///
+    /// Field evidence, one seam: track 476081904 was segmented `chorus
+    /// 131.5–174.3`, then a passage 174.3–208.6 that happens exactly once
+    /// (`repetition == 1`, so the segmenter files it as a bridge) and whose
+    /// `vocalDensity` is 1.03 — the singer is still working, at above the
+    /// track's own average — then the outro. The guard protected the sixteen
+    /// bars *before* the last chorus and then stood aside, so the hand-over
+    /// landed at 204.7 s, four seconds from the end of a phrase nobody had
+    /// finished. The listener marked it bad, and was right to.
+    ///
+    /// So the no-cut zone runs on past the final chorus for as long as unique,
+    /// vocally dense sections follow it directly. Three conditions, all
+    /// necessary: **unique**, because a repeat-out is the song saying something
+    /// it has already said; **vocally dense**, because an instrumental tag is
+    /// a fine place to leave; and **immediately after**, because a dense verse
+    /// two sections later is a different part of the song.
+    ///
+    /// Returns nil — no extension — whenever any of the three fails, which is
+    /// the ordinary case.
+    private static func climaxExtension(
+        _ sections: [TrackAnalysis.Section], after final: TrackAnalysis.Section,
+        config: Config
+    ) -> (end: TimeInterval, detail: String)? {
+        let ordered = sections.sorted { $0.start < $1.start }
+        guard let index = ordered.firstIndex(where: { abs($0.start - final.start) < 1e-6 })
+        else { return nil }
+        var end = final.end
+        var taken: [TrackAnalysis.Section] = []
+        for section in ordered[(index + 1)...] {
+            guard abs(section.start - end) < 1e-3 else { break }
+            guard section.repetition == 1,
+                  Double(section.vocalDensity) >= config.climaxExtendVocalDensity,
+                  !isClimax(section.kind), section.kind != .outro
+            else { break }
+            taken.append(section)
+            end = section.end
+        }
+        guard !taken.isEmpty else { return nil }
+        return (end, String(format: "the final %@ ends at %.2f s but %@ follows it — "
+                            + "unique, vocal density %.2f against a %.2f line — so the no-cut "
+                            + "zone runs to %.2f s",
+                            final.kind.rawValue, final.end,
+                            taken.map(\.kind.rawValue).joined(separator: "+"),
+                            Double(taken.map(\.vocalDensity).max() ?? 0),
+                            config.climaxExtendVocalDensity, end))
+    }
+
+    /// **A vocal cliff**: how far `vocalActivity` falls across `t`, in units of
+    /// the track's own mean, or nil when it does not fall far enough to matter.
+    ///
+    /// The other half of the same lesson. The right cut on that seam was
+    /// 208.6 s — the outro's downbeat, where the voice stops — and nothing in
+    /// the candidate ordering could prefer it over 204.7 s, where the voice is
+    /// mid-phrase, because the ordering only knows about section boundaries and
+    /// RMS jumps. A voice stopping is the most audible full stop a song has.
+    static func vocalCliff(
+        _ a: TrackAnalysis, at t: TimeInterval, config: Config
+    ) -> Double? {
+        let window = config.vocalCliffWindowSeconds
+        guard window > 0,
+              let before = vocalScore(a, from: max(0, t - window), length: window),
+              let after = vocalScore(a, from: t, length: window)
+        else { return nil }
+        let drop = before - after
+        return drop >= config.vocalCliffDrop ? drop : nil
     }
 
     /// The last entry of an ascending array that is at or before `t`.

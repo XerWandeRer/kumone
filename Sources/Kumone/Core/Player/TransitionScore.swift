@@ -78,21 +78,51 @@ public struct TransitionAim: Codable, Equatable, Sendable {
         case core
     }
 
+    /// **Which instant of the hand-over the target is made to land on.**
+    ///
+    /// P1/P2 had only one answer, because only a score aimed: the seam. P3's
+    /// `dropAlign` class aims a *blend*, and a blend's arrival is not its seam
+    /// — it is the end of the overlap, with the outgoing tail lying over the
+    /// incoming build and the hand-over completing on the drop (predev §2.3
+    /// point 2). Two landings, one aiming machinery, and the gates below are
+    /// re-run identically for both.
+    public enum Landing: String, Codable, Sendable {
+        /// The bass-swap point: the cut's "the one".
+        case seam
+        /// The end of the overlap: the blend's arrival.
+        case overlapEnd
+
+        public var label: String {
+            switch self {
+            case .seam: return "the seam"
+            case .overlapEnd: return "the end of the overlap"
+            }
+        }
+    }
+
     public var target: Target
     /// The instant on the **incoming track's own clock** the seam is aimed at.
     public var time: TimeInterval
     /// How many bars of the incoming track are played, silently under the
-    /// outgoing one, before the seam reaches `time`.
+    /// outgoing one, before the landing point reaches `time`.
     public var leadBars: Int
+    /// Defaulted to `.seam` so every P1/P2 call site, fixture and decoded
+    /// sidecar means exactly what it meant before the case existed.
+    public var landing: Landing = .seam
 
-    public init(target: Target, time: TimeInterval, leadBars: Int) {
+    public init(target: Target, time: TimeInterval, leadBars: Int,
+                landing: Landing = .seam) {
         self.target = target
         self.time = time
         self.leadBars = leadBars
+        self.landing = landing
     }
 
     /// `drop@84.00s` — how the console, the panel and the seam history name it.
-    public var label: String { String(format: "%@@%.2fs", target.rawValue, time) }
+    public var label: String {
+        String(format: "%@@%.2fs", target.rawValue, time)
+            + (landing == .seam ? "" : "→overlapEnd")
+    }
 
     /// The one line a report prints, aimed or not. The unaimed case is spelled
     /// out rather than omitted: "we did not aim" is the interesting half of the
