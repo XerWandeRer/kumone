@@ -34,6 +34,17 @@ enum OfflineTransitionRenderer {
         /// render, with the reason reported in `Result.stemFallbackReason`.
         var vocalStemProvider: VocalStemProvider? = nil
 
+        /// The compiled audio side of a `TransitionScore`: two whole-mix gain
+        /// lanes and, when the score throws one, a delay directive
+        /// (`ScoreCompiler`). Nil — the default, and every render that has
+        /// never heard of a score — leaves this whole path unread.
+        ///
+        /// **Nothing here separates anything.** A score-only segment costs one
+        /// render pass (~1 s) and never touches `vocalStemProvider`, which is
+        /// the entire point: a full-band gesture does not need stems, and
+        /// paying 30 s of separation for one silent beat would be absurd.
+        var mixLanes: WholeMixLanes? = nil
+
         /// Per-deck loudness compensation, in dB, exactly as the live player
         /// would apply it (`LoudnessCompensation`). Multiplied into every fader
         /// write, so what the render sounds like is what the product does.
@@ -158,6 +169,11 @@ enum OfflineTransitionRenderer {
         /// render is a plain whole-mix one and says so out loud, rather than
         /// silently sounding like something the caller did not ask for.
         var stemFallbackReason: String? = nil
+        /// The render performed a score's whole-mix lanes.
+        var scoreLanesApplied = false
+        /// Why it did not, when it was asked to. Non-nil means the file holds
+        /// the plain blend — never a half-performed score.
+        var scoreFallbackReason: String? = nil
 
         var realtimeFactor: Double { renderSeconds > 0 ? duration / renderSeconds : .infinity }
     }
@@ -215,6 +231,11 @@ enum OfflineTransitionRenderer {
         var rideReleaseSeconds: TimeInterval
         var stemApplied: StemTechniqueLayer.Applied?
         var stemFallbackReason: String?
+        /// The whole-mix lanes this render performed, when it was handed any.
+        /// Nil means the score did not play — the mix is the plain blend, and
+        /// `scoreFallbackReason` says why.
+        var lanesApplied: WholeMixLaneLayer.Applied?
+        var scoreFallbackReason: String?
 
         /// Source position of one deck at `offset`, linearly interpolated
         /// between breakpoints and clamped to the ends.
@@ -265,7 +286,9 @@ enum OfflineTransitionRenderer {
                       stemSeparatedSides: mix.stemApplied?.separatedSides ?? [],
                       stemVocalEnergyRatio: mix.stemApplied?.vocalEnergyRatio,
                       stemCacheHit: mix.stemApplied?.cacheHit ?? false,
-                      stemFallbackReason: mix.stemFallbackReason)
+                      stemFallbackReason: mix.stemFallbackReason,
+                      scoreLanesApplied: mix.lanesApplied != nil,
+                      scoreFallbackReason: mix.scoreFallbackReason)
     }
 
     /// Render a transition into memory. This is the whole computation — the
@@ -291,6 +314,12 @@ enum OfflineTransitionRenderer {
                 planned.plan, geometry: geometry)
         }
         if planned.style.outroEffect == .echoOut, geometry.overlapDuration > 0 {
+            settleDuration = max(settleDuration, TransitionAutomation.echoTailDuration)
+        }
+        // A score's echo throw rings past the seam exactly as `.echoOut`'s does
+        // — the outgoing deck is cut, the tail is not — so it needs the same
+        // settling window to decay in.
+        if options.mixLanes?.echoThrow != nil, geometry.overlapDuration > 0 {
             settleDuration = max(settleDuration, TransitionAutomation.echoTailDuration)
         }
 
@@ -381,6 +410,8 @@ enum OfflineTransitionRenderer {
         var written: AVAudioFrameCount = 0
         var stemApplied: StemTechniqueLayer.Applied?
         var stemFallback: String?
+        var lanesApplied: WholeMixLaneLayer.Applied?
+        var scoreFallback: String?
         var endRideDB: Double = 0
 
         // Where the two source tracks are as the mix plays. A deck consumes
@@ -409,6 +440,9 @@ enum OfflineTransitionRenderer {
         if case .gapless = planned.plan {
             if planned.style.stemTechnique != nil {
                 stemFallback = StemTechniqueLayer.StemError.noOverlap.errorDescription
+            }
+            if options.mixLanes != nil {
+                scoreFallback = WholeMixLaneLayer.LaneError.noOverlap.errorDescription
             }
             // Tail-to-head: play out the end of the outgoing track, then start
             // the incoming one on the very next sample.
@@ -522,6 +556,38 @@ enum OfflineTransitionRenderer {
                 }
             }
 
+            // --- Score layer: two whole-mix gain lanes, applied to the same
+            // source buffers and in the same place, but per sample and without
+            // separating anything. A cut edge has to land on the frame the
+            // compiler named; 50 Hz control points would put it within 20 ms of
+            // it, which is the flam the score model exists to avoid.
+            if let lanes = options.mixLanes, !lanes.isPassThrough {
+                var outgoingRate = 1.0
+                var incomingRate = 1.0
+                if case .beatMatched(let p) = planned.plan {
+                    outgoingRate = Double(p.outgoingRate)
+                    incomingRate = Double(p.incomingRate)
+                }
+                do {
+                    lanesApplied = try WholeMixLaneLayer.apply(
+                        lanes,
+                        outgoing: StemTechniqueLayer.Side(
+                            buffer: outBuffer, source: outgoingURL, windowStart: outStart,
+                            overlapStartFrame: Int((preRoll * sampleRate).rounded()),
+                            rate: outgoingRate),
+                        incoming: StemTechniqueLayer.Side(
+                            buffer: inBuffer, source: incomingURL,
+                            windowStart: inPoint, overlapStartFrame: 0,
+                            rate: incomingRate,
+                            glide: TransitionAutomation.incomingGlide(
+                                for: planned.plan, geometry: geometry)),
+                        overlap: overlap)
+                } catch {
+                    scoreFallback = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                }
+            }
+
             // --- Pre-roll: the outgoing track alone, chain transparent.
             outgoingSource = outStart
             incomingSource = inPoint
@@ -596,13 +662,38 @@ enum OfflineTransitionRenderer {
             var elapsed: TimeInterval = 0
             var echoThrown = false
             let tickSeconds = Double(tickFrames) / sampleRate
+            // A score that owns the gain law replaces the blend rather than
+            // decorating it: the cut *is* the hand-over, and cutting a deck the
+            // staged EQ has already stripped of its highs and mids would cut
+            // something that was barely there. So both decks' faders and EQ go
+            // neutral and the lanes — already burnt into the source buffers —
+            // say everything. The rates still come from the plan: a cut on the
+            // one is only on the one if the two grids are still matched.
+            let scoreOwnsGain = lanesApplied != nil && (options.mixLanes?.ownsGainLaw ?? false)
+            let throwDirective = lanesApplied != nil ? options.mixLanes?.echoThrow : nil
             while elapsed < overlap {
-                let frame = TransitionAutomation.frame(
+                var frame = TransitionAutomation.frame(
                     plan: planned.plan, style: planned.style,
                     elapsed: elapsed, geometry: geometry,
                     // The stem layer has already rewritten the source buffers,
                     // so the live stand-in for it must not run as well.
                     approximateStems: stemApplied == nil)
+                if scoreOwnsGain {
+                    let rates = (outgoing: frame.outgoing.rate, incoming: frame.incoming.rate)
+                    frame.outgoing = TransitionAutomation.DeckParameters()
+                    frame.incoming = TransitionAutomation.DeckParameters()
+                    frame.outgoing.rate = rates.outgoing
+                    frame.incoming.rate = rates.incoming
+                    if let throwDirective, elapsed >= throwDirective.throwAt {
+                        // The lane cuts the *source*, upstream of this delay, so
+                        // the tail outlives the track it came from — the same
+                        // reason `.echoOut` never cuts with the fader.
+                        frame.outgoing.delayTime = throwDirective.delayTime
+                        frame.outgoing.delayWetDryMix = throwDirective.wetDryMix
+                        frame.outgoing.delayFeedback = throwDirective.feedback
+                        frame.echoThrown = true
+                    }
+                }
                 from.apply(frame.outgoing)
                 to.apply(frame.incoming)
                 if frame.echoThrown { echoThrown = true }
@@ -713,7 +804,8 @@ enum OfflineTransitionRenderer {
                    outgoing: outgoingTimeline, incoming: incomingTimeline,
                    rideDB: rideDB, rideDBAtEnd: endRideDB,
                    rideReleaseSeconds: rideRelease,
-                   stemApplied: stemApplied, stemFallbackReason: stemFallback)
+                   stemApplied: stemApplied, stemFallbackReason: stemFallback,
+                   lanesApplied: lanesApplied, scoreFallbackReason: scoreFallback)
     }
 
     // MARK: - Output normalization and write-out

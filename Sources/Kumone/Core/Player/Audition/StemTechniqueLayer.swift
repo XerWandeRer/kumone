@@ -104,6 +104,34 @@ enum StemTechniqueLayer {
         }
     }
 
+    /// One deck's overlap-time → source-time map, with no audio attached.
+    ///
+    /// Split out of `Side` because two callers need the arithmetic without
+    /// having a buffer to hand: the score compiler places a grid position on
+    /// the overlap clock before anything is loaded, and its inverse is how a
+    /// downbeat in the incoming song's own timeline becomes "+7.31 s into the
+    /// overlap". One copy of the map, so the compiler and the renderer cannot
+    /// disagree about where a cut lands.
+    struct SourceClock: Sendable, Equatable {
+        /// Playback rate this deck runs at during the overlap.
+        var rate: Double
+        /// The deck's post-swap walk back to unity, when it has one.
+        var glide: TransitionAutomation.IncomingGlide?
+
+        /// Source seconds consumed in the first `elapsed` seconds of the overlap.
+        func sourceAdvance(to elapsed: TimeInterval) -> TimeInterval {
+            glide?.sourceAdvance(to: elapsed) ?? elapsed * rate
+        }
+
+        /// The inverse: the overlap-relative instant at which the deck is
+        /// `source` seconds into its window.
+        func overlapElapsed(atSource source: TimeInterval,
+                            within limit: TimeInterval) -> TimeInterval {
+            guard let glide else { return rate > 0 ? source / rate : 0 }
+            return glide.overlapElapsed(atSource: source, within: limit)
+        }
+    }
+
     /// One deck's window, as the envelope path needs to see it.
     ///
     /// `overlapStartFrame` differs between the two by construction: the
@@ -132,10 +160,13 @@ enum StemTechniqueLayer {
         /// arithmetic exactly as it was.
         var glide: TransitionAutomation.IncomingGlide? = nil
 
+        /// This deck's overlap↔source map, without the audio.
+        var clock: SourceClock { SourceClock(rate: rate, glide: glide) }
+
         /// Source seconds this deck consumes in the first `elapsed` seconds of
         /// the overlap.
         func sourceAdvance(to elapsed: TimeInterval) -> TimeInterval {
-            glide?.sourceAdvance(to: elapsed) ?? elapsed * rate
+            clock.sourceAdvance(to: elapsed)
         }
     }
 
