@@ -741,8 +741,11 @@ final class PlayerService: ObservableObject {
         prefetchedNext = nil
         currentAnalysis = nil
         currentLocalURL = nil
-        // A new track is a new decision round for the queue-order mode.
+        // A new track is a new decision round for the queue-order mode: the
+        // escalation restarts from nothing admitted, on top of the (now
+        // richer) pool of everything analyzed so far.
         autoMixPickCommitted = false
+        queueOrderSelector?.beginPick()
         AutoMixDebugModel.shared.clearNext()
         isBuffering = false
         enginePaused = false
@@ -1044,6 +1047,9 @@ final class PlayerService: ObservableObject {
         // time to be downloaded, analyzed and armed.
         if autoMixPickPending {
             prefetchTask?.cancel()
+            // Nilled, not just cancelled, so `autoMixMayDownload` can read it
+            // as the truthful "no playback-quality transfer is running".
+            prefetchTask = nil
             prefetchedNext = nil
             AutoMixDebugModel.shared.setNextTitle(
                 nil, stage: .deferred("AutoMix order is still choosing"))
@@ -1617,7 +1623,8 @@ final class PlayerService: ObservableObject {
             AutoMixDebugModel.shared.setOrder(AutoMixDebugOrder(mode: queueOrder.rawValue))
             return
         }
-        let pool = selector.pool(remaining: autoMixRemaining())
+        let remaining = autoMixRemaining()
+        let pool = selector.pool(remaining: remaining)
         // While the pick is pending, re-score for display. This does not age
         // anything — `noteRound` is the only thing that moves a counter — so
         // previewing is free of consequence, and after the commit the table is
@@ -1652,8 +1659,9 @@ final class PlayerService: ObservableObject {
         }
         AutoMixDebugModel.shared.setOrder(AutoMixDebugOrder(
             mode: queueOrder.rawValue, state: state,
-            poolSize: pool.count,
-            analyzed: pool.filter(selector.hasAnalysis).count,
+            poolSize: remaining.count,
+            analyzed: pool.count,
+            rounds: selector.rounds, downloads: selector.downloadsThisPick,
             deadline: duration > 0 ? autoMixDeadline : nil,
             candidates: candidates))
     }
@@ -1937,21 +1945,51 @@ final class PlayerService: ObservableObject {
         // the list already points at.
         guard remaining.count > 1 else { return commitAutoMixPick(nil, pool: []) }
 
-        let pool = selector.pool(remaining: remaining)
-        selector.ensureCandidates(pool)
-
         let atDeadline = duration > 0 && progress >= autoMixDeadline
         // Scoring against a missing outgoing analysis is not scoring: every
-        // candidate comes back `.gapless` and the order would be pure aging.
-        // So the pick waits for the playing track's own analysis too — up to
-        // the deadline, where the list order takes over.
-        guard atDeadline || (currentAnalysis != nil && selector.isSettled(pool)) else { return }
+        // candidate comes back `.gapless`, so "is this one good enough" has no
+        // answer and the escalation would have nothing to steer by. Until the
+        // playing track's own analysis lands, acquisition is limited to the
+        // free half — the disk scan — and the deadline still takes over.
+        guard currentAnalysis != nil || atDeadline else {
+            selector.acquire(remaining: remaining, mayDownload: false)
+            return
+        }
+
+        let pool = selector.pool(remaining: remaining)
         let winner = selector.pick(
             outgoing: currentTrack, outgoingAnalysis: currentAnalysis, pool: pool,
             plannerConfig: plannerConfig,
             outgoingLyricLineEnds: currentLocalURL
                 .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
-        commitAutoMixPick(winner, pool: pool)
+        // Good enough is good enough: the tier is the dominant term, so a
+        // further round can only buy a *higher* tier or a second-order
+        // reshuffle inside this one — not worth another download and another
+        // minute of waiting.
+        if atDeadline || selector.lastPickSatisfies {
+            return commitAutoMixPick(winner, pool: pool)
+        }
+        // Nothing satisfies yet: open the next round, unless the queue is
+        // spent — in which case the best analyzed candidate is the answer, and
+        // a nil one honestly leaves the list order alone.
+        if selector.acquire(remaining: remaining,
+                            mayDownload: autoMixMayDownload) == .exhausted {
+            commitAutoMixPick(winner, pool: pool)
+        }
+    }
+
+    /// Whether the escalation may open a transfer right now.
+    ///
+    /// The politeness rule (predev §2.2's budget of one): candidate downloads
+    /// are background work and never compete with audio that is about to play,
+    /// or is playing. `prefetchTask` is the playback-quality fetch of the
+    /// *chosen* next track — while the pick is pending `schedulePrefetch` has
+    /// already stood it down, so this is nil then by construction — and
+    /// `hasLocalFile` is false exactly while the current track is still
+    /// streaming into the cache. Both resume the escalation on their own: the
+    /// progress tick calls back in every second.
+    private var autoMixMayDownload: Bool {
+        prefetchTask == nil && hasLocalFile
     }
 
     /// Freeze the decision for this track and hand the pipeline the result.

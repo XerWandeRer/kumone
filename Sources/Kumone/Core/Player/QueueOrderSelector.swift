@@ -6,6 +6,17 @@ import Foundation
 // are in the pool, which have an analysis in hand, which one is being fetched,
 // and how many rounds each has lost.
 //
+// **The acquisition policy is satisficing escalation.** A pick starts from
+// every analysis already in hand and stops the instant one of them is good
+// enough (`config.satisfyingTier`, "beat-matched or better"). Only when none
+// is does it start paying, in exponentially growing rounds down the remaining
+// queue — 1 track, then 4, then 16 — stopping mid-round the moment something
+// satisfies. The fixed W=4 window this replaced was measured worthless on a
+// real cache (13 % beat-matched at list order vs 16 % at W=4 vs 53 % with the
+// whole analyzed pool): the value was never in the window, it was in the pool
+// being rich, and the sidecars each round leaves behind make it richer for
+// every later pick.
+//
 // **Nothing in this file exists while the mode is off.** `PlayerService` holds
 // the selector as an optional and only builds one when the queue order is
 // `.autoMix`, so a player in `.listed` or `.shuffled` runs the code it always
@@ -68,6 +79,26 @@ final class QueueOrderSelector {
     /// happens once per track rather than once per tick.
     private var scanned: Set<Int> = []
 
+    /// The tracks this pick's escalation has admitted for acquisition, by ID
+    /// (predev §2.2).
+    ///
+    /// **A set, never indices.** The queue can be edited under us at any moment
+    /// — a removal, an insertion, a manual jump — and every question the policy
+    /// asks ("what is the frontier", "is it resolved", "what may I admit next")
+    /// is answered by intersecting this set with the *current* remaining queue.
+    /// A track that leaves the queue simply stops being in the frontier; one
+    /// that joins is unadmitted until a round reaches it.
+    private var admitted: Set<Int> = []
+    /// How many tracks the last round admitted, so the next one can be `×
+    /// escalationFactor` of it. 0 before the first round.
+    private var lastRoundSize = 0
+    /// Rounds this pick has escalated through — the cost figure the debug panel
+    /// and `audition order` report.
+    private(set) var rounds = 0
+    /// Candidates downloaded for *this* pick. Reset with the pick, unlike
+    /// `analyses`, which is cumulative across the session.
+    private(set) var downloadsThisPick = 0
+
     /// **The whole download budget: one.** The same discipline the existing
     /// prefetch runs under, for the same reason — a second concurrent transfer
     /// competes with the audio that is playing.
@@ -82,24 +113,27 @@ final class QueueOrderSelector {
 
     // MARK: - Pool bookkeeping
 
-    /// The candidate pool for a remaining queue `remaining`, in the order the
-    /// pool is walked (predev §2.2): the next `config.window` listed entries,
-    /// then every other remaining track that already has an analysis in hand.
+    /// The candidate pool for a remaining queue: **everything already analyzed**
+    /// (predev §2.2).
     ///
-    /// The second half is free by construction — it is exactly the set this
-    /// selector can score without spending anything — so a playlist whose
-    /// audio is already on disk gets the whole list to choose from, while a
-    /// cold one is held to the window.
+    /// This is exactly the set the selector can score without spending
+    /// anything — the window bookkeeping of earlier picks, everything the
+    /// escalation downloaded in previous rounds and previous sessions, and
+    /// every sidecar the disk scan found. It is free by construction, so every
+    /// pick starts from all of it and the escalation below only ever has to pay
+    /// for what this does not already cover.
+    ///
+    /// Kept in list order, which is what the pick's tie-break reads: a pool the
+    /// scorer cannot tell apart reproduces the user's own list.
     func pool(remaining: [Track]) -> [Track] {
-        let windowed = Array(remaining.prefix(max(1, config.window)))
-        var seen = Set(windowed.map(\.id))
-        var pool = windowed
-        for track in remaining.dropFirst(windowed.count)
-        where analyses[track.id] != nil && !seen.contains(track.id) {
-            seen.insert(track.id)
-            pool.append(track)
-        }
-        return pool
+        remaining.filter { analyses[$0.id] != nil }
+    }
+
+    /// The tracks this pick's escalation has admitted, in list order —
+    /// re-derived from `remaining` every time it is asked, so a queue edit
+    /// needs no index fix-up.
+    func frontier(remaining: [Track]) -> [Track] {
+        remaining.filter { admitted.contains($0.id) }
     }
 
     /// Whether every candidate in the pool has been resolved one way or the
@@ -113,13 +147,54 @@ final class QueueOrderSelector {
 
     var analyzedCount: Int { analyses.count }
 
-    /// Move the pool one step forward: look up whatever has not been looked up
-    /// on disk yet, then start at most one download. Cheap and idempotent —
-    /// it is called from the playback tick, and returns immediately once a job
-    /// is in flight or the pool is settled.
-    func ensureCandidates(_ pool: [Track]) {
-        guard !scanning, !fetching else { return }
-        let unscanned = pool.filter { !scanned.contains($0.id) }
+    /// Whether the last `pick` came back with a candidate that reaches
+    /// `config.satisfyingTier` — the stop condition of the whole escalation.
+    var lastPickSatisfies: Bool {
+        guard let best = lastPick.first else { return false }
+        return best.score.tier >= config.satisfyingTier
+    }
+
+    /// A new track is playing: the escalation starts over from nothing
+    /// admitted. Analyses are emphatically **not** dropped — they are the
+    /// richer pool this pick starts from, which is the entire point of paying
+    /// for them once (predev §2.2).
+    func beginPick() {
+        admitted.removeAll()
+        lastRoundSize = 0
+        rounds = 0
+        downloadsThisPick = 0
+    }
+
+    // MARK: - Satisficing escalation
+
+    /// What one acquisition tick concluded.
+    enum Acquisition: Equatable {
+        /// A disk scan or a download is under way; call again when it lands.
+        case acquiring
+        /// The escalation is standing aside for the playback-quality prefetch.
+        case deferred
+        /// Nothing left to admit — the remaining queue is spent. The caller
+        /// should pick the best it has rather than keep waiting.
+        case exhausted
+    }
+
+    /// Move the escalation one step (predev §2.2).
+    ///
+    /// Called from the playback tick, only while the pick is still unsatisfied.
+    /// It costs a directory walk once per track and at most one download at a
+    /// time, and it is idempotent — a tick that arrives while a job is in
+    /// flight does nothing.
+    ///
+    /// - Parameter mayDownload: false while the playback-quality prefetch is
+    ///   pulling bytes. The escalation is background work and yields to the
+    ///   audio that is about to play; the disk scan, which costs no network,
+    ///   goes ahead either way.
+    @discardableResult
+    func acquire(remaining: [Track], mayDownload: Bool = true) -> Acquisition {
+        guard !scanning else { return .acquiring }
+        // Free first, always: a sidecar already on disk is a candidate that
+        // costs nothing, and finding it may end the escalation outright.
+        let unscanned = remaining.filter { !scanned.contains($0.id) }
         if !unscanned.isEmpty {
             scanning = true
             let ids = Set(unscanned.map(\.id))
@@ -135,20 +210,58 @@ final class QueueOrderSelector {
                 }
                 if landed { self.onCandidateReady?() }
             }
-            return
+            return .acquiring
         }
-        guard let next = pool.first(where: {
-            analyses[$0.id] == nil && !refused.contains($0.id)
-        }) else { return }
+        guard !fetching else { return .acquiring }
+
+        // Walk down the ladder: serve the admitted frontier first, and only
+        // once every admitted track has resolved does the next — four times
+        // larger — round open.
+        while true {
+            if let next = frontier(remaining: remaining).first(where: isUnresolved) {
+                guard mayDownload else { return .deferred }
+                startFetch(next)
+                return .acquiring
+            }
+            guard escalate(remaining: remaining) else { return .exhausted }
+        }
+    }
+
+    /// Admit the next round's worth of unresolved tracks, in list order.
+    /// False when there were none left to admit.
+    ///
+    /// Only *unresolved* tracks count against a round's size: a track already
+    /// analyzed is in the pool for free and admitting it would spend a round on
+    /// nothing.
+    private func escalate(remaining: [Track]) -> Bool {
+        let size = lastRoundSize == 0
+            ? max(1, config.escalationFirstRound)
+            : lastRoundSize * max(1, config.escalationFactor)
+        let opened = remaining
+            .filter { isUnresolved($0) && !admitted.contains($0.id) }
+            .prefix(size)
+        guard !opened.isEmpty else { return false }
+        admitted.formUnion(opened.map(\.id))
+        lastRoundSize = size
+        rounds += 1
+        return true
+    }
+
+    private func isUnresolved(_ track: Track) -> Bool {
+        analyses[track.id] == nil && !refused.contains(track.id)
+    }
+
+    private func startFetch(_ track: Track) {
         fetching = true
+        downloadsThisPick += 1
         Task { [weak self] in
-            let analysis = await Self.scoringAnalysis(for: next)
+            let analysis = await Self.scoringAnalysis(for: track)
             guard let self else { return }
             self.fetching = false
             if let analysis {
-                self.analyses[next.id] = analysis
+                self.analyses[track.id] = analysis
             } else {
-                self.refused.insert(next.id)
+                self.refused.insert(track.id)
             }
             self.onCandidateReady?()
         }
@@ -220,6 +333,7 @@ final class QueueOrderSelector {
         lostRounds.removeAll()
         refused.removeAll()
         lastPick = []
+        beginPick()
     }
 
     // MARK: - Test hooks
@@ -240,6 +354,18 @@ final class QueueOrderSelector {
     }
 
     func lostRoundsForTesting(_ id: Int) -> Int { lostRounds[id] ?? 0 }
+
+    /// Open one escalation round without going near the network — the ladder
+    /// (1, 4, 16 …) is arithmetic over the remaining queue and is worth
+    /// asserting on directly.
+    @discardableResult
+    func escalateForTesting(remaining: [Track]) -> Bool { escalate(remaining: remaining) }
+
+    /// Pretend the disk has already been walked for these tracks, so `acquire`
+    /// gets past its free half without a file system.
+    func markScannedForTesting(_ tracks: [Track]) {
+        scanned.formUnion(tracks.map(\.id))
+    }
 
     // MARK: - Fetching
 

@@ -155,9 +155,14 @@ struct AutoMixDebugOrder: Equatable {
     var mode = "listed"
     /// "choosing", "decided", or why neither applies.
     var state = "off"
-    /// Candidates in the pool, and how many of them have an analysis in hand.
+    /// How many tracks are still ahead in the queue, and how many of them the
+    /// selector can already score for free.
     var poolSize = 0
     var analyzed = 0
+    /// What this pick's escalation has cost so far: rounds opened and
+    /// low-bitrate downloads started (predev §2.2).
+    var rounds = 0
+    var downloads = 0
     /// Playback position by which the pick is made regardless.
     var deadline: TimeInterval?
     /// Best first.

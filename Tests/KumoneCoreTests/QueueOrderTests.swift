@@ -265,21 +265,237 @@ import Foundation
     // MARK: - Pool bookkeeping
 
     @MainActor
-    @Test func thePoolIsTheWindowPlusEverythingAlreadyAnalyzed() {
+    @Test func thePoolIsEverythingAlreadyAnalyzedInListOrder() {
         let selector = QueueOrderSelector()
-        selector.config.window = 2
         let remaining = (1...6).map { track($0) }
-        // Cold: only the window is reachable.
-        #expect(selector.pool(remaining: remaining).map(\.id) == [1, 2])
+        // Cold: nothing is free, so the pool is empty and the escalation below
+        // is the only way to fill it.
+        #expect(selector.pool(remaining: remaining).isEmpty)
 
-        // A track further down the list that already has an analysis joins for
-        // free — predev §2.2's second half of the pool.
+        // Anything with an analysis in hand joins for free, wherever it sits —
+        // and the pool stays in list order, which is what the pick's tie-break
+        // reads.
         selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 5)
-        #expect(selector.pool(remaining: remaining).map(\.id) == [1, 2, 5])
-
-        // Something already inside the window does not appear twice.
         selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 2)
-        #expect(selector.pool(remaining: remaining).map(\.id) == [1, 2, 5])
+        #expect(selector.pool(remaining: remaining).map(\.id) == [2, 5])
+
+        // An analysis for a track that is no longer in the queue is simply not
+        // in the pool — no bookkeeping needed.
+        #expect(selector.pool(remaining: [track(1), track(5)]).map(\.id) == [5])
+    }
+
+    // MARK: - Satisficing escalation (predev §2.2)
+
+    /// A selector whose pool already satisfies, seen through `pick`: an
+    /// outgoing and an incoming analysis that the *planner* will beat-match.
+    /// The escalation's stop condition reads the tier off a real plan, so the
+    /// fixtures have to be plannable rather than stated.
+    @MainActor
+    private func beatMatchableSelector() -> (QueueOrderSelector, TrackAnalysis) {
+        let selector = QueueOrderSelector()
+        return (selector, makeAnalysis(bpm: 120, keyPitchClass: 0, keyConfidence: 0.9,
+                                       melProfile: [1, 0, 0, 0], energy: 0.6))
+    }
+
+    @MainActor
+    @Test func aPoolThatAlreadySatisfiesCostsNothing() {
+        let (selector, outgoing) = beatMatchableSelector()
+        let remaining = (1...20).map { track($0) }
+        // Track 7 is a twin of what is playing: same tempo, same key, same
+        // energy — the planner beat-matches it.
+        selector.injectAnalysisForTesting(outgoing, forTrackID: 7)
+
+        let pool = selector.pool(remaining: remaining)
+        let winner = selector.pick(outgoing: nil, outgoingAnalysis: outgoing, pool: pool)
+        #expect(winner?.id == 7)
+        #expect(selector.lastPickSatisfies)
+        // Zero rounds, zero downloads: the whole point of satisficing.
+        #expect(selector.rounds == 0)
+        #expect(selector.downloadsThisPick == 0)
+        #expect(selector.frontier(remaining: remaining).isEmpty)
+    }
+
+    @MainActor
+    @Test func aPoolThatDoesNotSatisfyIsNotMistakenForOne() {
+        let (selector, outgoing) = beatMatchableSelector()
+        // Far enough apart in tempo that the planner cannot lock the grids.
+        selector.injectAnalysisForTesting(
+            makeAnalysis(bpm: 155, keyPitchClass: 6, keyConfidence: 0.9,
+                         melProfile: [-1, 0, 0, 0], energy: 0.1),
+            forTrackID: 3)
+        let remaining = (1...20).map { track($0) }
+        _ = selector.pick(outgoing: nil, outgoingAnalysis: outgoing,
+                          pool: selector.pool(remaining: remaining))
+        #expect(!selector.lastPickSatisfies)
+        // A pick with nothing scored at all cannot satisfy either.
+        let empty = QueueOrderSelector()
+        _ = empty.pick(outgoing: nil, outgoingAnalysis: outgoing, pool: [])
+        #expect(!empty.lastPickSatisfies)
+    }
+
+    @MainActor
+    @Test func theRoundsAreOneThenFourThenSixteenInListOrder() {
+        let selector = QueueOrderSelector()
+        let remaining = (1...40).map { track($0) }
+        // No network in a test: `acquire` is driven with downloads forbidden,
+        // which is exactly the politeness path — it opens rounds and reports
+        // `.deferred` rather than fetching, so the ladder is observable
+        // without a single byte.
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).map(\.id) == [1])
+        #expect(selector.rounds == 1)
+
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).map(\.id) == Array(1...5))
+        #expect(selector.rounds == 2)
+
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).map(\.id) == Array(1...21))
+        #expect(selector.rounds == 3)
+
+        // Bounded by the remaining queue: the fourth round takes what is left
+        // and the fifth has nothing to admit.
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).count == 40)
+        #expect(!selector.escalateForTesting(remaining: remaining))
+    }
+
+    @MainActor
+    @Test func aRoundOnlySpendsItselfOnTracksItActuallyHasToBuy() {
+        let selector = QueueOrderSelector()
+        let remaining = (1...20).map { track($0) }
+        // Tracks 1–3 are already analyzed (a previous session paid for them)
+        // and track 4 was refused. A round of one must reach past all four
+        // rather than spend itself on a track that costs nothing.
+        for id in 1...3 { selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: id) }
+        selector.injectRefusalForTesting(trackID: 4)
+
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).map(\.id) == [5])
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).map(\.id) == [5, 6, 7, 8, 9])
+    }
+
+    @MainActor
+    @Test func satisfactionStopsTheRoundHalfWayThrough() {
+        let (selector, outgoing) = beatMatchableSelector()
+        let remaining = (1...20).map { track($0) }
+        // Open the 1 and the 4: five tracks admitted, none resolved.
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.escalateForTesting(remaining: remaining))
+        #expect(selector.frontier(remaining: remaining).count == 5)
+
+        // The second track of the round of four comes back beat-matchable.
+        selector.injectAnalysisForTesting(makeAnalysis(bpm: 155), forTrackID: 1)
+        selector.injectAnalysisForTesting(outgoing, forTrackID: 3)
+        _ = selector.pick(outgoing: nil, outgoingAnalysis: outgoing,
+                          pool: selector.pool(remaining: remaining))
+        #expect(selector.lastPickSatisfies)
+
+        // Three of the five admitted tracks are still unresolved. The caller
+        // stops here — it never asks `acquire` again — so they are never
+        // bought. The round does not have to finish for the pick to be made.
+        #expect(selector.frontier(remaining: remaining)
+                    .filter { !selector.hasAnalysis(for: $0) }.map(\.id) == [2, 4, 5])
+        #expect(selector.rounds == 2)
+    }
+
+    @MainActor
+    @Test func theEscalationIsBoundedByTheQueueAndThenReportsExhausted() {
+        let selector = QueueOrderSelector()
+        let remaining = [track(1), track(2)]
+        // Both already resolved, so there is nothing left to admit at all and
+        // the very first tick says so — which is the caller's cue to pick the
+        // best it has rather than wait for the deadline.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 1)
+        selector.injectRefusalForTesting(trackID: 2)
+        #expect(selector.acquire(remaining: remaining, mayDownload: true) == .exhausted)
+    }
+
+    @MainActor
+    @Test func theDeadlineStillTakesTheBestAnalyzedCandidateOrNothing() {
+        // The deadline path is the one thing the escalation does not touch: it
+        // never consults the satisfying tier, it takes `pick`'s answer — the
+        // best analyzed candidate, or nil, which leaves the user's list order
+        // alone rather than holding up a hand-over for a download.
+        let (selector, outgoing) = beatMatchableSelector()
+        let remaining = (1...6).map { track($0) }
+        #expect(selector.pick(outgoing: nil, outgoingAnalysis: outgoing,
+                              pool: selector.pool(remaining: remaining)) == nil)
+
+        // Two candidates that cannot be beat-matched: nothing satisfies, and
+        // the deadline takes the better of them anyway.
+        selector.injectAnalysisForTesting(
+            makeAnalysis(bpm: 155, keyPitchClass: 6, keyConfidence: 0.9,
+                         melProfile: [-1, 0, 0, 0], energy: 0.05),
+            forTrackID: 4)
+        selector.injectAnalysisForTesting(
+            makeAnalysis(bpm: 151, keyPitchClass: 0, keyConfidence: 0.9,
+                         melProfile: [1, 0, 0, 0], energy: 0.6),
+            forTrackID: 2)
+        let winner = selector.pick(outgoing: nil, outgoingAnalysis: outgoing,
+                                   pool: selector.pool(remaining: remaining))
+        #expect(!selector.lastPickSatisfies)
+        #expect(winner?.id == 2)
+    }
+
+    @MainActor
+    @Test func theEscalationStandsAsideWhileThePlaybackDownloadRuns() {
+        let selector = QueueOrderSelector()
+        let remaining = (1...8).map { track($0) }
+        selector.markScannedForTesting(remaining)
+        // Impolite moment: a round opens (the bookkeeping is free) but no
+        // transfer starts, and the tick says why.
+        #expect(selector.acquire(remaining: remaining, mayDownload: false) == .deferred)
+        #expect(selector.rounds == 1)
+        #expect(selector.downloadsThisPick == 0)
+        // Asking again while still impolite does not open a second round: the
+        // frontier is unresolved, so there is nothing to escalate past.
+        #expect(selector.acquire(remaining: remaining, mayDownload: false) == .deferred)
+        #expect(selector.rounds == 1)
+    }
+
+    @MainActor
+    @Test func aQueueEditIsHandledByReDerivingNotByFixingUpIndices() {
+        let selector = QueueOrderSelector()
+        var remaining = (1...20).map { track($0) }
+        selector.escalateForTesting(remaining: remaining)
+        selector.escalateForTesting(remaining: remaining)
+        #expect(selector.frontier(remaining: remaining).map(\.id) == Array(1...5))
+
+        // The user removes two admitted tracks and inserts a new one at the
+        // head. The frontier is the admitted set intersected with the queue as
+        // it is *now*: the departed tracks are gone, and the newcomer is not
+        // admitted until a round reaches it.
+        remaining = [track(99)] + remaining.filter { $0.id != 2 && $0.id != 4 }
+        #expect(selector.frontier(remaining: remaining).map(\.id) == [1, 3, 5])
+
+        // The next round admits the newcomer along with the rest of the list,
+        // in the order the list has now — no index anywhere survived the edit.
+        selector.escalateForTesting(remaining: remaining)
+        #expect(selector.frontier(remaining: remaining).map(\.id)
+                == [99, 1, 3, 5] + Array(6...20))
+
+        // A pick that lands on a departed track is impossible: the pool is
+        // derived from `remaining` too.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 2)
+        #expect(!selector.pool(remaining: remaining).contains { $0.id == 2 })
+    }
+
+    @MainActor
+    @Test func aNewTrackRestartsTheEscalationButKeepsWhatItPaidFor() {
+        let selector = QueueOrderSelector()
+        let remaining = (1...20).map { track($0) }
+        selector.escalateForTesting(remaining: remaining)
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 1)
+        #expect(selector.rounds == 1)
+
+        selector.beginPick()
+        #expect(selector.rounds == 0)
+        #expect(selector.downloadsThisPick == 0)
+        #expect(selector.frontier(remaining: remaining).isEmpty)
+        // The sidecar it bought is the whole reason the next pick is cheaper.
+        #expect(selector.pool(remaining: remaining).map(\.id) == [1])
     }
 
     @MainActor
@@ -296,7 +512,6 @@ import Foundation
     @MainActor
     @Test func onlyThePoolAgesAndTheWinnerIsForgiven() {
         let selector = QueueOrderSelector()
-        selector.config.window = 4
         let one = track(1), two = track(2), three = track(3)
         for t in [one, two, three] {
             selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: t.id)
@@ -386,9 +601,20 @@ import Foundation
     // MARK: - Config surface
 
     @Test func theWeightsAreSweepableTheSameWayThePlannersAre() {
-        let moved = QueueOrderConfig.standard(overriding: ["agingEpsilon": 1.25, "window": 7])
+        let moved = QueueOrderConfig.standard(
+            overriding: ["agingEpsilon": 1.25, "escalationFirstRound": 7,
+                         "escalationFactor": 2, "satisfyingTier": 2])
         #expect(moved.agingEpsilon == 1.25)
-        #expect(moved.window == 7)
+        #expect(moved.escalationFirstRound == 7)
+        #expect(moved.escalationFactor == 2)
+        #expect(moved.satisfyingTier == .stagedCrossfade)
+        // The default is "the grids can be locked", which both beat-matched
+        // tiers clear.
+        #expect(QueueOrderConfig.standard.satisfyingTier == .beatMatched)
+        #expect(TransitionTier.rampedBeatMatched >= QueueOrderConfig.standard.satisfyingTier)
+        // A tier out of range is clamped rather than crashing a swept preset.
+        #expect(QueueOrderConfig.standard(overriding: ["satisfyingTier": 99]).satisfyingTier
+                == .rampedBeatMatched)
         // Unknown names are ignored and values are clamped, so a stale preset
         // can never take the mode down.
         let clamped = QueueOrderConfig.standard(

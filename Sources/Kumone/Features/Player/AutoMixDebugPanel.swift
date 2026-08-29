@@ -147,6 +147,9 @@ struct AutoMixDebugPanel: View {
             if order.mode == "autoMix" {
                 DebugRow("state", order.state)
                 DebugRow("pool", "\(order.analyzed)/\(order.poolSize) analyzed")
+                DebugRow("escalation",
+                         "round \(order.rounds) · \(order.downloads) download"
+                         + (order.downloads == 1 ? "" : "s"))
                 DebugRow("deadline", order.deadline.map {
                     AutoMixDebugFormat.clock($0) + String(format: " (%.0fs)", $0)
                 } ?? "—")

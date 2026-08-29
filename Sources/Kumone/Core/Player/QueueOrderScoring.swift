@@ -116,10 +116,31 @@ struct QueueOrderConfig: Sendable, Equatable {
     /// 0 turns the rule off.
     var sameArtistPenalty: Double = 1.5
 
-    /// How many of the remaining queue's *listed* entries join the candidate
-    /// pool for free (predev §2.2). Read by `QueueOrderSelector`, not by the
-    /// scoring below; it lives here so one value describes the whole mode.
-    var window: Int = 4
+    // MARK: - Acquisition (predev §2.2)
+    //
+    // Read by `QueueOrderSelector`, not by the scoring below; they live here
+    // so one value describes the whole mode.
+
+    /// The tier at which a candidate is **good enough** and the escalation
+    /// stops. The default is "the grids can be locked" — the share this whole
+    /// feature exists to raise — which `beatMatched` and `rampedBeatMatched`
+    /// both clear.
+    ///
+    /// Satisficing rather than optimising is sound here because the tier is the
+    /// dominant term by construction (`tierSpacing`): once a candidate reaches
+    /// the satisfying tier, everything a further round could buy is either a
+    /// *higher* tier or a second-order reshuffle inside the same one. Paying
+    /// several downloads for that is a bad trade against playing sooner.
+    var satisfyingTier: TransitionTier = .beatMatched
+
+    /// How many tracks the first escalation round downloads.
+    var escalationFirstRound: Int = 1
+
+    /// What each subsequent round multiplies the last one by: 1, 4, 16, 64 …
+    /// Exponential so a cold queue that needs a lot of material gets it in a
+    /// handful of rounds, while the common case — the very next track is
+    /// already fine — costs exactly one download.
+    var escalationFactor: Int = 4
 
     static let standard = QueueOrderConfig()
 }
@@ -350,11 +371,26 @@ extension QueueOrderConfig {
         field("sameArtistPenalty",
               "候选与当前曲同歌手时扣多少分。0 = 关掉这条规则。",
               0, 10, 0.1, 2, \.sameArtistPenalty),
-        Field(name: "window",
-              blurb: "剩余队列里按列表序免费进入候选池的首数（已缓存曲目另外全进）。",
+        Field(name: "satisfyingTier",
+              blurb: "满意档位：候选达到这一档就立即选定、停止下载。"
+                  + "0=gapless 1=crossfade 2=stagedCrossfade 3=beatMatched 4=rampedBeatMatched。",
+              min: 0, max: 4, step: 1, digits: 0,
+              read: { Double($0.satisfyingTier.rawValue) },
+              write: { config, raw in
+                  let clamped = Swift.min(Swift.max(Int(raw.rounded()), 0),
+                                          TransitionTier.rampedBeatMatched.rawValue)
+                  config.satisfyingTier = TransitionTier(rawValue: clamped) ?? .beatMatched
+              }),
+        Field(name: "escalationFirstRound",
+              blurb: "第一轮补下载几首。调大 = 更急躁,冷队列更快出结果也更费流量。",
               min: 1, max: 32, step: 1, digits: 0,
-              read: { Double($0.window) },
-              write: { $0.window = Int($1.rounded()) }),
+              read: { Double($0.escalationFirstRound) },
+              write: { $0.escalationFirstRound = Swift.max(1, Int($1.rounded())) }),
+        Field(name: "escalationFactor",
+              blurb: "每轮相对上一轮的倍数(1→4→16…)。1 = 每次只加一首。",
+              min: 1, max: 8, step: 1, digits: 0,
+              read: { Double($0.escalationFactor) },
+              write: { $0.escalationFactor = Swift.max(1, Int($1.rounded())) }),
     ]
 
     var asDictionary: [String: Double] {
