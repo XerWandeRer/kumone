@@ -1721,10 +1721,13 @@ final class PlayerService: ObservableObject {
                 tempo: candidate.score.tempoAffinity, key: candidate.score.keyAffinity,
                 style: candidate.score.styleAffinity, energy: candidate.score.energyContinuity,
                 aging: candidate.score.aging, samePenalty: candidate.score.sameArtistPenalty,
+                future: candidate.score.futureRichness,
                 total: candidate.score.total, chosen: index == 0)
         }
         let state: String
-        if !playNextList.isEmpty {
+        if isTrial {
+            state = "stood down — trial fragment (never cached, no analysis possible)"
+        } else if !playNextList.isEmpty {
             state = "stood down — a manual “play next” is sovereign"
         } else if autoMixPickCommitted {
             state = "decided"
@@ -2002,6 +2005,12 @@ final class PlayerService: ObservableObject {
     private var autoMixPickPending: Bool {
         queueOrderSelector != nil && queueOrder == .autoMix
             && !autoMixPickCommitted && !isFMMode && playNextList.isEmpty
+            // A trial fragment is never cached, so it never gets an analysis
+            // and never reaches its metadata-length deadline (the fragment
+            // ends first) — a pick would pend forever while the escalation
+            // opens a pointless round per fragment. The mode stands down
+            // exactly like FM: nothing to plan with, nothing to hold up.
+            && !isTrial
     }
 
     private func syncQueueOrderSelector() {
