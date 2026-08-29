@@ -907,6 +907,228 @@ import Foundation
         #expect(PlayerService.restoredQueueOrder(state) == .shuffled)
     }
 
+    // MARK: - The future term (predev §2.3 / §4's tail row)
+    //
+    // The term exists to be *measured*, and it ships off; what these assert is
+    // that it cannot do damage while it is available — the current seam is
+    // never sold for a better future, and the price is bounded.
+
+    /// A pool of tracks whose planner outcome against `outgoing` is stated by
+    /// construction: `matches` twins of the 120 BPM outgoing (beat-matchable)
+    /// followed by `strangers` that nothing can lock to.
+    private func futurePool(matches: Int, strangers: Int)
+        -> (keys: [Int], analyses: [Int: TrackAnalysis], outgoing: TrackAnalysis) {
+        let outgoing = makeAnalysis(bpm: 120, keyPitchClass: 0, keyConfidence: 0.9,
+                                    melProfile: [1, 0, 0, 0], energy: 0.6)
+        var analyses: [Int: TrackAnalysis] = [:]
+        var keys: [Int] = []
+        for i in 0..<matches {
+            keys.append(i)
+            analyses[i] = outgoing
+        }
+        for i in 0..<strangers {
+            let id = matches + i
+            keys.append(id)
+            analyses[id] = makeAnalysis(bpm: 155 + Double(i), keyPitchClass: 6,
+                                        keyConfidence: 0.9, melProfile: [-1, 0, 0, 0],
+                                        energy: 0.1)
+        }
+        return (keys, analyses, outgoing)
+    }
+
+    @Test func theFutureTermIsOffUntilItIsAskedFor() {
+        // The shipping default. The offline evaluation (predev §5.2) found no
+        // tail improvement from either estimator, so the mode stays off and the
+        // live pick is arithmetically identical to the one before it existed.
+        #expect(QueueOrderConfig.standard.futureMode == .off)
+        let pool = futurePool(matches: 2, strangers: 2)
+        var ranked = pool.keys.map { key -> (key: Int, score: QueueOrderScore) in
+            (key, QueueOrderScorer.score(outgoing: pool.outgoing,
+                                         incoming: pool.analyses[key],
+                                         planned: planned(.crossfade)))
+        }
+        let before = ranked.map(\.score)
+        let evaluated = QueueOrderScorer.applyFuture(
+            to: &ranked, analysis: { pool.analyses[$0] }, config: .standard)
+        #expect(evaluated == 0)
+        #expect(ranked.map(\.score) == before)
+        #expect(ranked.allSatisfy { $0.score.futureRichness == 0 })
+    }
+
+    @Test func theFutureTermNeverSellsTheCurrentSeam() {
+        // The dominance guarantee, stated at the weight's ceiling: a candidate
+        // that satisfies with the emptiest possible future must still outrank
+        // one that does not satisfy with the richest possible future.
+        let ceiling = QueueOrderConfig.fields.first { $0.name == "futureWeight" }!.max
+        var satisfying = QueueOrderScorer.score(outgoing: nil, incoming: nil,
+                                                planned: planned(.beatMatched))
+        var stranded = QueueOrderScorer.score(
+            outgoing: makeAnalysis(), incoming: makeAnalysis(),
+            planned: planned(.stagedCrossfade))
+        satisfying.applyFuture(0, weight: ceiling)
+        stranded.applyFuture(1, weight: ceiling)
+        #expect(satisfying.total > stranded.total)
+        // And the reason it holds: the bounded budget still sits under one
+        // tier step. Four continuity weights of 1 each, plus the future's own.
+        let c = QueueOrderConfig.standard
+        #expect(c.tempoWeight + c.keyWeight + c.styleWeight + c.energyWeight + ceiling
+                < c.tierSpacing)
+    }
+
+    @Test func theFutureTermCannotFlipASatisfyingWinnerBelowANonSatisfyingOne() {
+        // The same guarantee end to end, through `applyFuture` on a real
+        // ranked list: one beat-matchable candidate that leads nowhere, three
+        // crossfade-only candidates that lead everywhere.
+        let pool = futurePool(matches: 1, strangers: 3)
+        var config = QueueOrderConfig.standard
+        config.futureMode = .degree
+        config.futureWeight = QueueOrderConfig.fields.first { $0.name == "futureWeight" }!.max
+        var ranked = pool.keys.map { key -> (key: Int, score: QueueOrderScore) in
+            let planned = TransitionPlanner.plan(
+                outgoing: pool.outgoing, incoming: pool.analyses[key], stems: .none,
+                config: .standard, context: .init(outgoingLyricLineEnds: []))
+            return (key, QueueOrderScorer.score(outgoing: pool.outgoing,
+                                                incoming: pool.analyses[key],
+                                                planned: planned, config: config))
+        }
+        #expect(ranked[0].score.tier.isBeatMatched)
+        #expect(ranked.dropFirst().allSatisfy { !$0.score.tier.isBeatMatched })
+        QueueOrderScorer.applyFuture(to: &ranked, analysis: { pool.analyses[$0] },
+                                     config: config)
+        #expect(ranked.first?.key == 0)
+        #expect(ranked.first?.score.tier.isBeatMatched == true)
+    }
+
+    @Test func onlyTheTopKCandidatesArePaidFor() {
+        // The price of the term is `futureTopK` extra ranks and not one more —
+        // this is what keeps a 200-track pool under the 50 ms tripwire.
+        let pool = futurePool(matches: 6, strangers: 6)
+        var config = QueueOrderConfig.standard
+        config.futureMode = .degree
+        config.futureWeight = 1
+        config.futureTopK = 3
+        var ranked = pool.keys.map { key -> (key: Int, score: QueueOrderScore) in
+            (key, QueueOrderScorer.score(outgoing: pool.outgoing,
+                                         incoming: pool.analyses[key],
+                                         planned: planned(.beatMatched), config: config))
+        }
+        let evaluated = QueueOrderScorer.applyFuture(
+            to: &ranked, analysis: { pool.analyses[$0] }, config: config)
+        #expect(evaluated == 3)
+        #expect(ranked.filter { $0.score.futureRichness > 0 }.count <= 3)
+        // A K larger than the pool asks for the pool, not for an out-of-bounds
+        // read — a swept preset must not be able to trap the pick.
+        config.futureTopK = 999
+        var short = Array(ranked.prefix(2))
+        #expect(QueueOrderScorer.applyFuture(
+            to: &short, analysis: { pool.analyses[$0] }, config: config) == 2)
+    }
+
+    @Test func theDegreeIsTheShareOfThePoolThisCandidateCouldHandOverTo() {
+        // Two of the four others are twins of the candidate, so the candidate
+        // reaches the satisfying tier with exactly half of them.
+        let pool = futurePool(matches: 3, strangers: 2)
+        let degree = QueueOrderScorer.futureDegree(
+            candidate: 0, rest: pool.keys, analysis: { pool.analyses[$0] },
+            config: .standard)
+        #expect(abs(degree - 0.5) < 1e-9)
+        // The candidate never counts itself, and a dead end reads 0.
+        let deadEnd = futurePool(matches: 1, strangers: 3)
+        #expect(QueueOrderScorer.futureDegree(
+            candidate: 0, rest: deadEnd.keys, analysis: { deadEnd.analyses[$0] },
+            config: .standard) == 0)
+    }
+
+    @Test func aFutureEvaluationNeverLooksAtMoreThanItsCap() {
+        // The cap is the price gate. Above it the pool is sampled by a stride
+        // — every entry distinct, spread across the whole list, deterministic.
+        var config = QueueOrderConfig.standard
+        config.futurePoolCap = 7
+        let rest = Array(0..<100)
+        let sample = QueueOrderScorer.futureSample(rest, config: config)
+        #expect(sample.count == 7)
+        #expect(Set(sample).count == 7)
+        #expect(sample == QueueOrderScorer.futureSample(rest, config: config))
+        #expect(sample.first == 0)
+        #expect(sample.max()! < 100)
+        // Below the cap nothing is dropped at all.
+        #expect(QueueOrderScorer.futureSample(Array(0..<5), config: config) == Array(0..<5))
+    }
+
+    @Test func foldingAFutureReadingInIsIdempotentByReplacement() {
+        // `applyFuture` is called on scores that may already carry a reading —
+        // a re-rank of the same pool — so the contribution must be replaced,
+        // never compounded.
+        var score = QueueOrderScorer.score(outgoing: nil, incoming: nil,
+                                           planned: planned(.crossfade))
+        let base = score.total
+        score.applyFuture(0.5, weight: 2)
+        #expect(abs(score.total - (base + 1)) < 1e-9)
+        score.applyFuture(0.5, weight: 2)
+        #expect(abs(score.total - (base + 1)) < 1e-9)
+        score.applyFuture(0, weight: 2)
+        #expect(abs(score.total - base) < 1e-9)
+        // Out-of-range and non-finite readings are clamped rather than trusted.
+        score.applyFuture(5, weight: 1)
+        #expect(score.futureRichness == 1)
+        score.applyFuture(.nan, weight: 1)
+        #expect(score.futureRichness == 0)
+    }
+
+    @Test func theFutureKnobsRideTheSameSweepSurfaceAsEverythingElse() {
+        let moved = QueueOrderConfig.standard(
+            overriding: ["futureMode": 2, "futureWeight": 0.75, "futureTopK": 9,
+                         "futurePoolCap": 32, "futureRolloutDepth": 4])
+        #expect(moved.futureMode == .rollout)
+        #expect(moved.futureWeight == 0.75)
+        #expect(moved.futureTopK == 9)
+        #expect(moved.futurePoolCap == 32)
+        #expect(moved.futureRolloutDepth == 4)
+        // A mode out of range is clamped to a real one rather than crashing.
+        #expect(QueueOrderConfig.standard(overriding: ["futureMode": 99]).futureMode
+                == .rollout)
+        #expect(QueueOrderConfig.standard(overriding: ["futureMode": -5]).futureMode == .off)
+    }
+
+    // MARK: - Thirds of a schedule (predev §2.5)
+
+    @Test func aScheduleSplitsIntoThreeThirdsThatTileItExactly() {
+        // The arithmetic the acceptance gate is read off. Whatever the length,
+        // there are always three parts, they always sum back to the whole, and
+        // no two differ by more than one seam.
+        for n in 0...40 {
+            let tiers = (0..<n).map { _ in TransitionTier.crossfade.label }
+            let schedule = Audition.OrderSchedule(
+                label: "t", names: [], tiers: tiers, steps: [])
+            let thirds = schedule.thirds
+            #expect(thirds.count == 3)
+            #expect(thirds.reduce(0) { $0 + $1.pairs } == n)
+            #expect(thirds.map(\.pairs).max()! - thirds.map(\.pairs).min()! <= 1)
+        }
+    }
+
+    @Test func theThirdsCountBeatMatchedSeamsWhereTheyActuallyFell() {
+        // Nine seams, three per third: all of the first third beat-matched,
+        // none of the last. This is the front-loading the report exists to
+        // make visible — an overall 44 % that is really 100 / 33 / 0.
+        let bm = TransitionTier.beatMatched.label
+        let ramped = TransitionTier.rampedBeatMatched.label
+        let cf = TransitionTier.crossfade.label
+        let schedule = Audition.OrderSchedule(
+            label: "t", names: [],
+            tiers: [bm, ramped, bm, cf, bm, cf, cf, cf, cf], steps: [])
+        let thirds = schedule.thirds
+        #expect(thirds.map(\.pairs) == [3, 3, 3])
+        #expect(thirds.map(\.beatMatched) == [3, 1, 0])
+        #expect(thirds[0].share == 100)
+        #expect(abs(thirds[1].share - 100.0 / 3) < 1e-9)
+        #expect(thirds[2].share == 0)
+        // The thirds and the overall count are the same measurement, cut two
+        // ways: they cannot disagree.
+        #expect(thirds.reduce(0) { $0 + $1.beatMatched } == schedule.beatMatched)
+        #expect(thirds.reduce(0) { $0 + $1.pairs } == schedule.pairs)
+    }
+
     // MARK: - Config surface
 
     @Test func theWeightsAreSweepableTheSameWayThePlannersAre() {

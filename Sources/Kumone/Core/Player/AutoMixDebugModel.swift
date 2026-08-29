@@ -143,6 +143,10 @@ struct AutoMixDebugCandidate: Identifiable, Equatable {
     var energy: Double
     var aging: Double
     var samePenalty: Double
+    /// How much of the pool this candidate would leave reachable, in `[0, 1]`.
+    /// 0 when the future term is off — and 0 for every candidate outside the
+    /// top `futureTopK`, which are never evaluated.
+    var future: Double
     var total: Double
     /// The one the selector took (or would take right now, while it is still
     /// choosing).

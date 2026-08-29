@@ -50,6 +50,8 @@ extension Audition {
         public let energyContinuity: Double
         public let aging: Double
         public let sameArtistPenalty: Double
+        /// 0 when the future term is off.
+        public let futureRichness: Double
         public let total: Double
         public let lostRounds: Int
         /// This is the one the greedy took.
@@ -86,6 +88,41 @@ extension Audition {
         /// How many pairs landed in each tier, keyed by `orderTierLabels`.
         public var tierCounts: [String: Int] {
             tiers.reduce(into: [:]) { $0[$1, default: 0] += 1 }
+        }
+
+        /// One third of a schedule: where it sits and how it did.
+        public struct Third: Sendable {
+            public let pairs: Int
+            public let beatMatched: Int
+            public var share: Double {
+                pairs == 0 ? 0 : 100 * Double(beatMatched) / Double(pairs)
+            }
+        }
+
+        /// The beat-matched share of the first, middle and last third of the
+        /// schedule — **always exactly three entries**, and their `pairs` always
+        /// sum back to `pairs`.
+        ///
+        /// This is the measurement the overall share hides. Greedy's quality is
+        /// front-loaded: it spends the compatible pairs while it has the whole
+        /// pool to choose from, and the tail is left escaping clusters on aging
+        /// alone. A single percentage over the whole schedule averages that
+        /// collapse away; three of them cannot.
+        ///
+        /// Contiguous, cut at `i × n / 3`, so the three parts differ in size by
+        /// at most one pair and always tile the schedule exactly.
+        public var thirds: [Third] {
+            let n = tiers.count
+            let bounds = (0...3).map { $0 * n / 3 }
+            return (0..<3).map { i in
+                let slice = tiers[bounds[i]..<bounds[i + 1]]
+                return Third(
+                    pairs: slice.count,
+                    beatMatched: slice.filter {
+                        $0 == TransitionTier.beatMatched.label
+                            || $0 == TransitionTier.rampedBeatMatched.label
+                    }.count)
+            }
         }
     }
 
@@ -165,7 +202,7 @@ extension Audition {
             let outgoingArtist = artists[current.path]
             let lineEnds = Lyrics.lineEnds(for: current)
 
-            var scored: [(url: URL, score: QueueOrderScore)] = []
+            var scored: [(key: URL, score: QueueOrderScore)] = []
             for candidate in pool {
                 let incoming = analyses[candidate.path]
                 let planned = TransitionPlanner.plan(
@@ -183,45 +220,32 @@ extension Audition {
             // Ties break on list order, which is the pool's own order — so a
             // pool where nothing distinguishes the candidates reproduces the
             // listed sequence exactly.
-            guard let bestIndex = scored.indices.max(by: {
-                scored[$0].score.total < scored[$1].score.total
-            }) else { break }
-            let winner = scored[bestIndex]
+            var ranked = sortByTotalThenListOrder(scored)
+            QueueOrderScorer.applyFuture(
+                to: &ranked, analysis: { analyses[$0.path] },
+                config: queueConfig, plannerConfig: plannerConfig)
+            guard let winner = ranked.first else { break }
 
-            let ranked = scored.enumerated()
-                .sorted { $0.element.score.total > $1.element.score.total }
-                .prefix(candidateLimit)
-                .map { entry in
-                    OrderCandidate(
-                        name: displayName(entry.element.url),
-                        tier: entry.element.score.tier.label,
-                        tempoAffinity: entry.element.score.tempoAffinity,
-                        keyAffinity: entry.element.score.keyAffinity,
-                        styleAffinity: entry.element.score.styleAffinity,
-                        energyContinuity: entry.element.score.energyContinuity,
-                        aging: entry.element.score.aging,
-                        sameArtistPenalty: entry.element.score.sameArtistPenalty,
-                        total: entry.element.score.total,
-                        lostRounds: lostRounds[entry.element.url.path] ?? 0,
-                        chosen: entry.offset == bestIndex)
-                }
             steps.append(OrderStep(
                 position: steps.count + 1,
-                from: displayName(current), to: displayName(winner.url),
+                from: displayName(current), to: displayName(winner.key),
                 tier: winner.score.tier.label,
-                poolSize: pool.count, candidates: Array(ranked)))
+                poolSize: pool.count,
+                candidates: ranked.prefix(candidateLimit).map { entry in
+                    candidate(entry, lostRounds: lostRounds, winner: winner.key)
+                }))
 
             // Everyone else in the pool ages; tracks that were never offered a
             // seat do not, or a long queue's tail would arrive pre-aged.
-            for entry in scored where entry.url.path != winner.url.path {
-                lostRounds[entry.url.path, default: 0] += 1
+            for entry in ranked where entry.key.path != winner.key.path {
+                lostRounds[entry.key.path, default: 0] += 1
             }
-            lostRounds[winner.url.path] = nil
+            lostRounds[winner.key.path] = nil
 
-            names.append(displayName(winner.url))
+            names.append(displayName(winner.key))
             tiers.append(winner.score.tier.label)
-            remaining.removeAll { $0.path == winner.url.path }
-            current = winner.url
+            remaining.removeAll { $0.path == winner.key.path }
+            current = winner.key
         }
 
         return OrderSchedule(
@@ -249,6 +273,17 @@ extension Audition {
         /// shrinking pool.
         public let chainMS: Double
         public let depth: Int
+        /// Milliseconds the future term adds to one rank — `futureTopK`
+        /// evaluations against a pool bounded by `futurePoolCap`. 0 when the
+        /// term is off.
+        public let futureMS: Double
+        public let futureMode: String
+        public let futureTopK: Int
+        public let futurePoolCap: Int
+
+        /// What one `pick` really costs on the main actor now: the rank plus
+        /// the future term. This is the number the 50 ms tripwire watches.
+        public var pickMS: Double { rankMS + futureMS }
     }
 
     public static func orderBench(
@@ -259,11 +294,17 @@ extension Audition {
         var analyses: [TrackAnalysis] = []
         for file in files { analyses.append(try analysis(of: file)) }
         guard analyses.count >= 2 else {
-            return OrderBench(poolSize: analyses.count, planMS: 0, rankMS: 0,
-                              chainMS: 0, depth: queueConfig.lookaheadDepth)
+            return OrderBench(
+                poolSize: analyses.count, planMS: 0, rankMS: 0, chainMS: 0,
+                depth: queueConfig.lookaheadDepth, futureMS: 0,
+                futureMode: queueConfig.futureMode.label,
+                futureTopK: queueConfig.futureTopK,
+                futurePoolCap: queueConfig.futurePoolCap)
         }
         let outgoing = analyses[0]
         let pool = Array(analyses.dropFirst())
+        let poolFiles = Array(files.dropFirst().prefix(pool.count))
+        let byPath = Dictionary(uniqueKeysWithValues: zip(poolFiles.map(\.path), pool))
 
         func score(_ a: TrackAnalysis, _ b: TrackAnalysis) {
             let planned = TransitionPlanner.plan(
@@ -293,9 +334,23 @@ extension Audition {
                 remaining.removeFirst()
             }
         }
+        // What the future term adds to one pick: `futureTopK` evaluations over
+        // a pool the cap has already bounded. Measured as the caller runs it —
+        // through `applyFuture`, on a ranked list — so the number includes the
+        // re-sort and cannot drift from the shipping path.
+        var futureRanked = poolFiles.map { (key: $0, score: QueueOrderScore()) }
+        let futureMS = milliseconds {
+            QueueOrderScorer.applyFuture(
+                to: &futureRanked, analysis: { byPath[$0.path] },
+                config: queueConfig, plannerConfig: plannerConfig)
+        }
         return OrderBench(poolSize: pool.count,
                           planMS: rankMS / Double(max(1, pool.count)),
-                          rankMS: rankMS, chainMS: chainMS, depth: depth)
+                          rankMS: rankMS, chainMS: chainMS, depth: depth,
+                          futureMS: futureMS,
+                          futureMode: queueConfig.futureMode.label,
+                          futureTopK: queueConfig.futureTopK,
+                          futurePoolCap: queueConfig.futurePoolCap)
     }
 
     // MARK: - Satisficing escalation
@@ -382,31 +437,34 @@ extension Audition {
             let lineEnds = Lyrics.lineEnds(for: current)
 
             /// Score the free pool as it stands. Best first.
-            func rank() -> [(url: URL, score: QueueOrderScore)] {
-                remaining.filter { visible.contains($0.path) }.map { candidate in
-                    let incoming = analyses[candidate.path]
-                    let planned = TransitionPlanner.plan(
-                        outgoing: outgoing, incoming: incoming, stems: .none,
-                        config: plannerConfig,
-                        context: .init(outgoingLyricLineEnds: lineEnds))
-                    let sharesArtist = outgoingArtist != nil
-                        && outgoingArtist == artists[candidate.path]
-                    return (candidate, QueueOrderScorer.score(
-                        outgoing: outgoing, incoming: incoming, planned: planned,
-                        lostRounds: lostRounds[candidate.path] ?? 0,
-                        sharesArtist: sharesArtist,
-                        config: queueConfig, plannerConfig: plannerConfig))
-                }
+            ///
+            /// The future term is folded in here, on the *visible* pool — which
+            /// is exactly what the player sees, and the reason this row's
+            /// numbers are the shipping numbers rather than an idealisation.
+            func rank() -> [(key: URL, score: QueueOrderScore)] {
+                let scored = remaining.filter { visible.contains($0.path) }
+                    .map { candidate -> (key: URL, score: QueueOrderScore) in
+                        let incoming = analyses[candidate.path]
+                        let planned = TransitionPlanner.plan(
+                            outgoing: outgoing, incoming: incoming, stems: .none,
+                            config: plannerConfig,
+                            context: .init(outgoingLyricLineEnds: lineEnds))
+                        let sharesArtist = outgoingArtist != nil
+                            && outgoingArtist == artists[candidate.path]
+                        return (candidate, QueueOrderScorer.score(
+                            outgoing: outgoing, incoming: incoming, planned: planned,
+                            lostRounds: lostRounds[candidate.path] ?? 0,
+                            sharesArtist: sharesArtist,
+                            config: queueConfig, plannerConfig: plannerConfig))
+                    }
                 // Ties break on list order, which the filter above preserves.
-                .enumerated()
-                .sorted {
-                    $0.element.score.total == $1.element.score.total
-                        ? $0.offset < $1.offset
-                        : $0.element.score.total > $1.element.score.total
-                }
-                .map(\.element)
+                var ranked = sortByTotalThenListOrder(scored)
+                QueueOrderScorer.applyFuture(
+                    to: &ranked, analysis: { analyses[$0.path] },
+                    config: queueConfig, plannerConfig: plannerConfig)
+                return ranked
             }
-            func isSatisfied(_ ranked: [(url: URL, score: QueueOrderScore)]) -> Bool {
+            func isSatisfied(_ ranked: [(key: URL, score: QueueOrderScore)]) -> Bool {
                 (ranked.first?.score.tier).map { $0 >= queueConfig.satisfyingTier } ?? false
             }
 
@@ -444,35 +502,24 @@ extension Audition {
 
             steps.append(OrderStep(
                 position: steps.count + 1,
-                from: displayName(current), to: displayName(winner.url),
+                from: displayName(current), to: displayName(winner.key),
                 tier: winner.score.tier.label,
                 poolSize: ranked.count,
                 candidates: ranked.prefix(candidateLimit).map { entry in
-                    OrderCandidate(
-                        name: displayName(entry.url),
-                        tier: entry.score.tier.label,
-                        tempoAffinity: entry.score.tempoAffinity,
-                        keyAffinity: entry.score.keyAffinity,
-                        styleAffinity: entry.score.styleAffinity,
-                        energyContinuity: entry.score.energyContinuity,
-                        aging: entry.score.aging,
-                        sameArtistPenalty: entry.score.sameArtistPenalty,
-                        total: entry.score.total,
-                        lostRounds: lostRounds[entry.url.path] ?? 0,
-                        chosen: entry.url.path == winner.url.path)
+                    candidate(entry, lostRounds: lostRounds, winner: winner.key)
                 }))
             downloadsPerPick.append(downloads)
             roundsPerPick.append(rounds)
 
-            for entry in ranked where entry.url.path != winner.url.path {
-                lostRounds[entry.url.path, default: 0] += 1
+            for entry in ranked where entry.key.path != winner.key.path {
+                lostRounds[entry.key.path, default: 0] += 1
             }
-            lostRounds[winner.url.path] = nil
+            lostRounds[winner.key.path] = nil
 
-            names.append(displayName(winner.url))
+            names.append(displayName(winner.key))
             tiers.append(winner.score.tier.label)
-            remaining.removeAll { $0.path == winner.url.path }
-            current = winner.url
+            remaining.removeAll { $0.path == winner.key.path }
+            current = winner.key
         }
 
         return OrderEscalation(
@@ -519,6 +566,39 @@ extension Audition {
     }
 
     // MARK: - Helpers
+
+    /// Best first, ties on the candidate's position in the pool — the one
+    /// ordering both offline schedules and the live selector agree on.
+    private static func sortByTotalThenListOrder(
+        _ scored: [(key: URL, score: QueueOrderScore)]
+    ) -> [(key: URL, score: QueueOrderScore)] {
+        scored.enumerated()
+            .sorted {
+                $0.element.score.total == $1.element.score.total
+                    ? $0.offset < $1.offset
+                    : $0.element.score.total > $1.element.score.total
+            }
+            .map(\.element)
+    }
+
+    private static func candidate(
+        _ entry: (key: URL, score: QueueOrderScore),
+        lostRounds: [String: Int], winner: URL
+    ) -> OrderCandidate {
+        OrderCandidate(
+            name: displayName(entry.key),
+            tier: entry.score.tier.label,
+            tempoAffinity: entry.score.tempoAffinity,
+            keyAffinity: entry.score.keyAffinity,
+            styleAffinity: entry.score.styleAffinity,
+            energyContinuity: entry.score.energyContinuity,
+            aging: entry.score.aging,
+            sameArtistPenalty: entry.score.sameArtistPenalty,
+            futureRichness: entry.score.futureRichness,
+            total: entry.score.total,
+            lostRounds: lostRounds[entry.key.path] ?? 0,
+            chosen: entry.key.path == winner.path)
+    }
 
     private static func planned(
         _ a: TrackAnalysis, _ b: TrackAnalysis,

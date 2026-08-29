@@ -159,6 +159,60 @@ struct QueueOrderConfig: Sendable, Equatable {
     /// it.
     var maxDownloadsPerPick: Int = 24
 
+    // MARK: - Future richness (predev §2.3 / §4's tail row)
+
+    /// Which future-richness estimator the pick uses, as a raw value so it can
+    /// ride the same `--order-set` sweep surface as every other knob.
+    ///
+    /// The term exists because greedy is measurably front-loaded: on a 101-pick
+    /// schedule it eats the compatible pairs early and the last third collapses
+    /// into aging-forced escapes. Preferring, *within a tier*, the candidate
+    /// that leaves a richer future is the cheapest thing that could push back.
+    enum FutureMode: Int, Sendable, CaseIterable {
+        /// No future term at all — the shipping behaviour before this existed.
+        case off = 0
+        /// Degree: how much of the remaining pool this candidate could hand
+        /// over to at the satisfying tier. One extra rank per evaluated
+        /// candidate.
+        case degree = 1
+        /// Short rollout: greedily walk `futureRolloutDepth` seams on from this
+        /// candidate and read the tiers back. `depth` extra ranks per candidate.
+        case rollout = 2
+
+        var label: String {
+            switch self {
+            case .off: return "off"
+            case .degree: return "degree"
+            case .rollout: return "rollout"
+            }
+        }
+    }
+
+    var futureMode: FutureMode = .off
+
+    /// The future term's weight. **Bounded on purpose**, like the four
+    /// continuity terms and unlike aging: the richness itself is in `[0, 1]`
+    /// and this knob's ceiling is 2, so the whole bounded budget is at most
+    /// `1 + 1 + 1 + 1 + 2 = 6` against a `tierSpacing` of 10. No setting of it
+    /// can promote a crossfade over a beat-match — the current seam is never
+    /// sold for a better future.
+    var futureWeight: Double = 0.5
+
+    /// How many of the already-ranked candidates get the future term. The rest
+    /// keep richness 0, which is safe rather than arbitrary: the bonus is
+    /// non-negative and goes only to the *best* K, so it can lift them relative
+    /// to each other but can never push one below a candidate it already beat.
+    var futureTopK: Int = 5
+
+    /// The most remaining tracks one future evaluation looks at. Above this the
+    /// pool is sampled by a deterministic stride — an estimator of the same
+    /// quantity at a bounded price, which is what keeps `K` extra ranks off the
+    /// 50 ms tripwire at a 200-track pool.
+    var futurePoolCap: Int = 64
+
+    /// How many seams `FutureMode.rollout` walks.
+    var futureRolloutDepth: Int = 3
+
     /// How many picks past the decided next the provisional chain looks
     /// (predev §2.1 / §2.2). Pure arithmetic over the analyzed pool — no
     /// download, no commitment — so it costs microseconds and can be redone
@@ -182,6 +236,11 @@ struct QueueOrderScore: Sendable, Equatable {
     /// Already negative when it applies.
     var sameArtistPenalty: Double = 0
 
+    /// How rich a future this candidate leaves, in `[0, 1]`, before its weight.
+    /// 0 both when the term is off and when the candidate genuinely strands the
+    /// pool — the two are told apart by `QueueOrderConfig.futureMode`, not here.
+    var futureRichness: Double = 0
+
     /// The tier's own contribution — `tier.rawValue × tierSpacing`, kept
     /// rather than recomputed so a score made under a swept config can still
     /// be decomposed.
@@ -192,6 +251,18 @@ struct QueueOrderScore: Sendable, Equatable {
 
     /// Everything except the tier — what sorts candidates *inside* one tier.
     var continuity: Double { total - tierScore }
+
+    /// Fold a future-richness reading into an already-computed score.
+    ///
+    /// Additive and idempotent-by-replacement: the previous contribution is
+    /// backed out first, so re-applying a fresh reading to the same score does
+    /// not compound.
+    mutating func applyFuture(_ richness: Double, weight: Double) {
+        let clamped = richness.isFinite ? Swift.min(1, Swift.max(0, richness)) : 0
+        total -= weight * futureRichness
+        futureRichness = clamped
+        total += weight * clamped
+    }
 }
 
 /// The pure half of the queue-order mode.
@@ -235,6 +306,163 @@ enum QueueOrderScorer {
             + s.aging
             + s.sameArtistPenalty
         return s
+    }
+
+    // MARK: - Future richness
+    //
+    // Greedy is myopic by construction: it buys the best seam in front of it
+    // and never asks what that leaves behind. Measured on a real cache, that
+    // shows up as a schedule whose quality is front-loaded — the compatible
+    // pairs are spent early and the last third is aging-forced escapes from
+    // clusters nothing can leave.
+    //
+    // These two functions estimate "how much future does this candidate leave"
+    // and nothing else. They never decide anything: the caller folds the
+    // reading in as a *bounded, weighted, in-tier* term, so the current seam is
+    // never sold for a better future.
+    //
+    // Generic over the pool's key type because there are two callers with two
+    // key spaces — the selector keys by track ID, the offline `audition order`
+    // by file path — and the arithmetic is the same for both.
+
+    /// The pool a future evaluation actually looks at: `rest` itself when it is
+    /// small enough, otherwise a deterministic stride sample of
+    /// `config.futurePoolCap` entries spread across the whole of it.
+    ///
+    /// A stride rather than a prefix on purpose: a prefix of a list-ordered
+    /// pool is a sample of one corner of the playlist, and the whole question
+    /// being asked is about the pool's *spread*.
+    static func futureSample<Key>(_ rest: [Key], config: QueueOrderConfig) -> [Key] {
+        let cap = max(1, config.futurePoolCap)
+        guard rest.count > cap else { return rest }
+        // Evenly spaced indices, endpoints included, no duplicates by
+        // construction because `cap < rest.count`.
+        return (0..<cap).map { rest[$0 * rest.count / cap] }
+    }
+
+    /// **Design (a): degree.** The share of the remaining pool that this
+    /// candidate could hand over to at `config.satisfyingTier`, with the
+    /// candidate as the *outgoing* track.
+    ///
+    /// One rank per candidate, and the cheapest honest answer to "is this a
+    /// hub or a dead end". A candidate that only one other track can follow is
+    /// a cluster escape waiting to happen; one that half the pool can follow
+    /// costs the schedule nothing to spend now.
+    static func futureDegree<Key: Hashable>(
+        candidate: Key, rest: [Key],
+        analysis: (Key) -> TrackAnalysis?,
+        config: QueueOrderConfig,
+        plannerConfig: TransitionPlanner.Config = .standard
+    ) -> Double {
+        guard let outgoing = analysis(candidate) else { return 0 }
+        let sample = futureSample(rest.filter { $0 != candidate }, config: config)
+        guard !sample.isEmpty else { return 0 }
+        var reached = 0
+        for key in sample {
+            guard let incoming = analysis(key) else { continue }
+            let planned = TransitionPlanner.plan(
+                outgoing: outgoing, incoming: incoming, stems: .none,
+                config: plannerConfig, context: .init(outgoingLyricLineEnds: []))
+            if TransitionTier(planned) >= config.satisfyingTier { reached += 1 }
+        }
+        return Double(reached) / Double(sample.count)
+    }
+
+    /// **Design (b): short rollout.** Walk `config.futureRolloutDepth` seams on
+    /// from the candidate, greedily, and report the mean tier of the seams
+    /// walked, normalized onto `[0, 1]`.
+    ///
+    /// Strictly more informative than the degree — it knows that a hub which
+    /// leads only into a second dead end is not really a hub — and strictly
+    /// more expensive, at `depth` ranks per candidate rather than one. Which of
+    /// the two earns its price is a question for `audition order`, not for a
+    /// comment.
+    ///
+    /// The greedy inside is the same greedy the chain runs (best `total`, ties
+    /// on list order); aging is deliberately *not* advanced, because a rollout
+    /// that aged its own copy of the counters would be measuring the aging
+    /// term's escape hatch rather than the pool's compatibility.
+    static func futureRollout<Key: Hashable>(
+        candidate: Key, rest: [Key],
+        analysis: (Key) -> TrackAnalysis?,
+        config: QueueOrderConfig,
+        plannerConfig: TransitionPlanner.Config = .standard
+    ) -> Double {
+        let depth = max(1, config.futureRolloutDepth)
+        var pool = futureSample(rest.filter { $0 != candidate }, config: config)
+        var head = candidate
+        var tierSum = 0
+        var seams = 0
+        while seams < depth, !pool.isEmpty {
+            let outgoing = analysis(head)
+            var best: (index: Int, score: QueueOrderScore)?
+            for (index, key) in pool.enumerated() {
+                guard let incoming = analysis(key) else { continue }
+                let planned = TransitionPlanner.plan(
+                    outgoing: outgoing, incoming: incoming, stems: .none,
+                    config: plannerConfig, context: .init(outgoingLyricLineEnds: []))
+                let s = score(outgoing: outgoing, incoming: incoming, planned: planned,
+                              config: config, plannerConfig: plannerConfig)
+                if best == nil || s.total > best!.score.total { best = (index, s) }
+            }
+            guard let winner = best else { break }
+            tierSum += winner.score.tier.rawValue
+            seams += 1
+            head = pool[winner.index]
+            pool.remove(at: winner.index)
+        }
+        guard seams > 0 else { return 0 }
+        let top = TransitionTier.rampedBeatMatched.rawValue
+        return clamp01(Double(tierSum) / Double(seams * top))
+    }
+
+    /// Fold the future term into an already-ranked candidate list, in place.
+    ///
+    /// Only the first `config.futureTopK` entries are evaluated, and the bonus
+    /// is non-negative — so this can reorder the head of the list but can never
+    /// demote a candidate below one it already outscored. That, plus the
+    /// bounded weight, is the whole of the tier-dominance guarantee: the future
+    /// term acts within and near ties and nowhere else.
+    ///
+    /// Returns how many candidates were actually evaluated — the bound the
+    /// bench and the tests assert on.
+    @discardableResult
+    static func applyFuture<Key: Hashable>(
+        to ranked: inout [(key: Key, score: QueueOrderScore)],
+        analysis: (Key) -> TrackAnalysis?,
+        config: QueueOrderConfig,
+        plannerConfig: TransitionPlanner.Config = .standard
+    ) -> Int {
+        guard config.futureMode != .off, config.futureWeight != 0 else { return 0 }
+        let k = min(max(0, config.futureTopK), ranked.count)
+        guard k > 0 else { return 0 }
+        let keys = ranked.map(\.key)
+        for i in 0..<k {
+            let richness: Double
+            switch config.futureMode {
+            case .off: continue
+            case .degree:
+                richness = futureDegree(candidate: keys[i], rest: keys,
+                                        analysis: analysis, config: config,
+                                        plannerConfig: plannerConfig)
+            case .rollout:
+                richness = futureRollout(candidate: keys[i], rest: keys,
+                                         analysis: analysis, config: config,
+                                         plannerConfig: plannerConfig)
+            }
+            ranked[i].score.applyFuture(richness, weight: config.futureWeight)
+        }
+        // Only the evaluated head can have moved, and it can only have moved
+        // up; re-sorting the whole list keeps the tie-break (original position)
+        // that the callers already rely on.
+        ranked = ranked.enumerated()
+            .sorted {
+                $0.element.score.total == $1.element.score.total
+                    ? $0.offset < $1.offset
+                    : $0.element.score.total > $1.element.score.total
+            }
+            .map(\.element)
+        return k
     }
 
     // MARK: - Continuity terms
@@ -419,6 +647,34 @@ extension QueueOrderConfig {
               min: 1, max: 256, step: 1, digits: 0,
               read: { Double($0.maxDownloadsPerPick) },
               write: { $0.maxDownloadsPerPick = Swift.max(1, Int($1.rounded())) }),
+        Field(name: "futureMode",
+              blurb: "未来富余项的估法:0=关 1=degree(候选还能接上多少首) "
+                  + "2=rollout(往前贪心走几步看档位)。",
+              min: 0, max: 2, step: 1, digits: 0,
+              read: { Double($0.futureMode.rawValue) },
+              write: { config, raw in
+                  let clamped = Swift.min(Swift.max(Int(raw.rounded()), 0), 2)
+                  config.futureMode = QueueOrderConfig.FutureMode(rawValue: clamped) ?? .off
+              }),
+        field("futureWeight",
+              "未来富余项在档位内的权重。上限 2,连同其余连续项仍远小于 tierSpacing——"
+                  + "当前 seam 永远不会为了未来被卖掉。",
+              0, 2, 0.05, 2, \.futureWeight),
+        Field(name: "futureTopK",
+              blurb: "对排名前几位的候选算未来项。调大 = 更准也更贵(每位一次 rank)。",
+              min: 1, max: 16, step: 1, digits: 0,
+              read: { Double($0.futureTopK) },
+              write: { $0.futureTopK = Swift.max(1, Int($1.rounded())) }),
+        Field(name: "futurePoolCap",
+              blurb: "一次未来评估最多看剩余池里的几首(超出按等距抽样)。这是主 actor 上的价格闸。",
+              min: 4, max: 512, step: 4, digits: 0,
+              read: { Double($0.futurePoolCap) },
+              write: { $0.futurePoolCap = Swift.max(1, Int($1.rounded())) }),
+        Field(name: "futureRolloutDepth",
+              blurb: "rollout 模式往前走几个 seam。",
+              min: 1, max: 8, step: 1, digits: 0,
+              read: { Double($0.futureRolloutDepth) },
+              write: { $0.futureRolloutDepth = Swift.max(1, Int($1.rounded())) }),
         Field(name: "lookaheadDepth",
               blurb: "定下下一首后,再往前预演几步(纯计算,不下载、不承诺)。0 = 关掉。",
               min: 0, max: 32, step: 1, digits: 0,

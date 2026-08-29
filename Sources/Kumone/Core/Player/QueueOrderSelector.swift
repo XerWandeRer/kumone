@@ -324,7 +324,8 @@ final class QueueOrderSelector {
         plannerConfig: TransitionPlanner.Config,
         outgoingLyricLineEnds: [TimeInterval]
     ) -> [Candidate] {
-        var scored: [Candidate] = []
+        var scored: [(key: Int, score: QueueOrderScore)] = []
+        var byID: [Int: Track] = [:]
         for track in pool {
             guard let incoming = analyses[track.id] else { continue }
             // The planner *is* the scorer: whatever hand-over it can build for
@@ -333,7 +334,8 @@ final class QueueOrderSelector {
                 outgoing: outgoingAnalysis, incoming: incoming, stems: .none,
                 config: plannerConfig,
                 context: .init(outgoingLyricLineEnds: outgoingLyricLineEnds))
-            scored.append(Candidate(track: track, score: QueueOrderScorer.score(
+            byID[track.id] = track
+            scored.append((track.id, QueueOrderScorer.score(
                 outgoing: outgoingAnalysis, incoming: incoming, planned: planned,
                 lostRounds: lostRounds[track.id] ?? 0,
                 sharesArtist: Self.sharesArtist(outgoing, track),
@@ -343,13 +345,21 @@ final class QueueOrderSelector {
         // cannot tell apart reproduces the user's list rather than an arbitrary
         // permutation. `sorted` is not stable, hence the explicit index
         // tiebreak.
-        return scored.enumerated()
+        var ranked = scored.enumerated()
             .sorted {
                 $0.element.score.total == $1.element.score.total
                     ? $0.offset < $1.offset
                     : $0.element.score.total > $1.element.score.total
             }
             .map(\.element)
+        // The future term, if it is on: a bounded in-tier bonus for the top few
+        // candidates that leave the most of the pool still reachable.
+        QueueOrderScorer.applyFuture(
+            to: &ranked, analysis: { self.analyses[$0] },
+            config: config, plannerConfig: plannerConfig)
+        return ranked.compactMap { entry in
+            byID[entry.key].map { Candidate(track: $0, score: entry.score) }
+        }
     }
 
     // MARK: - Lookahead chain (predev §2.1 / §2.2)
@@ -418,28 +428,40 @@ final class QueueOrderSelector {
         while out.count < depth, !pool.isEmpty {
             let outgoing = input.analyses[outgoingID]
             let outgoingArtists = input.artistIDs[outgoingID] ?? []
-            var best: (index: Int, id: Int, score: QueueOrderScore)?
-            for (index, id) in pool.enumerated() {
+            var scored: [(key: Int, score: QueueOrderScore)] = []
+            for id in pool {
                 guard let incoming = input.analyses[id] else { continue }
                 let planned = TransitionPlanner.plan(
                     outgoing: outgoing, incoming: incoming, stems: .none,
                     config: input.plannerConfig,
                     context: .init(outgoingLyricLineEnds: []))
-                let score = QueueOrderScorer.score(
+                scored.append((id, QueueOrderScorer.score(
                     outgoing: outgoing, incoming: incoming, planned: planned,
                     lostRounds: aging[id] ?? 0,
                     sharesArtist: !outgoingArtists.isEmpty
                         && !(input.artistIDs[id] ?? []).isDisjoint(with: outgoingArtists),
-                    config: input.config, plannerConfig: input.plannerConfig)
-                // Ties break on list order, which `pool` is in.
-                if best == nil || score.total > best!.score.total { best = (index, id, score) }
+                    config: input.config, plannerConfig: input.plannerConfig)))
             }
-            guard let winner = best else { break }
-            out.append(ChainResult(id: winner.id, score: winner.score))
-            for id in pool where id != winner.id { aging[id, default: 0] += 1 }
-            aging[winner.id] = nil
-            pool.remove(at: winner.index)
-            outgoingID = winner.id
+            // Ties break on list order, which `pool` is in.
+            var ranked = scored.enumerated()
+                .sorted {
+                    $0.element.score.total == $1.element.score.total
+                        ? $0.offset < $1.offset
+                        : $0.element.score.total > $1.element.score.total
+                }
+                .map(\.element)
+            // The chain runs the same pick the real seam will, future term
+            // included — a preview that scored differently would be previewing
+            // a different player. It can afford to: this is a detached task.
+            QueueOrderScorer.applyFuture(
+                to: &ranked, analysis: { input.analyses[$0] },
+                config: input.config, plannerConfig: input.plannerConfig)
+            guard let winner = ranked.first else { break }
+            out.append(ChainResult(id: winner.key, score: winner.score))
+            for id in pool where id != winner.key { aging[id, default: 0] += 1 }
+            aging[winner.key] = nil
+            pool.removeAll { $0 == winner.key }
+            outgoingID = winner.key
         }
         return out
     }

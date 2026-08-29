@@ -76,7 +76,10 @@ usage:
             4, then 16, stopping the moment one is good enough — reported with
             its downloads-per-pick cost) vs `greedy (all cached)` (every
             remaining track is in the pool, the ceiling a fully cached playlist
-            gives the selector). Offline and read-only — it never analyzes and never hits
+            gives the selector). Every row is also cut into thirds — first,
+            middle, last — because greedy's quality is front-loaded and one
+            overall percentage averages that collapse away.
+            Offline and read-only — it never analyzes and never hits
             the network, so a file without an `.analysis.json` sidecar is
             skipped. Point it straight at ~/Library/Caches/Kumone/Audio.
             --window      pool size for the windowed schedule (default 4)
@@ -92,7 +95,10 @@ usage:
                           refresh) and stop. The selector runs on the main
                           actor, so these decide what may run there.
             --order-set   queue-order weights, e.g. --order-set agingEpsilon=0.5
-                          (`audition knobs` lists them under "queue order")
+                          (`audition knobs` lists them under "queue order").
+                          `futureMode=0|1|2` toggles the future-richness term
+                          (off / degree / rollout) — it ships off, and this is
+                          how the negative result in predev §5.2 is reproduced.
 
   sweep     plan every adjacent seam inside each `p<N>-…` playlist twice — once
             with a layer off and once with it on — and table what moved. Plans
@@ -1233,6 +1239,22 @@ func orderShare(_ part: Int, _ whole: Int) -> Double {
     whole == 0 ? 0 : 100 * Double(part) / Double(whole)
 }
 
+/// The beat-matched share of the first / middle / last third of a schedule.
+///
+/// The overall share is an average, and an average hides exactly the failure
+/// this column exists to catch: greedy spending its compatible pairs early and
+/// leaving the tail to escape clusters on aging alone.
+func thirdsBar(_ schedule: Audition.OrderSchedule) -> String {
+    guard schedule.pairs > 0 else { return "—" }
+    return "thirds " + schedule.thirds.map {
+        String(format: "%.0f %%", $0.share)
+    }.joined(separator: " / ")
+}
+
+func thirdsDetail(_ schedule: Audition.OrderSchedule) -> String {
+    schedule.thirds.map { "\($0.beatMatched)/\($0.pairs)" }.joined(separator: " · ")
+}
+
 /// The escalation's price tag, in one line: what a pick costs on average, what
 /// the worst one cost, and how often "good enough" was actually reached.
 func escalationCostLine(_ e: Audition.OrderEscalation) -> String {
@@ -1299,9 +1321,13 @@ func runOrder(_ args: Arguments) {
                 orderConfig: orderConfigOverrides(args))
             print(String(
                 format: "\npool %d tracks\n  one plan+score   %8.3f ms"
-                    + "\n  one rank (pool)  %8.1f ms   ← what `pick` costs"
+                    + "\n  one rank (pool)  %8.1f ms"
+                    + "\n  future (%@, K=%d, cap %d)  %8.1f ms"
+                    + "\n  one pick         %8.1f ms   ← rank + future, against a 50 ms tripwire"
                     + "\n  chain (depth %d) %8.1f ms   ← what one lookahead refresh costs",
-                bench.poolSize, bench.planMS, bench.rankMS, bench.depth, bench.chainMS))
+                bench.poolSize, bench.planMS, bench.rankMS,
+                bench.futureMode, bench.futureTopK, bench.futurePoolCap, bench.futureMS,
+                bench.pickMS, bench.depth, bench.chainMS))
         } catch {
             fail("bench: \(error.localizedDescription)")
         }
@@ -1315,7 +1341,8 @@ func runOrder(_ args: Arguments) {
     let orderOverrides = orderConfigOverrides(args)
 
     var sections: [String] = []
-    var totals: [(label: String, pairs: Int, beatMatched: Int)] = []
+    var totals: [(label: String, pairs: Int, beatMatched: Int,
+                  thirds: [Audition.OrderSchedule.Third])] = []
     var rows: [String] = []
     var escalations: [Audition.OrderEscalation] = []
 
@@ -1349,10 +1376,12 @@ func runOrder(_ args: Arguments) {
                   + String(format: "  beatMatched %d/%d (%.0f %%)   ",
                            schedule.beatMatched, schedule.pairs,
                            orderShare(schedule.beatMatched, schedule.pairs))
-                  + tierBar(schedule))
-            totals.append((schedule.label, schedule.pairs, schedule.beatMatched))
+                  + thirdsBar(schedule) + "   " + tierBar(schedule))
+            totals.append((schedule.label, schedule.pairs, schedule.beatMatched,
+                           schedule.thirds))
             rows.append("| \(group.name) | \(schedule.label) | \(schedule.beatMatched)"
-                        + "/\(schedule.pairs) | \(tierBar(schedule)) |")
+                        + "/\(schedule.pairs) | \(thirdsDetail(schedule)) "
+                        + "| \(tierBar(schedule)) |")
         }
 
         print("  escalation cost         " + escalationCostLine(escalation))
@@ -1361,7 +1390,8 @@ func runOrder(_ args: Arguments) {
         sections.append("**escalation cost** — " + escalationCostLine(escalation) + "\n")
         for schedule in schedules {
             sections.append("**\(schedule.label)** — beatMatched \(schedule.beatMatched)"
-                            + "/\(schedule.pairs) · \(tierBar(schedule))\n")
+                            + "/\(schedule.pairs) · \(thirdsBar(schedule)) "
+                            + "(\(thirdsDetail(schedule))) · \(tierBar(schedule))\n")
             sections.append(schedule.names.enumerated().map { i, name in
                 "\(i + 1). \(name)"
                     + (i < schedule.tiers.count ? "  →  _\(schedule.tiers[i])_" : "")
@@ -1372,8 +1402,8 @@ func runOrder(_ args: Arguments) {
         if let greedy = schedules.last, !greedy.steps.isEmpty {
             sections.append("<details><summary>candidate scores (\(greedy.label))</summary>\n")
             sections.append("| seam | candidate | tier | tempo | key | style | energy "
-                            + "| aging | same artist | total |")
-            sections.append("|---|---|---|---|---|---|---|---|---|---|")
+                            + "| aging | same artist | future | total |")
+            sections.append("|---|---|---|---|---|---|---|---|---|---|---|")
             for step in greedy.steps {
                 for c in step.candidates {
                     sections.append("| \(step.position). \(step.from) → | "
@@ -1381,7 +1411,7 @@ func runOrder(_ args: Arguments) {
                                     + " | \(c.tier) | \(f(c.tempoAffinity)) | \(f(c.keyAffinity))"
                                     + " | \(f(c.styleAffinity)) | \(f(c.energyContinuity))"
                                     + " | \(f(c.aging)) | \(f(c.sameArtistPenalty))"
-                                    + " | \(f(c.total)) |")
+                                    + " | \(f(c.futureRichness)) | \(f(c.total)) |")
                 }
             }
             sections.append("\n</details>\n")
@@ -1432,19 +1462,38 @@ func runOrder(_ args: Arguments) {
                    + "candidate is good enough, so it is the only row here that comes with a "
                    + "cost.",
                    ""]
-    var byLabel: [String: (pairs: Int, beatMatched: Int)] = [:]
+    var byLabel: [String: (pairs: Int, beatMatched: Int, thirds: [(Int, Int)])] = [:]
     var labelOrder: [String] = []
     for t in totals {
-        if byLabel[t.label] == nil { labelOrder.append(t.label) }
-        byLabel[t.label, default: (0, 0)].pairs += t.pairs
-        byLabel[t.label, default: (0, 0)].beatMatched += t.beatMatched
+        if byLabel[t.label] == nil {
+            labelOrder.append(t.label)
+            byLabel[t.label] = (0, 0, [(0, 0), (0, 0), (0, 0)])
+        }
+        byLabel[t.label]!.pairs += t.pairs
+        byLabel[t.label]!.beatMatched += t.beatMatched
+        for i in 0..<3 {
+            byLabel[t.label]!.thirds[i].0 += t.thirds[i].beatMatched
+            byLabel[t.label]!.thirds[i].1 += t.thirds[i].pairs
+        }
     }
-    summary.append("| schedule | beat-matched pairs | share |")
-    summary.append("|---|---|---|")
+    summary.append("Each schedule is also cut into **thirds** — the first, middle and last "
+                   + "third of its seams. The overall share is an average, and it hides the "
+                   + "failure mode this column exists to catch: a greedy that spends the "
+                   + "compatible pairs while the pool is still rich and leaves the tail "
+                   + "escaping clusters on aging alone.")
+    summary.append("")
+    summary.append("| schedule | beat-matched pairs | share | first third | middle | last third |")
+    summary.append("|---|---|---|---|---|---|")
     for label in labelOrder {
         let t = byLabel[label]!
-        summary.append(String(format: "| %@ | %d/%d | %.0f %% |", label, t.beatMatched,
-                              t.pairs, orderShare(t.beatMatched, t.pairs)))
+        let cells = t.thirds.map { third in
+            String(format: "%d/%d (%.0f %%)", third.0, third.1,
+                   orderShare(third.0, third.1))
+        }
+        summary.append(String(format: "| %@ | %d/%d | %.0f %% | %@ | %@ | %@ |",
+                              label, t.beatMatched, t.pairs,
+                              orderShare(t.beatMatched, t.pairs),
+                              cells[0], cells[1], cells[2]))
     }
     summary.append("")
     if !escalations.isEmpty {
@@ -1474,7 +1523,8 @@ func runOrder(_ args: Arguments) {
     summary.append("")
 
     let document = (summary
-                    + ["| playlist | schedule | beat-matched | tiers |", "|---|---|---|---|"]
+                    + ["| playlist | schedule | beat-matched | thirds (1st · mid · last) "
+                       + "| tiers |", "|---|---|---|---|---|"]
                     + rows + [""] + sections).joined(separator: "\n") + "\n"
     emitSweep(document, args)
 }
