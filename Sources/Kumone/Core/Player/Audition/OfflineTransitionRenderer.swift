@@ -282,7 +282,13 @@ enum OfflineTransitionRenderer {
         // How long the post-overlap settling phase runs, if at all.
         var settleDuration: TimeInterval = 0
         if case .beatMatched(let p) = planned.plan, abs(p.incomingRate - 1) > 0.001 {
-            settleDuration = TransitionAutomation.rateReleaseDuration(planned.plan)
+            // Zero under a post-swap glide that finished inside the overlap:
+            // the deck is already at unity, so the settle loop below runs no
+            // ticks — but its epilogue (the outgoing deck neutralized, the
+            // bent-rate pad let go of) still has to run, which is why
+            // `restoringRate` stays keyed off the bend and not off this.
+            settleDuration = TransitionAutomation.rateReleaseDuration(
+                planned.plan, geometry: geometry)
         }
         if planned.style.outroEffect == .echoOut, geometry.overlapDuration > 0 {
             settleDuration = max(settleDuration, TransitionAutomation.echoTailDuration)
@@ -494,7 +500,13 @@ enum OfflineTransitionRenderer {
                             incoming: StemTechniqueLayer.Side(
                                 buffer: inBuffer, source: incomingURL,
                                 windowStart: inPoint, overlapStartFrame: 0,
-                                rate: incomingRate),
+                                rate: incomingRate,
+                                // The incoming deck may walk back to unity
+                                // partway through the overlap, in which case
+                                // `incomingRate` alone no longer says where it
+                                // is in its own song; see `Side.glide`.
+                                glide: TransitionAutomation.incomingGlide(
+                                    for: planned.plan, geometry: geometry)),
                             geometry: geometry, provider: provider)
                     } else {
                         stemApplied = try StemTechniqueLayer.apply(
@@ -643,7 +655,8 @@ enum OfflineTransitionRenderer {
                 while settled < settleDuration {
                     let s = TransitionAutomation.settleFrame(
                         plan: planned.plan, restoringRate: restoringRate,
-                        echoTailRinging: tailRinging, elapsed: settled)
+                        echoTailRinging: tailRinging, elapsed: settled,
+                        geometry: geometry)
                     if restoringRate { to.timePitch.rate = s.incomingRate }
                     if tailRinging {
                         from.delay.wetDryMix = s.outgoingDelayWetDryMix

@@ -79,6 +79,25 @@ enum TransitionPlanner {
         /// enough that 6 % unwinds as a settle instead of a click, short enough
         /// that the artifact is gone before the new track's first phrase is.
         var rampReleaseSeconds: TimeInterval = 3
+        /// Start the incoming deck's walk back to unity **at the bass swap**,
+        /// spending the outgoing deck's exit on it, instead of holding the bend
+        /// for the whole overlap and releasing over `rampReleaseSeconds`
+        /// afterwards.
+        ///
+        /// Same total bend either way; what changes is *where* it is spent. Held
+        /// through the overlap, the artifact lands on the deck that owns the
+        /// floor from the swap on and is alone from the seam on — the worst
+        /// listening position in the whole hand-over, and what a listener
+        /// described as the new song starting underwater and then healing.
+        /// Glided from the swap, it is largest while the outgoing track is
+        /// still there to mask it, smallest by the time the incoming one is
+        /// exposed, and gone at `transition complete` rather than three seconds
+        /// later. Off restores the old curve exactly; the plan carries the
+        /// decision, so the engine, the offline render and a pre-rendered
+        /// segment cannot disagree about it. See
+        /// `TransitionAutomation.incomingGlide` for what it costs (beat
+        /// alignment drifts after the swap, deliberately).
+        var rampGlideBackFromSwap: Bool = true
         /// The beat-match caps that apply **instead** of `maxBPMDeltaRatio` /
         /// `maxRateDeviation` while `tempoRampEnabled` is on.
         ///
@@ -106,6 +125,41 @@ enum TransitionPlanner {
         /// the two and not the other.
         var rampMaxBPMDeltaRatio: Double = 0.115
         var rampMaxRateDeviation: Double = 0.065
+
+        /// What share of the tempo gap the **outgoing** deck absorbs, with the
+        /// rest going to the incoming one. Only read while `tempoRampEnabled`
+        /// is on; a stepped plan still meets exactly in the middle.
+        ///
+        /// **The two decks do not pay the same price for the same bend.** Time
+        /// stretching costs a phase-vocoder artifact — the watery, phasey
+        /// colour of the unit doing work — for as long as the deck is off
+        /// unity, and the two decks are off unity in front of very different
+        /// audiences. The outgoing deck's bend is spent while it is *leaving*:
+        /// masked by the incoming track underneath it, then by the staged EQ
+        /// carving its bands away, and finally by its own exit. The incoming
+        /// deck's is spent while it is *arriving* — it takes the floor at the
+        /// swap and then is the only thing playing, with nothing to hide behind
+        /// and a listener's full attention on it. Splitting the gap evenly
+        /// therefore puts the same artifact on the exposed side as on the
+        /// masked one, which is what a listener reported as the new song
+        /// opening underwater and then clearing up.
+        ///
+        /// 0.7 moves most of the work onto the side that can hide it. Combined
+        /// with the post-swap glide back to unity
+        /// (`TransitionAutomation.incomingGlide`), the exposed deck's worst
+        /// case drops from about half the gap held for the whole overlap to
+        /// under a third of it, shrinking from the swap onwards.
+        ///
+        /// **At the cap the split degrades toward 50/50, deliberately.** The
+        /// share is applied first and then clamped: if 0.7 of the gap would
+        /// bend the outgoing deck past `rampMaxRateDeviation`, it is held at
+        /// the cap and the remainder falls to the incoming deck. So a pair at
+        /// the very edge of `rampMaxBPMDeltaRatio` ends up close to an even
+        /// split again — there is nowhere else for the deviation to go, and the
+        /// alternative would be refusing the beat-match outright. 1.0 would put
+        /// the whole gap on the outgoing deck (and, past ~9.3 %, be clamped
+        /// back); 0.5 restores the old behaviour exactly.
+        var rampBendShareOutgoing: Double = 0.7
 
         // --- Dominant-deck blend.
 
@@ -144,6 +198,14 @@ enum TransitionPlanner {
         }
         var beatMatchRateCap: Double {
             tempoRampEnabled ? rampMaxRateDeviation : maxRateDeviation
+        }
+        /// The bend share actually in force. A stepped plan is always an even
+        /// meet-in-the-middle: the asymmetry buys down an artifact that only
+        /// the glide's widened caps make big enough to matter, and keeping the
+        /// stepped split at 0.5 is what keeps a `tempoRampEnabled = false` plan
+        /// bit-identical to the pre-ramp planner.
+        var beatMatchBendShareOutgoing: Double {
+            tempoRampEnabled ? Swift.min(1, Swift.max(0, rampBendShareOutgoing)) : 0.5
         }
         /// Coefficient of variation below which an RMS slice counts as steady.
         /// Deliberately loose: longer 8-bar overlaps are preferred whenever the
@@ -1414,8 +1476,10 @@ enum TransitionPlanner {
         // question about a config field nobody was looking at.
         let bpmCap = config.beatMatchBPMDeltaCap
         let rateCap = config.beatMatchRateCap
+        let bendShare = config.beatMatchBendShareOutgoing
         let regime = config.tempoRampEnabled
-            ? String(format: "ramped (%.1f s glide)", config.rampLeadSeconds)
+            ? String(format: "ramped (%.1f s glide, %.0f/%.0f split)",
+                     config.rampLeadSeconds, bendShare * 100, (1 - bendShare) * 100)
             : "stepped"
         guard note(&trace, .beatMatch, "bpmDelta", bpmDelta <= bpmCap,
                    bpmDelta, bpmCap,
@@ -1425,8 +1489,29 @@ enum TransitionPlanner {
                           bpmDelta * 100, bpmCap * 100, regime))
         else { return nil }
 
-        // Meet in the middle; how far each deck may bend is the regime's cap.
-        let targetBPM = (outgoing.bpm + foldedBPM) / 2
+        // Where the two decks meet, and how far each may bend to get there.
+        //
+        // An even split is written as the midpoint it always was rather than as
+        // `o + 0.5·(f − o)`: the two are the same number in exact arithmetic but
+        // not in `Double`, and "a plan made with the ramp off is what it was" is
+        // a promise about the bits, not about the algebra. The share path is
+        // therefore only taken when the share is actually asymmetric — which is
+        // also the only case that can need the clamp below.
+        var targetBPM = (outgoing.bpm + foldedBPM) / 2
+        if bendShare != 0.5 {
+            // The outgoing deck takes `bendShare` of the gap; the incoming one
+            // takes what is left. Clamped to the regime's cap, which is what
+            // spills the excess onto the other deck: `targetBPM` held at the
+            // cap *is* the remainder landing on the incoming side, and it is
+            // what makes the effective split degrade toward 50/50 for pairs at
+            // the edge of `beatMatchBPMDeltaCap` (see `rampBendShareOutgoing`).
+            // Whatever is left over after that spill is what the rate gate
+            // below refuses, exactly as it always did.
+            let bend = outgoing.bpm * rateCap
+            targetBPM = Swift.min(Swift.max(outgoing.bpm + bendShare * (foldedBPM - outgoing.bpm),
+                                            outgoing.bpm - bend),
+                                  outgoing.bpm + bend)
+        }
         let outgoingRate = targetBPM / outgoing.bpm
         let incomingRate = targetBPM / foldedBPM
         guard note(&trace, .beatMatch, "rateDeviation",
@@ -1588,7 +1673,9 @@ enum TransitionPlanner {
                 // to glide, and how far ahead" has to live. Zero — a plan made
                 // with the knob off — is read everywhere as the old step.
                 rampLeadSeconds: config.tempoRampEnabled ? config.rampLeadSeconds : 0,
-                rampReleaseSeconds: config.tempoRampEnabled ? config.rampReleaseSeconds : 0)
+                rampReleaseSeconds: config.tempoRampEnabled ? config.rampReleaseSeconds : 0,
+                rampGlideBackFromSwap: config.tempoRampEnabled
+                    && config.rampGlideBackFromSwap)
         }
         let plain = made(bars: bars, outPoint: outPoint)
         guard stems == .ready else { return (plain, nil) }

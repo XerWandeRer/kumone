@@ -102,9 +102,12 @@ import Foundation
             Issue.record("expected beatMatched")
             return
         }
-        // Target tempo splits the difference: (120+124)/2 = 122.
-        #expect(abs(Double(plan.outgoingRate) - 122.0 / 120.0) < 1e-4)
-        #expect(abs(Double(plan.incomingRate) - 122.0 / 124.0) < 1e-4)
+        // The outgoing deck absorbs 70 % of the 4 BPM gap (rampBendShareOutgoing),
+        // so the two meet at 120 + 0.7 × 4 = 122.8 rather than at the midpoint.
+        #expect(abs(Double(plan.outgoingRate) - 122.8 / 120.0) < 1e-4)
+        #expect(abs(Double(plan.incomingRate) - 122.8 / 124.0) < 1e-4)
+        // …and the exposed deck's bend really is the smaller of the two.
+        #expect(abs(Double(plan.incomingRate) - 1) < abs(Double(plan.outgoingRate) - 1))
         #expect(abs(Double(plan.outgoingRate) - 1) <= 0.04)
         #expect(abs(Double(plan.incomingRate) - 1) <= 0.04)
         // Steady envelopes on both sides → 8 bars.
@@ -115,7 +118,7 @@ import Foundation
         let expectedInPoint = try #require(
             incoming.downbeats.first { $0 >= incoming.introEnd - 0.05 })
         #expect(abs(plan.inPoint - expectedInPoint) < 1e-9)
-        #expect(abs(plan.overlapDuration - 8 * 4 * 60 / 122) < 1e-9)
+        #expect(abs(plan.overlapDuration - 8 * 4 * 60 / 122.8) < 1e-9)
         #expect(abs(plan.bassSwapOffset - plan.overlapDuration / 2) < 1e-9)
     }
 

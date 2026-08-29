@@ -506,8 +506,17 @@ struct BeatMatchedPlan: Sendable {
     var rampLeadSeconds: TimeInterval = 0
     /// Seconds over which the incoming deck is let back from `incomingRate` to
     /// 1.0 once it is the only thing audible. 0 → the legacy
-    /// `TransitionAutomation.rateRestoreDuration`.
+    /// `TransitionAutomation.rateRestoreDuration`. Under
+    /// `rampGlideBackFromSwap` this is only a *floor* on the glide's length,
+    /// which normally runs longer; see `TransitionAutomation.incomingGlide`.
     var rampReleaseSeconds: TimeInterval = 0
+    /// Whether the incoming deck starts walking back to unity **at the bass
+    /// swap** rather than after the overlap — moving the phase-vocoder artifact
+    /// off the deck that is about to be alone and onto the stretch where the
+    /// outgoing track still masks it. False, the default, is the old
+    /// hold-then-release and is what every plan built before the glide existed
+    /// reads as. See `TransitionAutomation.incomingGlide`.
+    var rampGlideBackFromSwap: Bool = false
 }
 
 extension TransitionPlan {

@@ -194,6 +194,64 @@ struct TransitionSegmentTests {
         #expect(segment.duration > TransitionSegmentRenderer.handoff + 4 + restore)
     }
 
+    // The post-swap glide's contract, seen from the splice — where it matters
+    // most, because a segment is *pre-rendered* and the deck has to pick the
+    // track up from it at the right place and the right speed.
+    //
+    // Three things have to hold at once, and the old hold-then-release curve
+    // satisfied them differently: the deck resumes at unity (so the tail window
+    // is an identity crossfade against audio the segment rendered unbent), it
+    // resumes at the position the glide's *integral* puts it at (not
+    // `overlap × incomingRate`), and the segment no longer has to carry a
+    // settling phase at all, which makes it shorter.
+    @Test func aGlidingSegmentHandsBackAtUnityAndAtTheGlidesIntegral() throws {
+        let beat = BeatMatchedPlan(
+            outPoint: 6, inPoint: 1, overlapBars: 4,
+            outgoingRate: 1.0, incomingRate: 1.04,
+            bassSwapOffset: 2, overlapDuration: 4,
+            rampLeadSeconds: 13, rampReleaseSeconds: 3,
+            rampGlideBackFromSwap: true)
+        var style = TransitionStyle(outroEffect: .fade, stagedEQ: true)
+        style.stemTechnique = .vocalDuck(depthDB: -9)
+        let planned = PlannedTransition(plan: .beatMatched(beat), style: style)
+        var req = request(planned)
+        req.planned = planned
+        let segment = try TransitionSegmentRenderer.render(req, provider: silentVocals)
+
+        let plan = TransitionPlan.beatMatched(beat)
+        let geometry = TransitionAutomation.Geometry(plan: plan)
+        let glide = try #require(TransitionAutomation.incomingGlide(for: plan,
+                                                                   geometry: geometry))
+        let handoff = TransitionSegmentRenderer.handoff
+        // Swap at 2 s of a 4 s overlap, so the glide is floored at the plan's
+        // 3 s release and spills 1 s past the overlap into the settling phase.
+        let spill = TransitionAutomation.rateReleaseDuration(plan, geometry: geometry)
+        #expect(abs(spill - 1) < 1e-9)
+        #expect(abs(segment.duration - (handoff + 4 + spill + handoff)) < 0.05,
+                "head + overlap + what is left of the glide + tail (\(segment.duration))")
+        // Strictly shorter than the old curve, which always paid the full
+        // `rampReleaseSeconds` after the overlap.
+        #expect(segment.duration < handoff + 4 + beat.rampReleaseSeconds + handoff)
+
+        // The hand-back position is the glide's integral across the overlap and
+        // its spill — measurably *not* what a constant `incomingRate` gives.
+        let consumed = segment.incomingResume - beat.inPoint
+        let expected = glide.sourceAdvance(to: geometry.overlapDuration + spill)
+        #expect(abs(consumed - expected) < 0.05,
+                "expected \(expected)s of incoming source, got \(consumed)s")
+        let naive = (4 + spill) * Double(beat.incomingRate)
+        #expect(consumed < naive - 0.02,
+                "a gliding deck eats less than a held one (\(consumed) vs \(naive))")
+
+        // And the tail the deck crossfades against was rendered at unity, which
+        // is what makes the identity crossfade an identity: past the hand-back
+        // the segment advances one source second per rendered second, matching
+        // a deck that resumes unbent.
+        let tailEnd = segment.incomingTime(at: segment.duration - 0.02)
+        #expect(abs((tailEnd - segment.incomingResume) - (handoff - 0.02)) < 0.02,
+                "the tail window must be unbent (\(segment.incomingResume) → \(tailEnd))")
+    }
+
     // MARK: - Refusals
 
     // Every way the pre-render declines, so the caller falls back to the live

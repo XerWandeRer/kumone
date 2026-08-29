@@ -344,9 +344,18 @@ import Foundation
             Issue.record("expected the near-miss seam to beat-match now")
             return
         }
-        let bend = abs(Double(plan.incomingRate) - 1)
-        #expect(bend > 0.06 && bend <= 0.065,
-                "the seam needs the extra half percent (\(bend))")
+        // The near-miss now lands on the *outgoing* deck: `rampBendShareOutgoing`
+        // offers it 70 % of an 11.5 % gap, which is past the cap, so it is held
+        // exactly at 6.5 % and the remainder spills to the incoming side. That
+        // spill is what the extra half percent buys — at 6.0 % the outgoing
+        // deck clamps sooner, leaves the incoming one over the line, and the
+        // seam is refused (below).
+        let outBend = abs(Double(plan.outgoingRate) - 1)
+        let inBend = abs(Double(plan.incomingRate) - 1)
+        #expect(abs(outBend - 0.065) < 1e-4,
+                "the outgoing deck should sit exactly on the cap (\(outBend))")
+        #expect(inBend > 0.05 && inBend < outBend,
+                "and the spill should land under it on the exposed side (\(inBend))")
 
         // The same seam under the old cap is refused, so this is the knob.
         var old = TransitionPlanner.Config.standard

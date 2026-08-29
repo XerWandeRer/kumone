@@ -2620,12 +2620,18 @@ final class PlaybackEngine: @unchecked Sendable {
                              + "\(tr.to.rawValue)=\(deckStates[tr.to].map(journalEQ) ?? "?")")
         eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
 
-        if case .beatMatched(let plan) = tr.plan, abs(plan.incomingRate - 1) > 0.001 {
+        // A plan with a post-swap glide has normally landed the deck on unity
+        // *inside* the overlap, so there is no release left to run: the
+        // settling phase is skipped and the pad goes home immediately. That is
+        // the glide working, not a missing step — the `else` branch below is
+        // exactly what the release would have finished with.
+        let rateRelease = TransitionAutomation.rateReleaseDuration(tr.plan)
+        if case .beatMatched(let plan) = tr.plan, abs(plan.incomingRate - 1) > 0.001,
+           rateRelease > 0 {
             tr.restoringRate = true
             PlaybackJournal.note(String(
                 format: "rate release start deck=%@ from=×%.4f over=%.2fs ",
-                tr.to.rawValue, to.timePitch.rate,
-                TransitionAutomation.rateReleaseDuration(tr.plan)) + journalRates)
+                tr.to.rawValue, to.timePitch.rate, rateRelease) + journalRates)
         } else {
             to.timePitch.rate = 1
             releaseRatePadLocked(to)

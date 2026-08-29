@@ -855,7 +855,15 @@ public enum Audition {
                     outPoint: min(p.outPoint, max(0, outgoingDuration - fade)),
                     inPoint: p.inPoint, overlapBars: p.overlapBars,
                     outgoingRate: p.outgoingRate, incomingRate: p.incomingRate,
-                    bassSwapOffset: fade / 2, overlapDuration: fade)),
+                    bassSwapOffset: fade / 2, overlapDuration: fade,
+                    // The ramp fields ride along. Rebuilding the plan without
+                    // them used to hand the renderer a *stepped* hand-over and
+                    // call it a length override: `--fade` says "keep the mix
+                    // points, change how long the overlap runs", and both
+                    // glides are part of the hand-over, not of its length.
+                    rampLeadSeconds: p.rampLeadSeconds,
+                    rampReleaseSeconds: p.rampReleaseSeconds,
+                    rampGlideBackFromSwap: p.rampGlideBackFromSwap)),
                 style: planned.style, rideDB: planned.rideDB)
         case .gapless:
             return PlannedTransition(

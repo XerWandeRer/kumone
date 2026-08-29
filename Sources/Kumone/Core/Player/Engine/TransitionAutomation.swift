@@ -153,6 +153,135 @@ enum TransitionAutomation {
         return TempoRamp(start: end - p.rampLeadSeconds, end: end, target: p.outgoingRate)
     }
 
+    // MARK: - The incoming deck's post-swap glide
+
+    /// The incoming deck's walk back to unity rate, as pure geometry.
+    ///
+    /// **The problem.** A ramped beat-match bends both decks and then holds the
+    /// incoming one bent for the entire overlap plus a `rampReleaseSeconds`
+    /// release *after* the hand-over is complete. Every one of those seconds is
+    /// a second of phase-vocoder artifact, and they are spent in the worst
+    /// possible place: from the swap onwards the incoming track owns the floor,
+    /// and from `transition complete` it is the only thing playing. A listener
+    /// hears the new song open watery and then, a verse in, heal — which is
+    /// exactly what "the deck reached unity" sounds like from the outside.
+    ///
+    /// **The fix.** Start the release *at the swap* instead of after the
+    /// overlap, and spend the whole of the outgoing deck's exit on it. The bend
+    /// is then largest while the outgoing track is still there to mask it and
+    /// smallest by the time the incoming one is exposed, and the deck is at
+    /// unity when the hand-over completes rather than three seconds later. Same
+    /// total bend, moved to where it cannot be heard.
+    ///
+    /// **What it costs: beat alignment drifts after the swap, on purpose.** The
+    /// two grids are locked at the seam and stay locked through the bass swap,
+    /// which is what a beat-match is for. Past it the incoming deck slows or
+    /// speeds toward its own tempo while the outgoing one holds the matched
+    /// one, so the two drift apart by the integral of the glide — up to about
+    /// half the bend times the glide's length, a few hundred milliseconds over
+    /// a long overlap. That is inaudible as a *phase* error because there is
+    /// nothing left to phase against: past the swap the outgoing deck has lost
+    /// its low end to the staged EQ and is fading out under a dominant incoming
+    /// track. The trade is deliberate — a drifting kick nobody can hear against
+    /// a phase vocoder everybody can.
+    ///
+    /// Smoothstepped rather than linear, unlike the outgoing lead glide: this
+    /// curve has to *join* two constant stretches (the held bend before it, the
+    /// unity after it) at both ends, so zero slope at the joins is what makes
+    /// the whole rate curve C¹ — no corner for the vocoder to ring on. The lead
+    /// glide has no such constraint at its start (it leaves unity, and its
+    /// closed-form position↔time map is what lands the deck on the out point),
+    /// which is why the two shapes differ.
+    struct IncomingGlide: Equatable, Sendable {
+        /// The bent rate the deck holds from the top of the overlap…
+        let bent: Float
+        /// …until here, seconds into the overlap (the swap)…
+        let start: TimeInterval
+        /// …reaching 1.0 here. Normally the end of the overlap; later only when
+        /// the post-swap stretch is shorter than the plan's own
+        /// `rampReleaseSeconds`, in which case the tail spills into the
+        /// settling phase and `TransitionAutomation.rateReleaseDuration`
+        /// reports it.
+        let end: TimeInterval
+
+        var glideSeconds: TimeInterval { end - start }
+
+        /// Rate `t` seconds into the overlap. Monotone between `bent` and 1.
+        func rate(at t: TimeInterval) -> Float {
+            guard end > start else { return t >= end ? 1 : bent }
+            return bent + (1 - bent) * TransitionAutomation.ramp(t, from: start, to: end)
+        }
+
+        /// Source seconds of the incoming track consumed in the first `t`
+        /// seconds of the overlap — ∫₀ᵗ rate.
+        ///
+        /// Closed form, because the smoothstep is a polynomial: with
+        /// u = (t − start)/G, ∫₀ᵘ (3x² − 2x³) dx = u³ − u⁴/2. Anything that has
+        /// to put an overlap-relative instant on the incoming song's own clock
+        /// needs this — the stem layer's separation window and its lane→sample
+        /// map above all, where treating the glide as a constant rate would
+        /// misplace a compiled vocal hand-over by hundreds of milliseconds.
+        func sourceAdvance(to t: TimeInterval) -> TimeInterval {
+            let t = Swift.max(0, t)
+            let flat = Swift.min(t, start)
+            var total = Double(bent) * flat
+            guard glideSeconds > 0 else {
+                return total + (t > start ? t - start : 0)
+            }
+            let u = Swift.min(1, Swift.max(0, (t - start) / glideSeconds))
+            if u > 0 {
+                total += Double(bent) * glideSeconds * u
+                total += Double(1 - bent) * glideSeconds * (u * u * u - u * u * u * u / 2)
+            }
+            total += Swift.max(0, t - end)
+            return total
+        }
+
+        /// Inverse of `sourceAdvance`: the overlap-relative instant at which
+        /// the deck is `source` seconds into its window. Bisected rather than
+        /// solved — the forward map is a quartic — over a bracket the caller
+        /// can always supply, which is what makes it monotone-safe.
+        func overlapElapsed(atSource source: TimeInterval,
+                            within limit: TimeInterval) -> TimeInterval {
+            guard source > 0 else { return 0 }
+            var lo: TimeInterval = 0
+            var hi = Swift.max(limit, end)
+            guard sourceAdvance(to: hi) > source else { return hi }
+            for _ in 0..<48 {
+                let mid = (lo + hi) / 2
+                if sourceAdvance(to: mid) < source { lo = mid } else { hi = mid }
+            }
+            return (lo + hi) / 2
+        }
+    }
+
+    /// The post-swap glide a plan implies, or nil when it implies none — a plan
+    /// made with `rampGlideBackFromSwap` off (every plan built before the glide
+    /// existed, and every one built with the knob down), a crossfade, or a
+    /// beat-match whose incoming deck is not bent at all. Nil is the old
+    /// hold-then-release behaviour everywhere.
+    static func incomingGlide(for plan: TransitionPlan,
+                              geometry: Geometry) -> IncomingGlide? {
+        guard case .beatMatched(let p) = plan,
+              p.rampGlideBackFromSwap,
+              abs(p.incomingRate - 1) > 0.0005,
+              geometry.overlapDuration > 0
+        else { return nil }
+        let start = geometry.swapOffset
+        // The glide gets the whole post-swap stretch, and never less than the
+        // plan's own release: a degenerate geometry (a swap at 0.9 of a short
+        // overlap) would otherwise ask for the entire bend in a fraction of a
+        // second, which is a step. When the floor bites, the tail runs past the
+        // overlap and the settling phase finishes it — see `rateReleaseDuration`.
+        //
+        // Deliberately measured against `geometry.swapOffset` rather than the
+        // style's midpoint rule: the rate curve is the one thing the engine,
+        // the offline renderer and a pre-rendered segment must agree on
+        // sample-for-sample, and geometry is what all three share.
+        let length = Swift.max(geometry.overlapDuration - start, p.rampReleaseSeconds)
+        return IncomingGlide(bent: p.incomingRate, start: start, end: start + length)
+    }
+
     /// How fast a transition gain ride (`PlannedTransition.rideDB`) is let go
     /// of once the overlap is over, in dB per second — the **boost** side,
     /// where the ride is positive and releasing it walks the track back down.
@@ -394,7 +523,11 @@ enum TransitionAutomation {
 
             f.midpointReached = progress >= 0.5
             if case .beatMatched(let p) = plan {
-                f.incoming.rate = p.incomingRate
+                // Held at the matched rate to the swap, then glided home; a
+                // plan without the glide holds it for the whole overlap, which
+                // is what every path read before `IncomingGlide` existed.
+                f.incoming.rate = incomingGlide(for: plan, geometry: geometry)?.rate(at: t)
+                    ?? p.incomingRate
                 if p.rampLeadSeconds > 0 {
                     // The pre-seam glide already landed the deck on its matched
                     // rate a `segmentHandoff` before the out point, so the whole
@@ -623,28 +756,51 @@ enum TransitionAutomation {
         var isDone: Bool { rateRestoreDone && echoTailDone }
     }
 
-    /// How long the incoming deck's rate release takes. The plan's own
-    /// `rampReleaseSeconds` when it has one — the release is the back half of
-    /// the ramp gesture and is let go of at the same unhurried pace the ride
-    /// is — and the legacy 1.5 s otherwise, which is every plan made with the
-    /// ramp off.
-    static func rateReleaseDuration(_ plan: TransitionPlan) -> TimeInterval {
-        guard case .beatMatched(let p) = plan, p.rampReleaseSeconds > 0 else {
-            return rateRestoreDuration
+    /// How much of the incoming deck's rate release is left to run **after** the
+    /// overlap.
+    ///
+    /// Three cases, and the first is the one that ships:
+    ///
+    ///   - a plan with a post-swap glide that finished inside the overlap — the
+    ///     deck is already at unity when the hand-over completes, so there is
+    ///     nothing to release and this is **0**. Callers must treat that as "no
+    ///     settling needed", not as a degenerate duration;
+    ///   - a plan whose glide spilled past the overlap (a degenerate geometry;
+    ///     see `incomingGlide`) — what is left of it;
+    ///   - no glide at all: the plan's own `rampReleaseSeconds`, or the legacy
+    ///     1.5 s for a plan made with the ramp off.
+    static func rateReleaseDuration(_ plan: TransitionPlan,
+                                    geometry: Geometry? = nil) -> TimeInterval {
+        guard case .beatMatched(let p) = plan else { return rateRestoreDuration }
+        let geometry = geometry ?? Geometry(plan: plan)
+        if let glide = incomingGlide(for: plan, geometry: geometry) {
+            return Swift.max(0, glide.end - geometry.overlapDuration)
         }
-        return p.rampReleaseSeconds
+        return p.rampReleaseSeconds > 0 ? p.rampReleaseSeconds : rateRestoreDuration
     }
 
     static func settleFrame(plan: TransitionPlan, restoringRate: Bool,
-                            echoTailRinging: Bool, elapsed: TimeInterval) -> SettleFrame {
+                            echoTailRinging: Bool, elapsed: TimeInterval,
+                            geometry: Geometry? = nil) -> SettleFrame {
         var s = SettleFrame()
         if restoringRate, case .beatMatched(let p) = plan {
-            let progress = Float(min(1, elapsed / rateReleaseDuration(plan)))
-            s.incomingRate = p.incomingRate + (1 - p.incomingRate) * progress
-            if progress >= 1 {
-                s.incomingRate = 1
-            } else {
-                s.rateRestoreDone = false
+            let geometry = geometry ?? Geometry(plan: plan)
+            let remaining = rateReleaseDuration(plan, geometry: geometry)
+            if let glide = incomingGlide(for: plan, geometry: geometry) {
+                // The glide is one curve that happens to cross the end of the
+                // overlap; the settling phase just keeps walking it, so the
+                // rate is continuous across `transition complete` rather than
+                // restarting from the bent value.
+                s.incomingRate = glide.rate(at: geometry.overlapDuration + elapsed)
+                if elapsed < remaining { s.rateRestoreDone = false }
+            } else if remaining > 0 {
+                let progress = Float(min(1, elapsed / remaining))
+                s.incomingRate = p.incomingRate + (1 - p.incomingRate) * progress
+                if progress >= 1 {
+                    s.incomingRate = 1
+                } else {
+                    s.rateRestoreDone = false
+                }
             }
         }
         if echoTailRinging {

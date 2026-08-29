@@ -130,6 +130,15 @@ extension TransitionPlanner.Config {
                   + "变速期间一直在过变调器，会有“水声”，所以这里是越短越干净，只要别短到变成一个台阶。"
                   + "调大 = 速度回落更平缓，但水声拖得更久。",
               1, 20, 0.5, 1, \.rampReleaseSeconds),
+        boolField("rampGlideBackFromSwap", "beatmatch",
+                  "开 = 入曲的速度从【低频交接那一刻】就开始往原速滑回去，把整段出曲退场的时间都花在这上面，"
+                  + "叠加结束时它已经回到原速；关 = 老行为，整段叠加都把入曲摁在变速上，"
+                  + "交接完之后再用 rampReleaseSeconds 放回来。变速总量一样，差别是那点“水声”落在哪里："
+                  + "老行为把它全放在入曲接过场子、然后独自在响的那段——最藏不住的位置，"
+                  + "听感就是新歌一进来像在水里、过一会儿才“好了”。"
+                  + "代价：交接点之后两首歌的拍子会慢慢错开（几百毫秒），但那时出曲低频已经交出去且正在淡出，"
+                  + "听不出来。",
+                  \.rampGlideBackFromSwap),
         field("rampMaxBPMDeltaRatio", "beatmatch",
               "开了 tempoRampEnabled 时生效的速度差上限（替代 maxBPMDeltaRatio）。"
                   + "滑行让更大的变速听不出来，所以这条线可以放宽。",
@@ -137,6 +146,14 @@ extension TransitionPlanner.Config {
         field("rampMaxRateDeviation", "beatmatch",
               "开了 tempoRampEnabled 时生效的单曲变速上限（替代 maxRateDeviation）。",
               0, 0.2, 0.002, 3, \.rampMaxRateDeviation),
+        field("rampBendShareOutgoing", "beatmatch",
+              "对拍要凑的速度差里，【出曲】承担多少比例（剩下的给入曲）。只在 tempoRampEnabled 开着时生效。"
+                  + "变调器的“水声”只跟“变速持续了多久”有关，而出曲的变速是在它退场的路上、被入曲和分频"
+                  + "交接盖住的；入曲的变速却是它接过场子、独自在响的时候——同样的变速，一边听不见，"
+                  + "一边听得一清二楚。0.5 = 老的对半分；调大 = 把脏活推给出曲。"
+                  + "注意任何一边都不会超过 rampMaxRateDeviation：超了就卡在上限、余下的自动落到另一边，"
+                  + "所以速度差本来就贴着上限的那些曲子会自己退回接近对半分。",
+              0.5, 1, 0.05, 2, \.rampBendShareOutgoing),
         boolField("dominantDeckBlend", "beatmatch",
                   "开 = 长的对拍叠加里始终只有一首歌“坐镇”：出曲先稳住不动，入曲在它下面（被切掉低频）"
                       + "先升上来待命，到低频交接那一刻才接过场子，然后出曲才退场。"

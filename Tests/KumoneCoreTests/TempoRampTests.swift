@@ -58,14 +58,23 @@ import Foundation
         }
         #expect(stepped.rampLeadSeconds == 0)
         #expect(stepped.rampReleaseSeconds == 0)
+        #expect(!stepped.rampGlideBackFromSwap)
         #expect(abs(Double(stepped.outgoingRate) - 1) <= 0.04)
+        // A stepped plan still meets exactly in the middle: 120 and 129 fold to
+        // 124.5, which is the midpoint and *not* what a 70/30 share would give.
+        #expect(abs(Double(stepped.outgoingRate) - 124.5 / 120.0) < 1e-6)
+        #expect(abs(Double(stepped.incomingRate) - 124.5 / 129.0) < 1e-6)
         // And a pair the *ramped* caps would take is refused, so the widening
         // and the gesture really are one switch.
         if case .beatMatched = plan(120, 132, config: rampOff) {
             Issue.record("10 % apart must not beat-match with the ramp off")
         }
-        // No ramp fields means no ramp anywhere downstream.
+        // No ramp fields means no ramp anywhere downstream — neither the
+        // outgoing deck's pre-seam glide nor the incoming deck's walk home.
         #expect(TransitionAutomation.tempoRamp(for: .beatMatched(stepped)) == nil)
+        #expect(TransitionAutomation.incomingGlide(
+            for: .beatMatched(stepped),
+            geometry: TransitionAutomation.Geometry(plan: .beatMatched(stepped))) == nil)
     }
 
     /// The payoff: 10 % apart is beat-matchable with the glide, 12 % is not —
@@ -75,11 +84,18 @@ import Foundation
             Issue.record("expected beatMatched at 10 % apart")
             return
         }
-        // Meeting in the middle: 126 BPM, so each deck bends ~4.8 % — past the
-        // old ±4 % step limit and inside the ramped ±6 % one.
-        #expect(abs(Double(matched.outgoingRate) - 126.0 / 120.0) < 1e-4)
+        // A 10 % gap is more than the outgoing deck's 70 % share can take at a
+        // 6.5 % cap, so it sits *on* the cap and the rest spills to the
+        // incoming deck: 127.8 BPM, +6.5 % / −3.2 %. Both are past the old
+        // ±4 % step limit, which is what makes this a ramped-only pair.
+        #expect(abs(Double(matched.outgoingRate) - 127.8 / 120.0) < 1e-4)
         #expect(abs(Double(matched.outgoingRate) - 1) > 0.04)
-        #expect(abs(Double(matched.outgoingRate) - 1) <= 0.06)
+        #expect(abs(Double(matched.outgoingRate) - 1) <= 0.065 + 1e-6)
+        // The exposed deck gets the smaller half, which is the point of the
+        // asymmetric share.
+        #expect(abs(Double(matched.incomingRate) - 1)
+                < abs(Double(matched.outgoingRate) - 1))
+        #expect(matched.rampGlideBackFromSwap)
         #expect(matched.rampLeadSeconds == TransitionPlanner.Config.standard.rampLeadSeconds)
         #expect(matched.rampReleaseSeconds
                 == TransitionPlanner.Config.standard.rampReleaseSeconds)
@@ -219,8 +235,13 @@ import Foundation
         #expect(steppedLater.outgoing.rate == stepped.outgoingRate)
     }
 
-    /// The release is the ramp's back half: the incoming deck is let back to
-    /// unity over the plan's own `rampReleaseSeconds`, not the legacy 1.5 s.
+    /// A plan with the post-swap glide has **nothing left to release**: the
+    /// deck walked home inside the overlap, so the settling phase is a no-op
+    /// and `transition complete` finds it already at unity. That is the fix
+    /// working, not a missing step.
+    ///
+    /// A plan without the glide keeps the old back half — the plan's own
+    /// `rampReleaseSeconds`, or the legacy 1.5 s with the ramp off entirely.
     @Test func theRateReleaseFollowsThePlan() throws {
         guard case .beatMatched(let ramped) = plan(120, 132),
               case .beatMatched(let stepped) = plan(120, 129, config: rampOff)
@@ -228,23 +249,33 @@ import Foundation
             Issue.record("expected two beat-matched plans")
             return
         }
-        #expect(TransitionAutomation.rateReleaseDuration(.beatMatched(ramped))
-                == ramped.rampReleaseSeconds)
-        #expect(TransitionAutomation.rateReleaseDuration(.beatMatched(stepped))
-                == TransitionAutomation.rateRestoreDuration)
-
-        // Halfway through, halfway home; at the end, home and done.
-        let half = TransitionAutomation.settleFrame(
+        #expect(TransitionAutomation.rateReleaseDuration(.beatMatched(ramped)) == 0)
+        let atComplete = TransitionAutomation.settleFrame(
             plan: .beatMatched(ramped), restoringRate: true, echoTailRinging: false,
-            elapsed: ramped.rampReleaseSeconds / 2)
-        #expect(abs(half.incomingRate - (ramped.incomingRate + 1) / 2) < 1e-5)
+            elapsed: 0)
+        #expect(abs(atComplete.incomingRate - 1) < 1e-6)
+        #expect(atComplete.rateRestoreDone)
+
+        // The same plan with the glide switched off is the old gesture, whole.
+        var held = ramped
+        held.rampGlideBackFromSwap = false
+        #expect(TransitionAutomation.rateReleaseDuration(.beatMatched(held))
+                == held.rampReleaseSeconds)
+        let half = TransitionAutomation.settleFrame(
+            plan: .beatMatched(held), restoringRate: true, echoTailRinging: false,
+            elapsed: held.rampReleaseSeconds / 2)
+        #expect(abs(half.incomingRate - (held.incomingRate + 1) / 2) < 1e-5)
         #expect(!half.rateRestoreDone)
         let end = TransitionAutomation.settleFrame(
-            plan: .beatMatched(ramped), restoringRate: true, echoTailRinging: false,
-            elapsed: ramped.rampReleaseSeconds)
+            plan: .beatMatched(held), restoringRate: true, echoTailRinging: false,
+            elapsed: held.rampReleaseSeconds)
         #expect(end.incomingRate == 1)
         #expect(end.rateRestoreDone)
-        // The legacy plan still finishes at 1.5 s, to the sample.
+
+        // And a plan made with the ramp off still finishes at 1.5 s, to the
+        // sample.
+        #expect(TransitionAutomation.rateReleaseDuration(.beatMatched(stepped))
+                == TransitionAutomation.rateRestoreDuration)
         let legacy = TransitionAutomation.settleFrame(
             plan: .beatMatched(stepped), restoringRate: true, echoTailRinging: false,
             elapsed: TransitionAutomation.rateRestoreDuration)
@@ -322,6 +353,246 @@ import Foundation
             outgoing: outgoing, incoming: incoming, options: options)
         #expect(abs(mix.overlapStart - 8) < 0.01)
         #expect(abs((mix.outgoing.first?.source ?? -1) - 4) < 0.01)
+    }
+
+    // MARK: - The asymmetric bend split
+
+    /// The gap is split 70/30 onto the deck that can hide the artifact, and
+    /// the arithmetic is exact rather than approximately right.
+    @Test func theBendSplitFavoursTheOutgoingDeck() throws {
+        // 120 → 124: a 4 BPM gap, well inside the cap, so the share applies in
+        // full. 120 + 0.7 × 4 = 122.8.
+        guard case .beatMatched(let shared) = plan(120, 124) else {
+            Issue.record("expected beatMatched")
+            return
+        }
+        #expect(abs(Double(shared.outgoingRate) - 122.8 / 120) < 1e-6)
+        #expect(abs(Double(shared.incomingRate) - 122.8 / 124) < 1e-6)
+        // The share is of the *gap*, so the outgoing deck carries 70 % of the
+        // BPM move; expressed as rate deviations the two are 2.33 % and 0.97 %.
+        #expect(abs(abs(Double(shared.outgoingRate) - 1) - 0.7 * 4 / 120) < 1e-6)
+
+        // Moving the knob moves the split, and 0.5 is the old midpoint exactly.
+        var even = TransitionPlanner.Config.standard
+        even.rampBendShareOutgoing = 0.5
+        guard case .beatMatched(let middle) = plan(120, 124, config: even) else {
+            Issue.record("expected beatMatched at an even split")
+            return
+        }
+        #expect(abs(Double(middle.outgoingRate) - 122.0 / 120) < 1e-6)
+        #expect(abs(Double(middle.incomingRate) - 122.0 / 124) < 1e-6)
+        // Bit-identical to the pre-share planner: the even case is still
+        // written as the midpoint, not as `o + 0.5·(f − o)`.
+        #expect(middle.outgoingRate == Float(((120.0 + 124.0) / 2) / 120))
+    }
+
+    /// Past the cap the 70 % side clamps and the remainder spills to the other
+    /// deck, so the effective split degrades toward 50/50 rather than the plan
+    /// being refused.
+    @Test func theBendSplitClampsAtTheCapAndSpillsTheRemainder() throws {
+        let cap = TransitionPlanner.Config.standard.rampMaxRateDeviation
+        // 120 → 132 is a 10 % gap; 70 % of it would bend the outgoing deck
+        // 7 %, past the 6.5 % cap.
+        guard case .beatMatched(let clamped) = plan(120, 132) else {
+            Issue.record("expected beatMatched")
+            return
+        }
+        let out = abs(Double(clamped.outgoingRate) - 1)
+        let incoming = abs(Double(clamped.incomingRate) - 1)
+        #expect(abs(out - cap) < 1e-5, "the outgoing deck sits on the cap (\(out))")
+        #expect(incoming < cap, "and the spill lands under it (\(incoming))")
+        // Degraded toward even, but still not even: the exposed deck keeps the
+        // smaller share of a gap this wide.
+        #expect(incoming < out)
+        #expect(incoming > 0.3 * out, "the spill really is a spill, not a rounding error")
+
+        // A gap small enough for the full share does *not* clamp, so the clamp
+        // is a ceiling rather than a rule.
+        guard case .beatMatched(let unclamped) = plan(120, 124) else {
+            Issue.record("expected beatMatched")
+            return
+        }
+        #expect(abs(Double(unclamped.outgoingRate) - 1) < cap - 0.01)
+    }
+
+    // MARK: - The incoming deck's post-swap glide
+
+    /// The curve itself: held at the bent rate to the swap, monotone to unity
+    /// by the end of the overlap, and C¹ at both joins (a smoothstep has zero
+    /// slope at its ends, so the rate curve has no corner anywhere).
+    @Test func theIncomingDeckGlidesHomeFromTheSwap() throws {
+        let matched = BeatMatchedPlan(
+            outPoint: 100, inPoint: 0, overlapBars: 8,
+            outgoingRate: 1.045, incomingRate: 0.965,
+            bassSwapOffset: 8, overlapDuration: 16,
+            rampLeadSeconds: 13, rampReleaseSeconds: 3,
+            rampGlideBackFromSwap: true)
+        let plan = TransitionPlan.beatMatched(matched)
+        let geometry = TransitionAutomation.Geometry(plan: plan)
+        let glide = try #require(TransitionAutomation.incomingGlide(for: plan,
+                                                                   geometry: geometry))
+        #expect(glide.start == geometry.swapOffset)
+        #expect(abs(glide.end - geometry.overlapDuration) < 1e-9,
+                "with room to spare the glide lands exactly on the overlap's end")
+
+        func rate(_ t: TimeInterval) -> Float {
+            TransitionAutomation.frame(plan: plan, style: .plain,
+                                       elapsed: t, geometry: geometry).incoming.rate
+        }
+        // Flat at the bend before the swap…
+        #expect(rate(0) == matched.incomingRate)
+        #expect(rate(geometry.swapOffset - 0.5) == matched.incomingRate)
+        #expect(rate(geometry.swapOffset) == matched.incomingRate)
+        // …home by the end…
+        #expect(abs(rate(geometry.overlapDuration) - 1) < 1e-6)
+        // …and monotone all the way, sampled at the engine's own 50 Hz.
+        var previous = rate(0)
+        var maxSlope: Float = 0
+        for tick in 1...Int(geometry.overlapDuration * 50) {
+            let t = Double(tick) / 50
+            let now = rate(t)
+            #expect(now >= previous - 1e-7, "the glide must not wander (\(t): \(now))")
+            maxSlope = max(maxSlope, abs(now - previous) * 50)
+            previous = now
+        }
+        #expect(abs(previous - 1) < 1e-6)
+
+        // C¹ at the swap: a smoothstep's slope is zero where it starts, so the
+        // join with the flat stretch before it has no corner. Measured as "the
+        // first tick after the swap moves far less than the steepest tick".
+        let atSwap = geometry.swapOffset
+        let firstStep = abs(rate(atSwap + 0.02) - rate(atSwap)) * 50
+        #expect(firstStep < maxSlope * 0.05,
+                "the glide must leave the plateau flat (\(firstStep) vs \(maxSlope))")
+        // …and the same at the far end, where it joins unity.
+        let lastStep = abs(rate(geometry.overlapDuration)
+                           - rate(geometry.overlapDuration - 0.02)) * 50
+        #expect(lastStep < maxSlope * 0.05)
+
+        // With the glide off, the whole overlap is the flat bend it always was
+        // — byte-identical, not merely close.
+        var held = matched
+        held.rampGlideBackFromSwap = false
+        let heldPlan = TransitionPlan.beatMatched(held)
+        let heldGeometry = TransitionAutomation.Geometry(plan: heldPlan)
+        for tick in 0...Int(heldGeometry.overlapDuration * 50) {
+            let f = TransitionAutomation.frame(plan: heldPlan, style: .plain,
+                                               elapsed: Double(tick) / 50,
+                                               geometry: heldGeometry)
+            #expect(f.incoming.rate == held.incomingRate)
+        }
+    }
+
+    /// A degenerate geometry — a swap so late that the post-swap stretch is
+    /// shorter than the plan's own release — does not get a step. The glide is
+    /// floored at `rampReleaseSeconds` and its tail spills into the settling
+    /// phase, which picks up the *same curve* rather than restarting it.
+    @Test func aShortPostSwapStretchSpillsIntoTheSettlingPhase() throws {
+        let matched = BeatMatchedPlan(
+            outPoint: 100, inPoint: 0, overlapBars: 1,
+            outgoingRate: 1.03, incomingRate: 0.97,
+            bassSwapOffset: 1.8, overlapDuration: 2,
+            rampLeadSeconds: 13, rampReleaseSeconds: 3,
+            rampGlideBackFromSwap: true)
+        let plan = TransitionPlan.beatMatched(matched)
+        let geometry = TransitionAutomation.Geometry(plan: plan)
+        let glide = try #require(TransitionAutomation.incomingGlide(for: plan,
+                                                                   geometry: geometry))
+        #expect(glide.glideSeconds == matched.rampReleaseSeconds)
+        let spill = TransitionAutomation.rateReleaseDuration(plan, geometry: geometry)
+        #expect(abs(spill - (glide.end - geometry.overlapDuration)) < 1e-9)
+        #expect(spill > 0)
+
+        // Continuous across `transition complete`: the last frame of the
+        // overlap and the first frame of the settle are the same rate.
+        let lastOverlap = TransitionAutomation.frame(
+            plan: plan, style: .plain, elapsed: geometry.overlapDuration,
+            geometry: geometry).incoming.rate
+        let firstSettle = TransitionAutomation.settleFrame(
+            plan: plan, restoringRate: true, echoTailRinging: false,
+            elapsed: 0, geometry: geometry).incomingRate
+        #expect(abs(lastOverlap - firstSettle) < 1e-6)
+        #expect(lastOverlap != 1, "the glide really has not finished yet")
+
+        let done = TransitionAutomation.settleFrame(
+            plan: plan, restoringRate: true, echoTailRinging: false,
+            elapsed: spill, geometry: geometry)
+        #expect(abs(done.incomingRate - 1) < 1e-6)
+        #expect(done.rateRestoreDone)
+    }
+
+    /// The glide's integral is the map from overlap time onto the incoming
+    /// song's own clock, and everything that places an instant on that clock —
+    /// the stem layer above all — reads it. Checked against direct numerical
+    /// integration of the rate curve, and inverted back again.
+    @Test func theGlideIntegralMatchesNumericalIntegration() throws {
+        let glide = TransitionAutomation.IncomingGlide(bent: 0.9607, start: 6, end: 20)
+        // Trapezoid over a fine grid; the closed form is a quartic, so this is
+        // an independent computation rather than the same one twice.
+        func integrate(to t: TimeInterval) -> Double {
+            let steps = 200_000
+            let h = t / Double(steps)
+            var total = 0.0
+            for i in 0..<steps {
+                let a = Double(glide.rate(at: Double(i) * h))
+                let b = Double(glide.rate(at: Double(i + 1) * h))
+                total += (a + b) / 2 * h
+            }
+            return total
+        }
+        for t in [3.0, 6.0, 13.0, 20.0, 25.0] {
+            #expect(abs(glide.sourceAdvance(to: t) - integrate(to: t)) < 1e-4,
+                    "integral mismatch at \(t)")
+        }
+        // Before the glide it is just the bent rate, after it the flat run-out.
+        #expect(abs(glide.sourceAdvance(to: 6) - 6 * Double(glide.bent)) < 1e-12)
+        #expect(abs(glide.sourceAdvance(to: 25)
+                    - (glide.sourceAdvance(to: 20) + 5)) < 1e-9)
+
+        // And the inverse round-trips.
+        for t in [1.0, 7.5, 12.0, 19.0, 22.0] {
+            let back = glide.overlapElapsed(atSource: glide.sourceAdvance(to: t), within: 30)
+            #expect(abs(back - t) < 1e-6, "inverse mismatch at \(t) (\(back))")
+        }
+
+        // The size of the correction is the thing that made this necessary: a
+        // constant-rate map is wrong by half the bend times the glide's length.
+        let naive = 20 * 0.9607
+        let actual = glide.sourceAdvance(to: 20)
+        #expect(abs((actual - naive) - 0.5 * (1 - 0.9607) * 14) < 0.01)
+        #expect(actual - naive > 0.15, "…which is well past a stem layer's budget")
+    }
+
+    /// Live and offline agree on the new curve: the renderer walks the incoming
+    /// deck through the glide, so where it ends up in its own song is the
+    /// glide's integral and not `overlap × incomingRate`.
+    @Test func theOfflineRenderWalksTheIncomingGlide() throws {
+        let matched = BeatMatchedPlan(
+            outPoint: 12, inPoint: 0, overlapBars: 4,
+            outgoingRate: 1.03, incomingRate: 0.94,
+            bassSwapOffset: 4, overlapDuration: 8,
+            rampLeadSeconds: 6, rampReleaseSeconds: 3,
+            rampGlideBackFromSwap: true)
+        let plan = TransitionPlan.beatMatched(matched)
+        let geometry = TransitionAutomation.Geometry(plan: plan)
+        let glide = try #require(TransitionAutomation.incomingGlide(for: plan,
+                                                                   geometry: geometry))
+        var options = OfflineTransitionRenderer.Options()
+        options.preRoll = 8
+        options.postRoll = 1
+        let mix = try OfflineTransitionRenderer.renderMix(
+            .plain(plan), outgoing: TempoRampAudio.outgoing,
+            incoming: TempoRampAudio.incoming, options: options)
+
+        // Where the incoming deck is in its own song at the end of the overlap.
+        let atEnd = OfflineTransitionRenderer.Mix.source(
+            of: mix.incoming, at: mix.overlapStart + geometry.overlapDuration)
+        #expect(abs(atEnd - (matched.inPoint + glide.sourceAdvance(to: geometry.overlapDuration)))
+                < 0.05,
+                "the render must consume the glide's integral (\(atEnd))")
+        // …and that is measurably *not* the constant-rate answer.
+        let naive = matched.inPoint + geometry.overlapDuration * Double(matched.incomingRate)
+        #expect(abs(atEnd - naive) > 0.05)
     }
 }
 

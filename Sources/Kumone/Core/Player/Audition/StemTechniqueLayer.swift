@@ -117,6 +117,26 @@ enum StemTechniqueLayer {
         let overlapStartFrame: Int
         /// Playback rate this deck runs at during the overlap.
         let rate: Double
+        /// The deck's post-swap walk back to unity, when it has one.
+        ///
+        /// **Why a scalar `rate` is not enough for the incoming deck any more.**
+        /// Everything here maps overlap-relative time onto source frames, and
+        /// under `TransitionAutomation.incomingGlide` that map is no longer
+        /// `t × rate`: the deck holds the bend to the swap and then walks home.
+        /// Treating the glide as a constant rate misplaces the far end of the
+        /// window by the glide's integral — for a 15 s post-swap stretch at a
+        /// 4 % bend, about 300 ms, which for a compiled `.vocalExchange` is the
+        /// difference between the incoming voice entering on the line and
+        /// entering over the end of the outgoing one. Nil — the default, and
+        /// every unramped plan and every outgoing side — keeps the constant-rate
+        /// arithmetic exactly as it was.
+        var glide: TransitionAutomation.IncomingGlide? = nil
+
+        /// Source seconds this deck consumes in the first `elapsed` seconds of
+        /// the overlap.
+        func sourceAdvance(to elapsed: TimeInterval) -> TimeInterval {
+            glide?.sourceAdvance(to: elapsed) ?? elapsed * rate
+        }
     }
 
     /// S1's `highpass(x, 100.0)` on the acapella: keeps the floated vocal out
@@ -223,7 +243,7 @@ enum StemTechniqueLayer {
             let data = side.buffer.floatChannelData!
             let gains = laneGains(envelope, vocal: vocalLane, bed: bedLane,
                                   frames: split.count, sampleRate: sampleRate,
-                                  rate: split.rate, overlap: overlap)
+                                  rate: split.rate, overlap: overlap, glide: split.glide)
             for channel in 0..<channelCount {
                 let pointer = data[channel] + split.start
                 let vocal = split.vocal[channel]
@@ -261,6 +281,7 @@ enum StemTechniqueLayer {
         let start: Int
         let count: Int
         let rate: Double
+        let glide: TransitionAutomation.IncomingGlide?
         let seconds: Double
         let cached: Bool
         let vocalEnergyRatio: Double
@@ -273,9 +294,14 @@ enum StemTechniqueLayer {
         let channelCount = Int(side.buffer.format.channelCount)
         let rate = max(0.5, min(2, side.rate))
         let start = max(0, min(Int(side.buffer.frameLength), side.overlapStartFrame))
-        // The overlap consumes `overlap × rate` source seconds; anything the
-        // buffer is short by simply is not separated (it is past the file end).
-        let wanted = Int((overlap * rate * sampleRate).rounded())
+        // How many source seconds the overlap consumes: `overlap × rate` at a
+        // constant rate, the glide's integral when the deck walks back to unity
+        // partway through. Anything the buffer is short by simply is not
+        // separated (it is past the file end).
+        // (`rate` is the clamped local, so the no-glide arithmetic is exactly
+        // what it was.)
+        let wanted = Int(((side.glide?.sourceAdvance(to: overlap) ?? overlap * rate)
+                          * sampleRate).rounded())
         let count = min(wanted, Int(side.buffer.frameLength) - start)
         guard count > 0 else { throw StemError.emptyWindow }
 
@@ -310,17 +336,26 @@ enum StemTechniqueLayer {
         let ratio = mixtureRMS > 0 ? rootMeanSquare(stem.channels) / mixtureRMS : 0
 
         return Separated(vocal: stem.channels, start: start, count: count, rate: rate,
+                         glide: side.glide,
                          seconds: seconds, cached: stem.cached, vocalEnergyRatio: ratio)
     }
 
     /// Per-sample gains for one side's two lanes, evaluated on the automation's
     /// own 50 Hz control grid and interpolated — the same shape (and the same
     /// cost) as `envelopes` above.
+    ///
+    /// `glide` is the deck's post-swap walk back to unity, when it has one: the
+    /// lanes are written in overlap-relative seconds and applied to source
+    /// frames, and under a glide that map is the integral of a moving rate
+    /// rather than a straight line. Nil is the constant-rate arithmetic this
+    /// always did, unchanged down to the arithmetic order.
     static func laneGains(_ envelope: StemEnvelope,
                           vocal vocalLane: StemEnvelope.Lane,
                           bed bedLane: StemEnvelope.Lane,
                           frames: Int, sampleRate: Double, rate: Double,
-                          overlap: TimeInterval) -> (vocal: [Float], bed: [Float]) {
+                          overlap: TimeInterval,
+                          glide: TransitionAutomation.IncomingGlide? = nil)
+        -> (vocal: [Float], bed: [Float]) {
         let controlHz = 50.0
         let elapsedPerFrame = 1 / (sampleRate * rate)
         let points = max(2, Int((overlap * controlHz).rounded()) + 2)
@@ -332,10 +367,32 @@ enum StemTechniqueLayer {
             controlBed[k] = envelope.gain(bedLane, at: elapsed)
         }
 
+        // Where each control point sits on the *source* clock, when the source
+        // clock is not linear in overlap time. Inverted by a monotone cursor
+        // walk rather than per-frame bisection: both sequences increase, so one
+        // pass over the frames costs what the straight-line version did.
+        var controlSource: [Double] = []
+        if let glide {
+            controlSource = (0..<points).map {
+                glide.sourceAdvance(to: Double($0) / controlHz)
+            }
+        }
+        var cursor = 0
+
         var vocal = [Float](repeating: 1, count: frames)
         var bed = [Float](repeating: 1, count: frames)
         for i in 0..<frames {
-            let position = Double(i) * elapsedPerFrame * controlHz
+            let position: Double
+            if glide != nil {
+                let source = Double(i) / sampleRate
+                while cursor + 1 < points, controlSource[cursor + 1] <= source { cursor += 1 }
+                let span = cursor + 1 < points
+                    ? controlSource[cursor + 1] - controlSource[cursor] : 0
+                position = Double(cursor) + (span > 0
+                                             ? (source - controlSource[cursor]) / span : 0)
+            } else {
+                position = Double(i) * elapsedPerFrame * controlHz
+            }
             let lower = min(points - 1, Int(position))
             let upper = min(points - 1, lower + 1)
             let fraction = Float(position - Double(lower))
