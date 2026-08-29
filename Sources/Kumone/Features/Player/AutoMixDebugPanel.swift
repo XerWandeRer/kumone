@@ -249,6 +249,12 @@ struct AutoMixDebugPanel: View {
                 // conditional on the pre-render row below it.
                 DebugRow("score", plan.score.map { "score=\($0)" }
                          ?? "none — today's blend")
+                // What that score is *aimed at* (P2): the drop, the chorus or
+                // the start of the song proper. Only ever present with a score,
+                // and it says `aim=none` out loud when the incoming track had
+                // no structure to aim at — the degradation is the interesting
+                // half of the A/B.
+                if let aim = plan.aim { DebugRow("aim", aim) }
                 DebugRow("ride", String(format: "%+.2f dB", plan.rideDB))
                 DebugRow("out section", plan.outSection ?? "no structure")
                 DebugRow("in source", plan.inPointSource ?? "—")
@@ -408,6 +414,7 @@ struct AutoMixDebugPanel: View {
                                 + String(format: " · overlap %.2fs", $0.overlap)
                                 + ($0.stemTechnique.map { " · \($0)" } ?? "")
                                 + ($0.score.map { " · score=\($0)" } ?? "")
+                                + ($0.aim.map { " · \($0)" } ?? "")
                         } ?? "—")
                         DebugRow("fallback", seam.fallback ?? "none — ran as planned")
                         DebugRow("pre-render", seam.prerender)

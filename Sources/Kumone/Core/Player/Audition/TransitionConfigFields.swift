@@ -272,6 +272,17 @@ extension TransitionPlanner.Config {
               "两首歌的拍子都要数到这个把握以上，才谈得上在格点上“切”。"
                   + "比对拍那条线高得多：blend 扛得住半拍的网格误差，切扛不住。",
               0, 1, 0.01, 2, \.scoreMinBPMConfidence),
+        boolField("scoreAimEnabled", "stem",
+                  "开（默认）= 先定入曲的目标格点——drop 起点 > 副歌起点 > 首个核心段起点——"
+                      + "再把入曲的进点从那里倒推出来，让那一刀正好落在这个点上；"
+                      + "入曲没有结构信息时自动退化成今天的进点。"
+                      + "关 = P1 的落法：seam 从低频交接点吸附到最近的乐句线，"
+                      + "切得干净但落在哪儿全看几何。只在出谱时起作用。",
+                  \.scoreAimEnabled),
+        field("scoreAimMaxLeadSeconds", "stem",
+              "瞄准点最多可以落在入曲 introEnd 之后多少秒。瞄准会跳过目标之前的一切，"
+                  + "所以这是“为了落在那个 drop 上，愿意丢掉入曲多少”的上限。",
+              0, 240, 5, 0, \.scoreAimMaxLeadSeconds),
         field("vocalCarryWindowSeconds", "stem",
               "出曲人声最多可以越过低频交接点 S 多少秒去把一句唱完；这个窗口里找得到歌词行末"
                   + "就是 vocalCarryover，找不到就退成 vocalYield（在 S 之前唱完）。"

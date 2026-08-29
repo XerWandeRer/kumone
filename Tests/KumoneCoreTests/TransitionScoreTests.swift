@@ -57,7 +57,8 @@ private enum ScoreFixtures {
     /// downbeat every four of them, from 0 to `duration`.
     static func analysis(bpm: Double, duration: TimeInterval = 30,
                          confidence: Double = 0.95,
-                         jitterAt: Int? = nil, jitter: Double = 0) -> TrackAnalysis {
+                         jitterAt: Int? = nil, jitter: Double = 0,
+                         rms: [Float]? = nil) -> TrackAnalysis {
         let beat = 60 / bpm
         var beats: [TimeInterval] = []
         var t: TimeInterval = 0
@@ -71,7 +72,7 @@ private enum ScoreFixtures {
         return TrackAnalysis(
             version: TrackAnalysis.currentVersion, bpm: bpm, bpmConfidence: confidence,
             beats: beats, downbeats: downbeats, phraseBoundaries: downbeats,
-            rmsEnvelope: [Float](repeating: 0.5, count: Int(duration)),
+            rmsEnvelope: rms ?? [Float](repeating: 0.5, count: Int(duration)),
             outroFadeStart: nil, introEnd: 0, duration: duration,
             melProfile: [], keyPitchClass: nil, keyIsMinor: false, keyConfidence: 0,
             vocalActivity: [Float](repeating: 0.5, count: Int(duration)))
@@ -268,6 +269,12 @@ private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
         // overlap, so where the slam lands *in the incoming song* is where the
         // new track appears to start. Landing four-bar phrases from the in
         // point is what makes that a phrase entry rather than a bar-group edge.
+        //
+        // **This is now the degradation path, and it still has to hold.** P2
+        // aims the seam at a drop / chorus / core start and the phrase snap
+        // then never runs; with no aim on the style — no structure on the
+        // incoming track, or a gate that refused the aimed entry — the seam
+        // goes exactly where P1 put it, which is what this pins.
         let plan = matchedPlan(bassSwapOffset: 10)
         let planned = PlannedTransition(plan: .beatMatched(plan),
                                         style: scoredStyle(.cutOnOne()))
@@ -328,7 +335,7 @@ private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
         #expect(edge >= 0.005 && edge <= 0.010)
     }
 
-    @Test func theEchoThrowAimsAtTheLastLineEndBeforeTheSeamAndDegradesWithoutOne() throws {
+    @Test func theEchoThrowIsOnlyEarnedByALineThatEndsOnTheSeam() throws {
         let planned = PlannedTransition(plan: .beatMatched(matchedPlan()),
                                         style: scoredStyle(.cutOnOne(throwingEcho: true)))
         let outgoing = ScoreFixtures.analysis(bpm: 120)
@@ -342,32 +349,334 @@ private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
         #expect(bare.didCompile)
         #expect(bare.echoThrow == nil)
         #expect(bare.degradations.count == 1)
+        // …and the report calls it what the listener will hear: a cut.
+        #expect(bare.label == "cutOnOne")
 
-        // With one, the throw lands on the last line end before the seam.
         let lyricTrack = ScoreFixtures.dir.appendingPathComponent("score-lyrics.caf")
         try? FileManager.default.removeItem(at: lyricTrack)
         try FileManager.default.copyItem(at: ScoreFixtures.outgoing, to: lyricTrack)
         let lrc = Audition.Lyrics.sidecarURL(for: lyricTrack)
-        try """
-        [00:09.00]一句
-        [00:12.00]又一句
-        [00:20.00]再一句
-        """.write(to: lrc, atomically: true, encoding: .utf8)
         defer {
             try? FileManager.default.removeItem(at: lrc)
             try? FileManager.default.removeItem(at: lyricTrack)
         }
-        let thrown = ScoreCompiler.compile(.cutOnOne(throwingEcho: true), planned: planned,
-                                           outgoing: outgoing, incoming: incoming,
-                                           outgoingURL: lyricTrack)
-        let directive = try #require(thrown.echoThrow)
-        // Line ends are the *next* line's timestamp: 12 s and 20 s. The seam is
-        // ~16 s into the outgoing track, so the 12 s end is the one to throw.
-        #expect(abs(directive.throwAt - (12 - 8)) < 0.05)
-        #expect(thrown.echoLine == "一句")
+        func compile(_ lyrics: String) throws -> ScoreCompiler.Compilation {
+            try lyrics.write(to: lrc, atomically: true, encoding: .utf8)
+            return ScoreCompiler.compile(.cutOnOne(throwingEcho: true), planned: planned,
+                                         outgoing: outgoing, incoming: incoming,
+                                         outgoingURL: lyricTrack)
+        }
+
+        // **P1's own case, now refused.** The seam is ~16 s into the outgoing
+        // track and line ends are the *next* line's timestamp, so this last
+        // line ended at 12 s — eight beats before the cut. P1 threw it anyway,
+        // which is why every scored seam in the field carried a throw and why
+        // the tail read as a wash rather than as a gesture. Eight beats of open
+        // delay over a track that is about to be cut is `.echoOut`, not a throw.
+        let stale = try compile("""
+        [00:09.00]一句
+        [00:12.00]又一句
+        [00:20.00]再一句
+        """)
+        #expect(stale.didCompile)
+        #expect(stale.echoThrow == nil, "a line that ended eight beats ago is not a throw")
+        #expect(stale.label == "cutOnOne")
+        #expect(stale.degradations.count == 1)
+
+        // A line that ends *on* the seam is the gesture: the singer lands on
+        // the one, the dry signal is cut on the same frame, the tail rings on.
+        // 15.75 s is a quarter of a beat before the 16 s seam, inside the
+        // one-beat (0.5 s at 120 BPM) window.
+        let earned = try compile("""
+        [00:09.00]一句
+        [00:15.75]又一句
+        [00:24.00]再一句
+        """)
+        let directive = try #require(earned.echoThrow)
+        #expect(abs(directive.throwAt - (15.75 - 8)) < 0.05)
+        // A line *ends* where the next one starts, so the thrown line is the one
+        // that runs up to 15.75 s.
+        #expect(earned.echoLine == "一句")
         // Beat-synced: a dotted eighth at 120 BPM is 375 ms.
         #expect(abs(directive.delayTime - 0.375) < 0.01)
-        #expect(thrown.degradations.isEmpty)
+        #expect(earned.degradations.isEmpty)
+        #expect(earned.label == "cutOnOne+echoThrow")
+
+        // Just outside the window on the same side: a beat and a half early is
+        // a line that stopped mid-bar, and the gate is what makes the throw a
+        // decision rather than a default.
+        let missed = try compile("""
+        [00:09.00]一句
+        [00:15.20]又一句
+        [00:24.00]再一句
+        """)
+        #expect(missed.echoThrow == nil)
+    }
+
+    @Test func theThrownTailSitsBelowTheOutroEchoItBorrowedItsNumbersFrom() {
+        // A throw rings *over a track that has already started*; `.echoOut`'s
+        // tail has nothing underneath it. Same numbers on both was P1's, and it
+        // is what put the old song's wet tail level with the new song's
+        // downbeat.
+        let ratio = EchoThrowDirective.throwWetMix / TransitionAutomation.echoWetMix
+        #expect(abs(20 * log10(ratio) - EchoThrowDirective.throwTailTrimDB) < 0.01)
+        #expect(EchoThrowDirective.throwTailTrimDB == -4)
+        #expect(EchoThrowDirective.throwFeedback < TransitionAutomation.echoFeedback)
+        // A directive built without an opinion gets the tamed numbers, so the
+        // discipline cannot be lost by a producer that forgets to ask.
+        let plain = EchoThrowDirective(throwAt: 1, delayTime: 0.375)
+        #expect(plain.wetDryMix == EchoThrowDirective.throwWetMix)
+        #expect(plain.feedback == EchoThrowDirective.throwFeedback)
+    }
+}
+
+// MARK: - Aiming (P2)
+
+/// A section list over a track whose bars are `bar` seconds long, so every
+/// `start` is a real downbeat of `ScoreFixtures.analysis`'s grid.
+private func sections(_ spec: [(TrackAnalysis.Section.Kind, TimeInterval, TimeInterval)])
+    -> [TrackAnalysis.Section] {
+    spec.map { .init(start: $0.1, end: $0.2, kind: $0.0, repetition: 2,
+                     energy: 0.8, vocalDensity: 0.5) }
+}
+
+private func aimable(bpm: Double = 120, duration: TimeInterval = 120,
+                     confidence: Double = 0.9,
+                     _ spec: [(TrackAnalysis.Section.Kind, TimeInterval, TimeInterval)])
+    -> TrackAnalysis {
+    var a = ScoreFixtures.analysis(bpm: bpm, duration: duration)
+    a.sections = sections(spec)
+    a.structureConfidence = confidence
+    return a
+}
+
+@Suite struct TransitionAimTests {
+
+    /// A plan with an in point the aiming layer will want to move: 16 bars of
+    /// overlap at 120 BPM (2 s bars), entered at the top of the track.
+    private func plan() -> BeatMatchedPlan {
+        matchedPlan(overlap: 32, outPoint: 60, inPoint: 0, bassSwapOffset: 16)
+    }
+
+    private var config: TransitionPlanner.Config {
+        var c = TransitionPlanner.Config.standard
+        c.scoreEnabled = true
+        return c
+    }
+
+    @Test func theDropOutranksTheChorusAndTheChorusOutranksTheCore() {
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        // One incoming track, three readings of it: with a drop, with the drop
+        // relabelled, and with neither. The priority is the predev's, and it is
+        // a priority rather than a search because a `.drop` *is* the thing a
+        // slam was invented for.
+        let all = aimable([(.intro, 0, 8), (.verse, 8, 40), (.chorus, 40, 56),
+                           (.drop, 56, 88), (.outro, 88, 120)])
+        #expect(TransitionPlanner.aim(plan: plan(), outgoing: out, incoming: all,
+                                      config: config).aim?.target == .drop)
+
+        let chorusOnly = aimable([(.intro, 0, 8), (.verse, 8, 40), (.chorus, 40, 56),
+                                  (.verse, 56, 88), (.outro, 88, 120)])
+        let c = TransitionPlanner.aim(plan: plan(), outgoing: out, incoming: chorusOnly,
+                                      config: config)
+        #expect(c.aim?.target == .chorus)
+        #expect(c.aim?.time == 40)
+
+        // No chorus and no drop: the first *core* section — which is
+        // `inPointChoice`'s own answer, aimed at rather than entered on.
+        // (A `bridge` is the segmenter's catch-all for a passage that happens
+        // once, so a first verse that never repeats verbatim comes back
+        // labelled that way — core is defined by exclusion, exactly as
+        // `inPointChoice` defines it.)
+        let plain = aimable([(.intro, 0, 24), (.bridge, 24, 88), (.outro, 88, 120)])
+        let core = TransitionPlanner.aim(plan: plan(), outgoing: out, incoming: plain,
+                                         config: config)
+        #expect(core.aim?.target == .core)
+        #expect(core.aim?.time == 24)
+    }
+
+    @Test func aTrackWithNoUsableStructureIsNotAimedAtAtAll() {
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        let p = plan()
+
+        // No sections at all — every pre-v7 sidecar, and everything the
+        // segmenter was unsure about. The entry is the plan's own, field for
+        // field: this is not "equivalent to" P1's placement, it *is* it.
+        let bare = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        let none = TransitionPlanner.aim(plan: p, outgoing: out, incoming: bare,
+                                         config: config)
+        #expect(none.aim == nil)
+        #expect(none.inPoint == p.inPoint)
+        #expect(none.detail == "no structure")
+
+        // Sections, but below the planner's own structure gate. The gate is not
+        // re-litigated here — aiming reads exactly the sections the in-point
+        // layer would have read, or it reads none.
+        var c = config
+        let shy = aimable(confidence: c.structureConfidenceGate - 0.01,
+                          [(.intro, 0, 8), (.drop, 8, 88), (.outro, 88, 120)])
+        let gated = TransitionPlanner.aim(plan: p, outgoing: out, incoming: shy, config: c)
+        #expect(gated.aim == nil)
+        #expect(gated.inPoint == p.inPoint)
+        #expect(gated.detail.contains("structure confidence"))
+
+        // And the layer's own switch, for the A/B.
+        c.scoreAimEnabled = false
+        let confident = aimable([(.intro, 0, 8), (.drop, 8, 88), (.outro, 88, 120)])
+        #expect(TransitionPlanner.aim(plan: p, outgoing: out, incoming: confident,
+                                      config: c).aim == nil)
+    }
+
+    @Test func theEntryIsComposedBackwardsSoTheAimLandsOnTheSeam() throws {
+        // The arithmetic the whole layer is: the aim minus however much of the
+        // incoming track runs before the hand-over. At 120 BPM with a 32 s
+        // overlap the swap is 16 s in, which is eight 2 s bars, so a drop at
+        // 56 s is entered at 40 s.
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        let inc = aimable([(.intro, 0, 8), (.verse, 8, 56), (.drop, 56, 96),
+                           (.outro, 96, 120)])
+        let outcome = TransitionPlanner.aim(plan: plan(), outgoing: out, incoming: inc,
+                                            config: config)
+        let aim = try #require(outcome.aim)
+        #expect(aim.time == 56)
+        #expect(aim.leadBars == 8)
+        #expect(abs(outcome.inPoint - 40) < 1e-9)
+
+        // …and the compiler, given the aimed plan, puts the seam on the aim
+        // itself rather than on the phrase line P1 would have snapped to.
+        let aimed = plan().enteringIncoming(at: outcome.inPoint)
+        var style = scoredStyle(.cutOnOne())
+        style.aim = aim
+        let planned = PlannedTransition(plan: .beatMatched(aimed), style: style)
+        let c = ScoreCompiler.compile(.cutOnOne(), planned: planned,
+                                      outgoing: out, incoming: inc, outgoingURL: nil)
+        #expect(c.didCompile, "\(c.refusalReason ?? "")")
+        #expect(abs(c.seamIncoming - 56) < 1e-6)
+        #expect(c.aim?.target == .drop)
+    }
+
+    @Test func theSeamReachesTheAimThroughTheGlidesIntegral() throws {
+        // The same claim under a bent, gliding incoming deck, where overlap
+        // seconds and source seconds stop being proportional. A rate-shaped
+        // shortcut lands the slam tens of milliseconds off the drop, which on a
+        // cut is the one error there is no hiding.
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        let inc = aimable(bpm: 125, [(.intro, 0, 7.68), (.verse, 7.68, 53.76),
+                                     (.drop, 53.76, 96), (.outro, 96, 120)])
+        var p = matchedPlan(overlap: 32, outPoint: 60, inPoint: 0,
+                            incomingRate: 1.04, glideBack: true, bassSwapOffset: 16)
+        p = p.enteringIncoming(at: 0)
+        let outcome = TransitionPlanner.aim(plan: p, outgoing: out, incoming: inc,
+                                            config: config)
+        let aim = try #require(outcome.aim)
+        #expect(aim.target == .drop)
+
+        let aimed = p.enteringIncoming(at: outcome.inPoint)
+        var style = scoredStyle(.cutOnOne())
+        style.aim = aim
+        let planned = PlannedTransition(plan: .beatMatched(aimed), style: style)
+        let c = ScoreCompiler.compile(.cutOnOne(), planned: planned,
+                                      outgoing: out, incoming: inc, outgoingURL: nil)
+        #expect(c.didCompile, "\(c.refusalReason ?? "")")
+        #expect(abs(c.seamIncoming - aim.time) < 1e-6)
+
+        // Walk the renderer's own map forward from the in point: the deck has
+        // to be standing on the drop at the compiled offset.
+        let geometry = TransitionAutomation.Geometry(plan: planned.plan)
+        let glide = TransitionAutomation.incomingGlide(for: planned.plan, geometry: geometry)
+        let clock = StemTechniqueLayer.SourceClock(rate: Double(aimed.incomingRate),
+                                                   glide: glide)
+        let arrived = aimed.inPoint + clock.sourceAdvance(to: c.seamOffset)
+        #expect(abs(arrived - aim.time) < 1e-3)
+    }
+
+    @Test func aGateBeatsAnAim() {
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        let p = plan()
+
+        // The aim is too near the top of the track to compose an entry from:
+        // eight bars before a drop at 8 s is a negative in point, and there is
+        // no aim worth entering a track before it starts for.
+        let early = aimable([(.intro, 0, 8), (.drop, 8, 96), (.outro, 96, 120)])
+        let tooEarly = TransitionPlanner.aim(plan: p, outgoing: out, incoming: early,
+                                             config: config)
+        #expect(tooEarly.aim == nil)
+        #expect(tooEarly.inPoint == p.inPoint)
+
+        // The aimed window runs off the end of the incoming track. The overlap
+        // still has to fit — the in-point clamp is a gate like any other, and
+        // aiming does not get to spend audio the track does not have.
+        let late = aimable(duration: 70, [(.intro, 0, 8), (.verse, 8, 56),
+                                          (.drop, 56, 70)])
+        let tooLate = TransitionPlanner.aim(plan: p, outgoing: out, incoming: late,
+                                            config: config)
+        #expect(tooLate.aim == nil)
+        #expect(tooLate.inPoint == p.inPoint)
+
+        // The clamp on how much of the incoming song an aim may skip.
+        var c = config
+        c.scoreAimMaxLeadSeconds = 10
+        let deep = aimable([(.intro, 0, 8), (.verse, 8, 56), (.drop, 56, 96),
+                            (.outro, 96, 120)])
+        #expect(TransitionPlanner.aim(plan: p, outgoing: out, incoming: deep,
+                                      config: c).aim == nil)
+
+        // And the incoming window's own steadiness gate, on an aimed entry that
+        // straddles a lurch the plain in point never saw.
+        var lurching = ScoreFixtures.analysis(
+            bpm: 120, duration: 120,
+            rms: (0..<120).map { $0 >= 40 && $0 < 48 ? 0.02 : 0.9 })
+        lurching.sections = sections([(.intro, 0, 8), (.verse, 8, 56), (.drop, 56, 96),
+                                      (.outro, 96, 120)])
+        lurching.structureConfidence = 0.9
+        let unsteady = TransitionPlanner.aim(plan: p, outgoing: out, incoming: lurching,
+                                             config: config)
+        #expect(unsteady.aim == nil)
+        #expect(unsteady.inPoint == p.inPoint)
+    }
+
+    @Test func aimingNeverTouchesTheOutgoingTracksExit() {
+        // The out point is the climax guard's, the lyric snap's and the
+        // candidate ordering's business, and this layer is structurally unable
+        // to reach it: `enteringIncoming` copies every other field. Asserted
+        // rather than assumed, because "the gates cannot be bought" is the
+        // safety argument for the whole layer.
+        let p = plan()
+        let moved = p.enteringIncoming(at: 40)
+        #expect(moved.inPoint == 40)
+        #expect(moved.outPoint == p.outPoint)
+        #expect(moved.overlapBars == p.overlapBars)
+        #expect(moved.overlapDuration == p.overlapDuration)
+        #expect(moved.bassSwapOffset == p.bassSwapOffset)
+        #expect(moved.outgoingRate == p.outgoingRate)
+        #expect(moved.incomingRate == p.incomingRate)
+        #expect(moved.rampLeadSeconds == p.rampLeadSeconds)
+        #expect(moved.rampReleaseSeconds == p.rampReleaseSeconds)
+        #expect(moved.rampGlideBackFromSwap == p.rampGlideBackFromSwap)
+    }
+
+    @Test func anAimThatNoLongerDescribesTheGeometryLosesToThePhraseLine() {
+        // A plan override moved the seam after the aim was chosen. The aim now
+        // points at a bar that is nowhere near the hand-over, and the answer is
+        // P1's placement with the swap it actually has — not a cut aimed at a
+        // bar that has drifted out of the window.
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 120)
+        let inc = aimable([(.intro, 0, 8), (.verse, 8, 56), (.drop, 56, 96),
+                           (.outro, 96, 120)])
+        var style = scoredStyle(.cutOnOne())
+        style.aim = TransitionAim(target: .drop, time: 56, leadBars: 8)
+        // Entered at 8 s rather than the 40 s the aim was composed for: the
+        // drop is now 48 s past the entry and the swap is 16 s past it.
+        let planned = PlannedTransition(
+            plan: .beatMatched(matchedPlan(overlap: 32, outPoint: 60, inPoint: 8,
+                                           bassSwapOffset: 16)),
+            style: style)
+        let c = ScoreCompiler.compile(.cutOnOne(), planned: planned,
+                                      outgoing: out, incoming: inc, outgoingURL: nil)
+        #expect(c.didCompile, "\(c.refusalReason ?? "")")
+        #expect(c.aim == nil)
+        #expect(c.degradations.count == 1)
+        #expect(abs(c.seamIncoming - 24) < 1e-6, "the phrase line eight bars past the entry")
     }
 }
 
@@ -587,6 +896,53 @@ private func scoredStyle(_ score: TransitionScore?) -> TransitionStyle {
         #expect(TransitionPlanner.score(outgoing: vague, incoming: confident,
                                         context: TransitionPlanner.PlanContext(),
                                         config: enabled) == nil)
+    }
+
+    @Test func theShippedPlannerAimsAtNothingBecauseItScoresNothing() {
+        // Aiming is the one thing a score *moves* — the incoming entry — so the
+        // byte-identity claim has to survive it. It does structurally: the layer
+        // runs inside the `style.score != nil` branch, which is unreachable at
+        // the shipped config. Asserted end to end anyway, on a pair whose
+        // incoming track has a drop the layer would very much like to aim at.
+        let outgoing = ScoreFixtures.analysis(bpm: 120, duration: 240, confidence: 0.95)
+        var incoming = ScoreFixtures.analysis(bpm: 120, duration: 240, confidence: 0.95)
+        incoming.sections = sections([(.intro, 0, 8), (.verse, 8, 56), (.drop, 56, 200),
+                                      (.outro, 200, 240)])
+        incoming.structureConfidence = 0.95
+
+        func planned(_ config: TransitionPlanner.Config) -> PlannedTransition {
+            TransitionPlanner.plan(outgoing: outgoing, incoming: incoming, config: config)
+        }
+        let shipped = planned(.standard)
+        #expect(shipped.style.score == nil)
+        #expect(shipped.style.aim == nil)
+
+        var enabled = TransitionPlanner.Config.standard
+        enabled.scoreEnabled = true
+        let scored = planned(enabled)
+        // The aim moved the entry and nothing else: same out point, same bars,
+        // same rates. That is the gates-win claim, at the planner's own level.
+        guard case .beatMatched(let a) = shipped.plan,
+              case .beatMatched(let b) = scored.plan else {
+            Issue.record("both plans should be beat-matched")
+            return
+        }
+        #expect(b.outPoint == a.outPoint)
+        #expect(b.overlapBars == a.overlapBars)
+        #expect(b.overlapDuration == a.overlapDuration)
+        #expect(b.outgoingRate == a.outgoingRate)
+        #expect(b.incomingRate == a.incomingRate)
+        #expect(scored.style.aim?.target == .drop)
+        #expect(b.inPoint != a.inPoint, "the entry is the one field aiming writes")
+
+        // …and with the aim switched off, the plan is the shipped one again,
+        // score or no score: the A/B's control arm.
+        enabled.scoreAimEnabled = false
+        let unaimed = planned(enabled)
+        #expect(unaimed.style.score != nil)
+        #expect(unaimed.style.aim == nil)
+        guard case .beatMatched(let u) = unaimed.plan else { return }
+        #expect(u.inPoint == a.inPoint)
     }
 
     @Test func anUncompiledScoreRendersTheSameSamplesAsNoScore() throws {

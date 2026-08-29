@@ -94,8 +94,40 @@ struct EchoThrowDirective: Sendable, Equatable {
     var throwAt: TimeInterval
     /// Beat-synced delay time, seconds.
     var delayTime: TimeInterval
-    var wetDryMix: Float = TransitionAutomation.echoWetMix
-    var feedback: Float = TransitionAutomation.echoFeedback
+    var wetDryMix: Float = Self.throwWetMix
+    var feedback: Float = Self.throwFeedback
+
+    // MARK: - The tail, tamed (P2)
+
+    /// **Wet level of the throw's tail, −4 dB against `.echoOut`'s.**
+    ///
+    /// A throw and an outro echo are not the same job, and P1 gave them the
+    /// same numbers. `.echoOut` is a *departure*: the outgoing track fades into
+    /// its own delay and nothing follows it for a while, so 70 % wet is the
+    /// point. A throw rings on **over a track that has already started** — the
+    /// slam lands on the same frame the dry signal is cut — so the same 70 %
+    /// puts the old song's wet tail level with the new song's downbeat, which
+    /// is what the field listen heard as the seam being cluttered rather than
+    /// decisive.
+    ///
+    /// Four dB down in amplitude is 70 % × 10^(−4/20) ≈ 44 %: still plainly a
+    /// throw, no longer competing with the thing it is handing over to. The
+    /// number is a constant rather than a `Config` field because the compiler
+    /// takes no config — it is deliberately a pure placement pass — and no
+    /// existing knob fits; a sweep changes it here.
+    static let throwWetMix: Float
+        = TransitionAutomation.echoWetMix * pow(10, throwTailTrimDB / 20)
+    /// The −4 dB itself, named so the reasoning above has something to point at
+    /// and a sweep has one number to move.
+    static let throwTailTrimDB: Float = -4
+
+    /// **Shorter feedback than `.echoOut`'s.** Fewer repeats for the same
+    /// reason: an outro tail may ring for as long as it likes because nothing
+    /// is underneath it, and a throw's repeats are landing on the incoming
+    /// track's first bars. 50 % → 30 % is roughly three audible repeats instead
+    /// of six, so the tail is gone inside the first phrase rather than through
+    /// it.
+    static let throwFeedback: Float = 30
 }
 
 /// The compiled audio side of a score: two lanes and the directives that are

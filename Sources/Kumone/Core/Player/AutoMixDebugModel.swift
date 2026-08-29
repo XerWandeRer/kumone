@@ -119,6 +119,10 @@ struct AutoMixDebugPlan: Equatable {
     /// it ("cutOnOne+echoThrow"). Nil on every shipped seam — a score only
     /// appears with the panel's own toggle on.
     var score: String?
+    /// **What the seam was aimed at** (P2, predev §2.3) — `drop@84.00s`, or
+    /// `aim=none` with the reason. Nil whenever the plan carries no score,
+    /// because aiming only runs under one.
+    var aim: String?
     var rideDB: Double = 0
     /// Which structural section the out point falls in, when the outgoing
     /// analysis has sections at all (it usually does not — see `TrackAnalysis`).
@@ -757,6 +761,13 @@ extension AutoMixDebugPlan {
         stagedEQ = planned.style.stagedEQ
         stemTechnique = planned.style.stemTechnique?.label
         score = planned.style.score?.label
+        // Shown whenever the aiming layer ran — which is whenever it left a
+        // sentence behind — rather than only when a score survived to arming.
+        // A seam whose score was refused still has an aimed entry, and that is
+        // exactly the seam whose row must not go blank.
+        aim = planned.style.aimDetail.map {
+            TransitionAim.report(planned.style.aim, reason: $0)
+        }
         rideDB = planned.rideDB
         outSection = outPoint.flatMap { AutoMixDebugFormat.section(at: $0, in: outgoing) }
         inPointSource = inPoint.flatMap {

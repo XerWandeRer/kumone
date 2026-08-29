@@ -25,6 +25,17 @@ enum ScoreCompiler {
     /// hand-over at all and the grid is not to be trusted.
     static let seamSnapBars: Double = 0.5
 
+    /// How far the aim's own bar line may sit from the hand-over instant before
+    /// the compiler stops believing the aim describes *this* geometry, in bars.
+    ///
+    /// Wider than `seamSnapBars` on purpose, and it is not a loosening: the
+    /// planner put the aim within half a bar of the swap by construction (it
+    /// rounded the lead to whole bars), so a full bar of slack absorbs that
+    /// rounding while still catching the case this exists for — a plan override
+    /// that moved the seam after the aim was chosen, leaving the aim pointing
+    /// at a bar that is no longer the hand-over.
+    static let aimSnapBars: Double = 1.0
+
     /// Grid self-check (predev §4.2): bar lengths around the seam must agree to
     /// within this fraction, or the grid is drifting and a cut on it would land
     /// off the beat.
@@ -61,6 +72,15 @@ enum ScoreCompiler {
     /// quarter second of the seam is not a throw, it is a cut with a click on
     /// it, and one that lands before the overlap has started cannot be played.
     static let echoThrowMarginSeconds: TimeInterval = 0.25
+    /// **The throw's qualification window**, in beats either side of the seam
+    /// (predev's throw, with P2's discipline on it).
+    ///
+    /// One beat, because one beat is the whole tolerance a sung line has: a
+    /// line that ends a beat before the seam ended *on* the phrase, and a line
+    /// that ends a beat after it is the singer landing on the one the cut is
+    /// taking. Two beats already admits lines that stop mid-bar, and four
+    /// admits everything, which is P1's behaviour and the thing being fixed.
+    static let echoThrowQualifyBeats: Double = 1.0
 
     // MARK: - Output
 
@@ -84,6 +104,14 @@ enum ScoreCompiler {
         /// How far the seam had to move off the plan's own swap point to land
         /// on a downbeat.
         var seamSnapSeconds: TimeInterval = 0
+        /// What the seam was aimed at, when the planner aimed it (P2). Nil is
+        /// the degradation path: the seam then goes where P1 put it, on the
+        /// phrase line nearest the plan's own swap point.
+        var aim: TransitionAim?
+        /// Why `aim` is what it is — the planner's own sentence, or the
+        /// compiler's when it is the one that dropped the aim. Printed with
+        /// `aim=none` so a report never says only "no".
+        var aimNote: String?
         var events: [Placed] = []
         var echoThrow: EchoThrowDirective?
         /// The outgoing line thrown into the delay.
@@ -114,7 +142,11 @@ enum ScoreCompiler {
                         outgoing: TrackAnalysis, incoming: TrackAnalysis,
                         outgoingURL: URL?) -> Compilation {
         func refuse(_ reason: String) -> Compilation {
-            Compilation(label: score.label, refusalReason: reason)
+            // The aim rides along even on a refusal: "what did this seam want
+            // to land on, and why did it not" is one question, and a report
+            // that dropped half of it would be answering the easier one.
+            Compilation(label: score.label, aim: planned.style.aim,
+                        aimNote: planned.style.aimDetail, refusalReason: reason)
         }
 
         do { try score.validate() } catch {
@@ -164,20 +196,28 @@ enum ScoreCompiler {
 
         // --- Where the seam goes.
         //
-        // P1 does not move the plan — aiming is P2 — so the seam starts from
-        // the plan's own hand-over instant, the floor swap, and is then snapped
-        // onto the incoming track's grid. Two snaps, in order:
+        // The seam *instant* is the plan's, and the plan's is the outgoing
+        // track's: the out point came out of the candidate list, the climax
+        // guard and the lyric snap, and nothing here has a vote on it. What is
+        // decided below is which bar of the **incoming** song that instant
+        // falls on — which, because the incoming deck has been running silently
+        // since the top of the overlap, is the whole question of what the slam
+        // sounds like it is arriving at.
         //
-        //   1. **a phrase line, if one is near.** The incoming deck has been
-        //      running silently since the top of the overlap, so the slam lands
-        //      wherever the seam is *in the incoming song*, not at its in point.
-        //      Landing a whole number of four-bar phrases past the in point is
-        //      what keeps that "cut into the next phrase" rather than "cut into
-        //      the middle of a bar-group"; the in point is itself a downbeat the
-        //      planner chose, so counting phrases from it is counting from the
-        //      entry the planner meant.
-        //   2. otherwise the nearest downbeat, which is the floor this can never
-        //      go below: a cut is a cut on the one or it is nothing.
+        // Two ways to answer it, in order:
+        //
+        //   1. **the aim** (P2, predev §2.3). The planner already composed the
+        //      entry backwards from a drop / chorus / core start, so that grid
+        //      point is *at* the swap by construction; the compiler only has to
+        //      honour it exactly rather than re-derive it. This is the whole
+        //      point of the layer: the cut lands on the thing the listener came
+        //      for, not on the nearest available bar line.
+        //   2. **the phrase line** (P1's placement, and the degradation path).
+        //      With no aim — no structure on the incoming track, or a gate that
+        //      refused the aimed entry — the seam starts from the plan's own
+        //      swap point and is snapped onto the nearest four-bar phrase line
+        //      counted from the in point, falling back to the nearest downbeat.
+        //      A cut is a cut on the one or it is nothing.
         //
         // Nothing constrains the seam's position beyond that, because a score
         // that owns the gain law replaces the crossfade rather than sitting on
@@ -191,7 +231,29 @@ enum ScoreCompiler {
             return refuse(String(format: "交接点附近 %.2f 秒内没有入曲的小节线（最近的差 %.2f 秒）。",
                                  inBar * seamSnapBars, abs(inDownbeats[seamIndex] - swapSource)))
         }
-        if let entry = nearestIndex(inDownbeats, to: p.inPoint) {
+        var degradations: [String] = []
+        var aim = planned.style.aim
+        var aimNote = planned.style.aimDetail
+        if let wanted = aim {
+            // The aim's own bar line, and a sanity check that it really is the
+            // instant this geometry hands over on. It is, whenever the plan is
+            // the one the aim was computed for; a plan override that moved the
+            // seam afterwards is the case this catches, and the answer there is
+            // P1's placement rather than a cut aimed at a bar that has drifted
+            // out of the window.
+            let aimed = nearestIndex(inDownbeats, to: wanted.time)
+            if let aimed, abs(inDownbeats[aimed] - swapSource) <= inBar * aimSnapBars {
+                seamIndex = aimed
+            } else {
+                degradations.append(String(
+                    format: "瞄准点 %@ 落在交接点 %.2f 秒之外，这一刀改回按乐句线对齐。",
+                    wanted.label,
+                    aimed.map { abs(inDownbeats[$0] - swapSource) } ?? .infinity))
+                aim = nil
+                aimNote = "the aim no longer described this geometry"
+            }
+        }
+        if aim == nil, let entry = nearestIndex(inDownbeats, to: p.inPoint) {
             let lo = Swift.max(0, seamIndex - phraseSnapBars)
             let hi = Swift.min(inDownbeats.count - 1, seamIndex + phraseSnapBars)
             let phrased = (lo...Swift.max(lo, hi))
@@ -259,24 +321,47 @@ enum ScoreCompiler {
             placed.append(Placed(event: scored.event.label, at: scored.at, offset: offset))
         }
 
-        // --- The echo throw's anchor: the last outgoing lyric line end before
-        // the seam. `VocalExchange`'s precedent, asked a simpler question.
+        // --- The echo throw's anchor, and the discipline P2 puts on it.
+        //
+        // P1 threw whatever the last line end before the seam was, however far
+        // back it sat, so **every** score came out carrying a throw — which is
+        // the second half of the field verdict on the first three scored seams.
+        // Two things are wrong with a throw at an arbitrary line end. A line
+        // that ended eight beats ago leaves the delay wide open over eight
+        // beats of dry outgoing track: that is an `.echoOut` wash, not a throw,
+        // and it muddies the bars the cut is supposed to be sharpening. And a
+        // line the singer is still in the middle of at the seam is the worst
+        // offender of all — a half-sung phrase smeared into a delay is the one
+        // thing a listener will notice and dislike.
+        //
+        // So the throw has to be *earned*: the outgoing track's last line end
+        // must land within a beat of the throw point, which is the seam itself.
+        // Within a beat either side is the gesture — the singer finishes on the
+        // one and the tail rings on over the new track. Anywhere else and this
+        // is a cut, cleanly and by name.
         var directive: EchoThrowDirective?
         var echoLine: String?
-        var degradations: [String] = []
         if score.events.contains(where: { $0.event == .echoThrow }) {
-            let beat = outBar / Double(TransitionScore.beatsPerBar) / outRate
-            let delayTime = min(max(beat * echoDelayBeatFraction, 0.05), 2.0)
-            if let anchor = lastLineEnd(before: seamOutgoing, outgoingURL: outgoingURL,
-                                        notBefore: p.outPoint
-                                            + echoThrowMarginSeconds * outRate,
-                                        margin: echoThrowMarginSeconds * outRate) {
+            let sourceBeat = outBar / Double(TransitionScore.beatsPerBar)
+            let delayTime = min(max(sourceBeat / outRate * echoDelayBeatFraction, 0.05), 2.0)
+            let window = sourceBeat * echoThrowQualifyBeats
+            let margin = echoThrowMarginSeconds * outRate
+            let anchor = lineEnd(nearest: seamOutgoing, within: window,
+                                 outgoingURL: outgoingURL,
+                                 notBefore: p.outPoint + margin)
+            if let anchor {
+                // A line that ends *after* the seam has nothing left to throw
+                // by the time the cut happens, so the delay is engaged just
+                // before the edge instead. Within the qualifying window this is
+                // at most one beat of difference and it keeps the tail audible.
+                let engageAt = Swift.min(anchor.end, seamOutgoing - margin)
                 directive = EchoThrowDirective(
-                    throwAt: outgoingOverlapTime(anchor.end), delayTime: delayTime)
+                    throwAt: outgoingOverlapTime(engageAt), delayTime: delayTime)
                 echoLine = anchor.text
             } else {
-                degradations.append("出曲在 seam 之前没有可用的歌词行尾，echo throw 降级为直切"
-                                    + "（延时没有可甩的末句）。")
+                degradations.append(String(
+                    format: "出曲的末句行尾不在 seam 前后 %.2f 秒（一拍）内，echo throw 降级为直切"
+                        + "——甩一句唱了一半的词比不甩更冒犯。", window))
             }
         }
 
@@ -297,10 +382,19 @@ enum ScoreCompiler {
         ])
         lanes.echoThrow = directive
 
+        // A throw that did not qualify leaves a **cut-only score**, and it is
+        // named as one: a report that still said "cutOnOne+echoThrow" would be
+        // describing a gesture the listener did not hear.
+        let asked = score.events.contains { $0.event == .echoThrow }
+        let label = asked && directive == nil
+            ? TransitionScore.cutOnOne().label
+            : score.label
+
         return Compilation(
-            label: score.label, seamOffset: seamOffset,
+            label: label, seamOffset: seamOffset,
             seamOutgoing: seamOutgoing, seamIncoming: seamIncoming,
             seamSnapSeconds: seamOffset - geometry.swapOffset,
+            aim: aim, aimNote: aimNote,
             events: placed, echoThrow: directive, echoLine: echoLine,
             degradations: degradations, lanes: lanes, refusalReason: nil)
     }
@@ -350,17 +444,23 @@ enum ScoreCompiler {
         return intervals.map { abs($0 - median) / median }.max()
     }
 
-    /// The last outgoing lyric line end before `seam`, with room on both sides.
-    static func lastLineEnd(before seam: TimeInterval, outgoingURL: URL?,
-                            notBefore: TimeInterval,
-                            margin: TimeInterval) -> (end: TimeInterval, text: String)? {
+    /// The outgoing lyric line end nearest `seam`, and only if it is inside
+    /// `within` seconds of it — the throw's qualification (see the call site).
+    ///
+    /// `notBefore` keeps the anchor inside the rendered window: a throw engaged
+    /// before the overlap started cannot be played.
+    static func lineEnd(nearest seam: TimeInterval, within: TimeInterval,
+                        outgoingURL: URL?,
+                        notBefore: TimeInterval) -> (end: TimeInterval, text: String)? {
         guard let outgoingURL, let lines = Audition.Lyrics.load(for: outgoingURL),
               !lines.isEmpty else { return nil }
         let ends = Audition.Lyrics.lineEnds(lines)
         var best: (end: TimeInterval, text: String)?
         for (line, end) in zip(lines, ends)
-        where end >= notBefore && end <= seam - margin {
-            if best == nil || end > best!.end { best = (end, line.text) }
+        where end >= notBefore && abs(end - seam) <= within {
+            if best == nil || abs(end - seam) < abs(best!.end - seam) {
+                best = (end, line.text)
+            }
         }
         return best
     }

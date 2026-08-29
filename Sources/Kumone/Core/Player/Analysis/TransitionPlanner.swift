@@ -446,6 +446,29 @@ enum TransitionPlanner {
         /// so the gesture that cannot forgive a bad grid asks for a better one.
         var scoreMinBPMConfidence: Double = 0.8
 
+        // --- Aiming (P2, predev §2.3). Only ever consulted when a score is
+        // offered, so with `scoreEnabled` down these two decide nothing and the
+        // plan is field-for-field what it was.
+
+        /// Compose the incoming entry backwards from a target grid point — the
+        /// drop, the chorus, or the start of the song proper — so the seam
+        /// lands **on** it rather than some number of phrase lines past it.
+        ///
+        /// On by default *within the score path*, because an unaimed slam is
+        /// the thing the first field listen rejected: the edge was clean and
+        /// the moment was arbitrary. Off restores P1's placement exactly, which
+        /// is what the A/B needs.
+        var scoreAimEnabled: Bool = true
+        /// How far past the incoming track's intro end an aim target may sit.
+        ///
+        /// Aiming skips whatever comes before the target, so an aim two minutes
+        /// in throws away two minutes of the song to land on a drop nobody was
+        /// waiting for. 120 s is deliberately permissive — a first drop is
+        /// typically 60–75 s in and a first chorus 45–60 s — because the
+        /// interesting refusals are the gates below, not this clamp; narrowing
+        /// it is a corpus question and corpus questions are P3's.
+        var scoreAimMaxLeadSeconds: TimeInterval = 120
+
         // --- Structure layer (predev §2.3). Read *only* when the analysis on
         // the relevant side carries `sections` — a v7 sidecar the segmenter was
         // confident about. Every other track (older sidecar, ambient material,
@@ -743,7 +766,28 @@ enum TransitionPlanner {
             // decides nothing — it is offered on top of a plan already made.
             // Where it went is reported by the compile (`Audition.describe`),
             // which is the only place that knows whether it was performed.
-            return finish(PlannedTransition(plan: .beatMatched(matched.plan), style: style,
+            //
+            // Aiming is the one thing a score *does* move (P2, predev §2.3),
+            // and it moves exactly one field: where the incoming deck is
+            // entered, so that the drop / chorus / core start falls on the
+            // seam instead of some number of phrase lines past it. It runs
+            // only under a score, so with `scoreEnabled` down this whole block
+            // is a nil check and the plan is what it was.
+            var plan = matched.plan
+            if style.score != nil {
+                let aimed = aim(plan: plan, outgoing: outgoing, incoming: incoming,
+                                config: config)
+                style.aim = aimed.aim
+                style.aimDetail = aimed.detail
+                if aimed.aim != nil, aimed.inPoint != plan.inPoint {
+                    plan = plan.enteringIncoming(at: aimed.inPoint)
+                }
+                _ = note(&trace, .structure, "scoreAim", true, aimed.aim?.time, nil,
+                         TransitionAim.report(aimed.aim,
+                                              reason: aimed.aim == nil ? aimed.detail : nil)
+                             + " — " + aimed.detail)
+            }
+            return finish(PlannedTransition(plan: .beatMatched(plan), style: style,
                                             rideDB: s.rideDB))
         }
         let cap: TimeInterval
@@ -796,6 +840,139 @@ enum TransitionPlanner {
         // An echo throw needs a last line to throw; with no `.lrc` the score is
         // the plain cut, which is the same gesture without the tail.
         return .cutOnOne(throwingEcho: !context.outgoingLyricLineEnds.isEmpty)
+    }
+
+    // MARK: - Aiming (P2, predev §2.3)
+
+    /// What the aiming layer decided, including when it decided not to aim.
+    struct AimOutcome {
+        /// Nil when the incoming track offered nothing to aim at, or when a
+        /// gate refused the geometry aiming asked for.
+        var aim: TransitionAim?
+        /// Where the incoming deck is entered. Unchanged from the plan's own
+        /// `inPoint` whenever `aim` is nil — this is the degradation path, and
+        /// it is not "equivalent to" today's placement, it *is* it.
+        var inPoint: TimeInterval
+        /// One sentence for the console, the panel and the seam history.
+        var detail: String
+    }
+
+    /// Compose the incoming entry backwards from a target grid point.
+    ///
+    /// **The order is the whole idea** (predev §1.3): today the in point asks
+    /// "where is it safe for the incoming song to start", and nobody asks
+    /// "which bar of the incoming song should land on the hand-over". Here the
+    /// second question is asked first — drop start, else chorus start, else the
+    /// first core section's start — and the entry is whatever falls out of it.
+    ///
+    /// **Gates win, always.** The out point is not touched, so the candidate
+    /// ordering, the lyric snap and the climax guard are structurally unable to
+    /// notice this layer at all. The two gates that *do* depend on the entry —
+    /// the incoming track having room for the overlap, and both sides' vocal
+    /// and energy behaviour over it — are re-run here on the aimed entry, and a
+    /// failure means no aim rather than an aim that overrode them. An aim is a
+    /// preference among geometries the gates already pass.
+    static func aim(plan p: BeatMatchedPlan, outgoing: TrackAnalysis,
+                    incoming: TrackAnalysis, config: Config) -> AimOutcome {
+        func unaimed(_ why: String) -> AimOutcome {
+            AimOutcome(aim: nil, inPoint: p.inPoint, detail: why)
+        }
+        guard config.scoreAimEnabled else { return unaimed("aiming is off") }
+        guard let sections = usableSections(incoming, config: config) else {
+            return unaimed(incoming.sections.isEmpty
+                           ? "no structure"
+                           : String(format: "structure confidence %.2f below the %.2f gate",
+                                    incoming.structureConfidence,
+                                    config.structureConfidenceGate))
+        }
+
+        // The target, by priority. `first` is by time and not by array position
+        // for the same reason `finalClimax` is: sections arrive in time order
+        // today, and an aim derived from the wrong one would silently point at
+        // the second drop if that ever stopped being true.
+        func firstStart(_ kind: TrackAnalysis.Section.Kind) -> TimeInterval? {
+            sections.filter { $0.kind == kind }.map(\.start).filter { $0.isFinite && $0 > 0 }
+                .min()
+        }
+        let target: (TransitionAim.Target, TimeInterval)
+        if let drop = firstStart(.drop) {
+            target = (.drop, drop)
+        } else if let chorus = firstStart(.chorus) {
+            target = (.chorus, chorus)
+        } else if let core = sections.first(where: { $0.kind != .intro && $0.kind != .outro }),
+                  core.start.isFinite, core.start > 0 {
+            target = (.core, core.start)
+        } else {
+            return unaimed("every section is an intro or an outro")
+        }
+        guard target.1 - incoming.introEnd <= config.scoreAimMaxLeadSeconds else {
+            return unaimed(String(format: "the first %@ sits at %.2f s, more than %.0f s past "
+                                  + "the intro end — too much of the song to skip",
+                                  target.0.rawValue, target.1, config.scoreAimMaxLeadSeconds))
+        }
+
+        // The aim has to be a bar line the compiler can actually address. The
+        // segmenter snaps section starts to downbeats already, so this normally
+        // finds the target itself; a target further than half a bar from any
+        // downbeat is one the two layers disagree about, and a cut is not the
+        // gesture to resolve a disagreement with.
+        let grid = incoming.downbeats
+        guard let index = ScoreCompiler.nearestIndex(grid, to: target.1) else {
+            return unaimed("the incoming track has no bar grid")
+        }
+        let bar = ScoreCompiler.barSeconds(grid, around: index, bpm: incoming.bpm)
+        guard abs(grid[index] - target.1) <= bar * 0.5 else {
+            return unaimed(String(format: "the %@ at %.2f s is %.2f s from the nearest bar line",
+                                  target.0.rawValue, target.1, abs(grid[index] - target.1)))
+        }
+        let aimTime = grid[index]
+
+        // How much of the incoming track runs before the seam: the swap point,
+        // read on the incoming deck's own clock — which under a post-swap glide
+        // is the integral of a moving rate, not a product (the c2ec6e6 lesson)
+        // — rounded to whole bars so the entry stays a downbeat. A downbeat
+        // entry is not cosmetic: the fall-back when no segment arms is a
+        // *complete blend*, and a blend entered half a bar out is beat-matched
+        // to nothing.
+        let geometry = TransitionAutomation.Geometry(plan: .beatMatched(p))
+        let glide = TransitionAutomation.incomingGlide(for: .beatMatched(p), geometry: geometry)
+        let clock = StemTechniqueLayer.SourceClock(
+            rate: Double(max(0.5, min(2, p.incomingRate))), glide: glide)
+        let advance = clock.sourceAdvance(to: geometry.swapOffset)
+        let leadBars = max(1, Int((advance / max(bar, 0.05)).rounded()))
+        guard index - leadBars >= 0 else {
+            return unaimed(String(format: "the %@ at %.2f s is fewer than %d bars into the track",
+                                  target.0.rawValue, aimTime, leadBars))
+        }
+        let entry = grid[index - leadBars]
+
+        // --- The gates that depend on the entry, re-run. Whatever they say
+        // about the aimed geometry is final; there is no aim strong enough to
+        // buy its way past one.
+        let overlap = p.overlapDuration
+        guard entry >= 0, entry + overlap <= incoming.duration else {
+            return unaimed(String(format: "entering at %.2f s leaves no room for the %.2f s "
+                                  + "overlap on a %.0f s track", entry, overlap,
+                                  incoming.duration))
+        }
+        guard isStable(incoming, incoming.rmsEnvelope, from: entry, length: overlap,
+                       cv: config.stableCV, config: config) else {
+            return unaimed(String(format: "the incoming window from %.2f s is not steady enough "
+                                  + "to enter on", entry))
+        }
+        guard !vocalsClash(outgoing: outgoing, outPoint: p.outPoint,
+                           incoming: incoming, inPoint: entry, overlap: overlap,
+                           config: config) else {
+            return unaimed(String(format: "entering at %.2f s puts two vocals over each other",
+                                  entry))
+        }
+
+        return AimOutcome(
+            aim: TransitionAim(target: target.0, time: aimTime, leadBars: leadBars),
+            inPoint: entry,
+            detail: String(format: "%@ at %.2f s lands on the seam; the incoming deck is "
+                           + "entered %d bars earlier at %.2f s (was %.2f s)",
+                           target.0.rawValue, aimTime, leadBars, entry, p.inPoint))
     }
 
     // MARK: - Decision ledger

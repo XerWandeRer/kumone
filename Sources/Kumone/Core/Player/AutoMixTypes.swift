@@ -153,6 +153,25 @@ struct TransitionStyle: Sendable, Equatable {
     /// approximated cut is worse than the blend it replaced (predev §1.2), so a
     /// segment that does not arm means the listener hears today's hand-over.
     var score: TransitionScore? = nil
+    /// **What the seam was aimed at** (`TransitionAim`, predev §2.3). Written
+    /// only alongside a `score`, and nil is again everything today.
+    ///
+    /// It is an *annotation*, not an instruction: the decision it records has
+    /// already been made — the plan's `inPoint` was composed backwards from it,
+    /// so a style stripped of this field still plays the aimed hand-over. What
+    /// it buys is that the compiler can place the seam on the aim exactly
+    /// rather than re-deriving it from the phrase grid, and that every report
+    /// can say *what* the cut landed on rather than only where.
+    var aim: TransitionAim? = nil
+    /// Why `aim` is what it is — and, when it is nil, **why there was nothing
+    /// to aim at**. One English sentence, carried rather than re-derived so the
+    /// console, the panel and the seam history all print the same reason the
+    /// planner actually acted on.
+    ///
+    /// Nil is "the aiming layer never ran", which is every unscored seam. A
+    /// refusal is never silent: `aim=none (no structure)` is the interesting
+    /// half of the A/B, and a bare `aim=none` reads as a missing feature.
+    var aimDetail: String? = nil
 
     static let plain = TransitionStyle(outroEffect: .fade, stagedEQ: false)
 }
@@ -532,6 +551,27 @@ struct BeatMatchedPlan: Sendable {
     /// hold-then-release and is what every plan built before the glide existed
     /// reads as. See `TransitionAutomation.incomingGlide`.
     var rampGlideBackFromSwap: Bool = false
+
+    /// The same hand-over, entered at a different point of the **incoming**
+    /// track — the one thing the aiming layer (predev §2.3) changes about a
+    /// plan.
+    ///
+    /// Field-for-field a copy but for `inPoint`, deliberately written out
+    /// rather than made a `var`: the plan is what the armed-plan comparison and
+    /// the segment signature are keyed on, and every other field staying put is
+    /// the promise that aiming moved the entry and nothing else. The out point,
+    /// the bar count, both rates and the whole ramp are the outgoing track's
+    /// and the gates' business, and aiming has no vote on any of them.
+    func enteringIncoming(at inPoint: TimeInterval) -> BeatMatchedPlan {
+        var moved = BeatMatchedPlan(
+            outPoint: outPoint, inPoint: inPoint, overlapBars: overlapBars,
+            outgoingRate: outgoingRate, incomingRate: incomingRate,
+            bassSwapOffset: bassSwapOffset, overlapDuration: overlapDuration)
+        moved.rampLeadSeconds = rampLeadSeconds
+        moved.rampReleaseSeconds = rampReleaseSeconds
+        moved.rampGlideBackFromSwap = rampGlideBackFromSwap
+        return moved
+    }
 }
 
 extension TransitionPlan {

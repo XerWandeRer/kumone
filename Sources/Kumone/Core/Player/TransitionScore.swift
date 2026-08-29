@@ -43,6 +43,66 @@ public struct GridPosition: Codable, Equatable, Sendable, Comparable {
     }
 }
 
+/// **What the seam is aimed at, in the incoming track** — the P2 layer
+/// (predev §2.3).
+///
+/// P1 put a cut on the one and left *which* one to the geometry: the seam
+/// started from the plan's own bass-swap point and was snapped onto the nearest
+/// phrase line of the incoming song. That lands a clean edge — and the field
+/// verdict on the first three scored seams was that it lands it *nowhere in
+/// particular*, N phrase-lines past the in point, so the slam reads as abrupt
+/// rather than as an arrival. A cut is only motivated if the thing it cuts to
+/// is the thing the listener came for.
+///
+/// So the aim is chosen first and the entry is composed backwards from it: the
+/// incoming deck is started however many bars before `time` the hand-over needs,
+/// so that `time` — the drop, the chorus, or failing both the start of the song
+/// proper — falls exactly on the seam. **Nothing else moves**: the out point,
+/// the climax guard, the lyric snap and the candidate ordering are the outgoing
+/// track's business and they are untouched, so aiming picks among geometries the
+/// gates have already passed and can never authorize one they refused.
+public struct TransitionAim: Codable, Equatable, Sendable {
+
+    /// Which structural landmark the seam was aimed at, in priority order.
+    public enum Target: String, Codable, Sendable {
+        /// A `.drop` section's start — the electronic climax, and the one grid
+        /// point a slam was invented for.
+        case drop
+        /// A chorus start: the pop equivalent of the same question.
+        case chorus
+        /// The first **core** section's start — `inPointChoice`'s own answer,
+        /// which is to say "where the song proper begins". Aiming at it is
+        /// still worth doing: today the in point is where the incoming deck
+        /// *starts*, so the core start goes by unremarked in the middle of the
+        /// overlap; aimed, the cut lands on it.
+        case core
+    }
+
+    public var target: Target
+    /// The instant on the **incoming track's own clock** the seam is aimed at.
+    public var time: TimeInterval
+    /// How many bars of the incoming track are played, silently under the
+    /// outgoing one, before the seam reaches `time`.
+    public var leadBars: Int
+
+    public init(target: Target, time: TimeInterval, leadBars: Int) {
+        self.target = target
+        self.time = time
+        self.leadBars = leadBars
+    }
+
+    /// `drop@84.00s` — how the console, the panel and the seam history name it.
+    public var label: String { String(format: "%@@%.2fs", target.rawValue, time) }
+
+    /// The one line a report prints, aimed or not. The unaimed case is spelled
+    /// out rather than omitted: "we did not aim" is the interesting half of the
+    /// A/B, and a missing row reads as a missing feature.
+    public static func report(_ aim: TransitionAim?, reason: String? = nil) -> String {
+        guard let aim else { return "aim=none" + (reason.map { " (\($0))" } ?? "") }
+        return "aim=\(aim.label)" + " (\(aim.leadBars) bars of lead)"
+    }
+}
+
 /// One club gesture, as an event rather than a curve.
 ///
 /// The cases past P1 are named here on purpose: the model has to be able to

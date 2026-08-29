@@ -721,14 +721,21 @@ public enum Audition {
     /// verbatim. Kept here rather than in `ScoreCompiler` so the compiler stays
     /// a pure placement problem with no opinions about phrasing.
     static func describe(_ c: ScoreCompiler.Compilation) -> [String] {
+        // The aim first, on both paths. What a scored seam was *aimed at* is
+        // the P2 question, and it is asked of a refusal exactly as loudly as of
+        // a compile — "we wanted the drop and did not get there" is the useful
+        // half of a refused score.
+        let aimLine = TransitionAim.report(c.aim, reason: c.aimNote)
         if let refusal = c.refusalReason {
-            return ["乐谱 \(c.label) 没有上演：\(refusal)", "这次转场听到的是今天的 blend。"]
+            return ["乐谱 \(c.label) 没有上演：\(refusal)", "  \(aimLine)",
+                    "这次转场听到的是今天的 blend。"]
         }
         var lines = [String(format: "乐谱 %@：seam 落在叠加的 +%.3f 秒"
                             + "（出曲 %.3f 秒 / 入曲 %.3f 秒），"
                             + "相对低频交接点移了 %+.3f 秒以落到小节线上。",
                             c.label, c.seamOffset, c.seamOutgoing, c.seamIncoming,
-                            c.seamSnapSeconds)]
+                            c.seamSnapSeconds),
+                     "  " + aimLine]
         for placed in c.events {
             lines.append(String(format: "  %@ @ bar %d beat %.2f → +%.3f 秒",
                                 placed.event, placed.at.bar, placed.at.beat, placed.offset))
