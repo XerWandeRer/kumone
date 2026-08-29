@@ -36,6 +36,17 @@ public enum StemSeparation {
 
     /// Whether a hand-over may be planned with `StemAvailability.ready`.
     public static var isAvailable: Bool { provider != nil }
+
+    /// Put a line about the separator's memory into the playback journal.
+    ///
+    /// The separator lives in StemKit and the journal lives here, and the
+    /// dependency only runs one way, so this is the door: the host installs a
+    /// `StemSeparator.onCacheTrim` hook that calls through to it. Narrower than
+    /// making `PlaybackJournal` public, which would invite every module to
+    /// write playback lines from wherever.
+    public static func note(_ line: String) {
+        PlaybackJournal.note(line)
+    }
 }
 
 /// Sidecar cache for separated vocals, shared by the app and the `audition`

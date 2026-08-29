@@ -295,4 +295,29 @@ import Testing
         #expect(result.stemTechnique == nil)
         #expect(result.stemFallbackReason?.contains("expected") == true)
     }
+
+    // MARK: - The memory door
+
+    /// The separator's memory notes reach the playback journal.
+    ///
+    /// `StemSeparator` drops the MLX buffer pool after every window — half a
+    /// gigabyte of it, measured — and the only field-visible record that it
+    /// happened is a journal line. But the separator lives in StemKit, which
+    /// cannot see `PlaybackJournal`: KumoneCore is deliberately MLX-free and
+    /// the dependency runs one way only. So the hosts (`StemSetup`, the
+    /// `audition` console) wire StemKit's hook to `StemSeparation.note`, and
+    /// this is the half of that path that is testable without a 64 MiB
+    /// checkpoint and a Metal device — that the door is open, and that a line
+    /// pushed through it comes out of the journal intact.
+    ///
+    /// Worth a test because the failure is silent by construction: if this
+    /// door closed, nothing would break, no separation would fail, and the
+    /// next person asking where the memory went would be back to `vmmap`.
+    @Test func theSeparatorsMemoryNotesReachTheJournal() {
+        let line = "mlx cache trimmed to 8MB after 14.8s window (freed 512MB)"
+        let (_, captured) = PlaybackJournal.tap.capture {
+            StemSeparation.note(line)
+        }
+        #expect(captured == [line])
+    }
 }

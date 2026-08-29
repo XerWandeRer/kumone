@@ -162,12 +162,70 @@ public final class StemSeparator: @unchecked Sendable {
         MLX.eval(vocalsArray, accompanimentArray)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
 
-        return SeparatedStems(
+        let stems = SeparatedStems(
             vocals: Self.channels(of: vocalsArray, count: inputChannels),
             accompaniment: Self.channels(of: accompanimentArray, count: inputChannels),
             sampleRate: sampleRate,
             separationSeconds: elapsed
         )
+        // The stems are Swift arrays now — nothing MLX-side is live but the
+        // weights, so this is the window's real completion point.
+        Self.trimCache(after: String(format: "%.1fs window", stems.duration))
+        return stems
+    }
+
+    // MARK: - GPU cache
+
+    /// Hand the MLX allocator's cached Metal buffers back after a window.
+    ///
+    /// **Why this is not optional.** MLX pools freed device buffers and only
+    /// reclaims them lazily, when a later allocation would breach
+    /// ``RoFormerConfiguration/gpuCacheLimit``. Since a separation transiently
+    /// touches ~1.6 GB, the pool saturates at the limit on the very first window
+    /// and stays there for the life of the process: measured on an M4, a player
+    /// that had separated once sat at **0.79 GB** physical footprint with
+    /// **0.50 GB** of it pure cache, against **0.06 GB** of genuinely live model
+    /// weights. Nothing gives it back, because nothing ever asks.
+    ///
+    /// **Why clearing outright, rather than a smaller limit.** A lower
+    /// ``RoFormerConfiguration/gpuCacheLimit`` would only trim on the *next*
+    /// allocation, so the memory stays held for exactly as long as it is a
+    /// problem — the idle stretch between two seams. Dropping the pool costs
+    /// nothing to rebuild: over four 12 s windows on an M4, separations that
+    /// started from an empty cache ran in **5.587 s** mean against **5.600 s**
+    /// warm — a 0.2 % difference, inside the run-to-run noise. The buffers come
+    /// back out of the Metal heap; only the pooling is discarded, not the
+    /// weights, and not the compiled pipelines.
+    ///
+    /// So the ceiling stays where it is for the duration of a window — the
+    /// chunked forward pass genuinely reuses those buffers — and the pool is
+    /// dropped the moment the window is done.
+    private static func trimCache(after context: String) {
+        let before = MLX.Memory.cacheMemory
+        guard before > 0 else { return }
+        MLX.Memory.clearCache()
+        report(freed: before, remaining: MLX.Memory.cacheMemory, context: context)
+    }
+
+    /// Where a trim gets announced.
+    ///
+    /// StemKit cannot see `PlaybackJournal` — KumoneCore is deliberately
+    /// MLX-free and the dependency only runs the other way — so the host wires
+    /// this up (`StemSetup`, `StemService`) and StemKit stays a library that
+    /// separates audio. Unset, a trim is silent, which is what `stemtool` and
+    /// `vocaleval` want.
+    public static var onCacheTrim: (@Sendable (String) -> Void)? {
+        get { hook.withLock { $0 } }
+        set { hook.withLock { $0 = newValue } }
+    }
+
+    private static let hook = Mutex<(@Sendable (String) -> Void)?>(nil)
+
+    private static func report(freed: Int, remaining: Int, context: String) {
+        guard let sink = onCacheTrim else { return }
+        let megabytes = { (bytes: Int) in Double(bytes) / (1024 * 1024) }
+        sink(String(format: "mlx cache trimmed to %.0fMB after %@ (freed %.0fMB)",
+                    megabytes(remaining), context, megabytes(freed)))
     }
 
     /// Convenience overload for interleaved stereo input.
@@ -212,5 +270,22 @@ public final class StemSeparator: @unchecked Sendable {
             MLX.eval(slice)
             return slice.asArray(Float.self)
         }
+    }
+}
+
+/// A lock around one value. `NSLock` plus a stored property, spelled once.
+///
+/// Swift's own `Mutex` is in `Synchronization` and needs macOS 15; StemKit
+/// still builds for 14.
+private final class Mutex<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) { self.value = value }
+
+    func withLock<R>(_ body: (inout Value) -> R) -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
     }
 }

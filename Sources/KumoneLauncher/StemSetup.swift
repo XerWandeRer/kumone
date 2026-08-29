@@ -14,6 +14,11 @@ enum StemSetup {
 
     static func install() {
         guard ResidentStemSeparator.isRunnable() else { return }
+        // "Why is the player holding 1.1 GB?" has, until now, been answerable
+        // only by attaching `vmmap` to a running app. The MLX buffer pool is
+        // half of that number and it is now dropped after every window, so the
+        // journal says so — one line per trim, with the megabytes.
+        StemSeparator.onCacheTrim = { StemSeparation.note($0) }
         StemSeparation.install(VocalStemCache.caching { request in
             try ResidentStemSeparator.shared.vocals(samples: request.samples,
                                                     sampleRate: request.sampleRate)

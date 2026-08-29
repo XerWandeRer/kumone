@@ -25,6 +25,14 @@ final class StemService: @unchecked Sendable {
 
     static func isStemSidecar(_ url: URL) -> Bool { VocalStemCache.isSidecar(url) }
 
+    private init() {
+        // A `batch` or `sweep` run separates hundreds of windows back to back,
+        // which is the run where the MLX pool being dropped between them
+        // matters most — and the one where a reader most wants the journal to
+        // say it happened.
+        StemSeparator.onCacheTrim = { StemSeparation.note($0) }
+    }
+
     /// What the renderer takes: `(window) throws -> vocal stem`.
     var provider: VocalStemProvider {
         VocalStemCache.caching { request in

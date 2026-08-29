@@ -240,6 +240,22 @@ func peakResidentBytes() -> UInt64 {
     return UInt64(usage.ru_maxrss)
 }
 
+/// What `vmmap` calls "Physical footprint" — the number a memory complaint is
+/// actually about. `ru_maxrss` is not it: the MLX buffer cache lives in
+/// IOAccelerator regions that never appear in RSS, so a run that leaves 500 MB
+/// of Metal buffers behind looks, to `getrusage`, exactly like one that does not.
+func physicalFootprintBytes() -> UInt64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return result == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0
+}
+
 func formatBytes(_ bytes: UInt64) -> String {
     String(format: "%.2f GB", Double(bytes) / 1_073_741_824)
 }
@@ -278,7 +294,10 @@ Task {
             let result = try await separator.separate(samples: mixture, sampleRate: sampleRate)
             print(
                 "run \(run)      \(String(format: "%.2f", result.separationSeconds))s  "
-                    + "(\(String(format: "%.2f", result.realtimeFactor))× realtime)")
+                    + "(\(String(format: "%.2f", result.realtimeFactor))× realtime)  "
+                    + "mlx active \(formatBytes(UInt64(MLX.Memory.activeMemory))) "
+                    + "cache \(formatBytes(UInt64(MLX.Memory.cacheMemory)))  "
+                    + "footprint \(formatBytes(physicalFootprintBytes()))")
             stems = result
         }
         guard let stems else { fail("no separation ran") }
@@ -305,7 +324,12 @@ Task {
                 + "\(decibels(peak(stems.accompaniment)))")
         print(
             "peak mem   MLX allocator \(formatBytes(UInt64(MLX.Memory.peakMemory)))  "
-                + "process RSS \(formatBytes(peakResidentBytes()))")
+                + "process RSS \(formatBytes(peakResidentBytes()))  "
+                + "footprint \(formatBytes(physicalFootprintBytes()))")
+        print(
+            "steady mem MLX active \(formatBytes(UInt64(MLX.Memory.activeMemory)))  "
+                + "cache \(formatBytes(UInt64(MLX.Memory.cacheMemory)))  "
+                + "limit \(formatBytes(UInt64(MLX.Memory.cacheLimit)))")
         print("output     \(outputURL.path)")
     } catch {
         FileHandle.standardError.write(Data("error: \(error)\n".utf8))
