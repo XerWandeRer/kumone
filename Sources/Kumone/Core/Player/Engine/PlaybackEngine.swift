@@ -1130,8 +1130,9 @@ final class PlaybackEngine: @unchecked Sendable {
         // the bug look like it never happened.
         if abs(state.timePitch.rate - 1) > 0.001 {
             PlaybackJournal.note(String(
-                format: "deck neutralize deck=%@ rate=×%.4f → ×1.0000 pad=%+.2fdB",
-                journalDeckName(state), state.timePitch.rate, state.ratePadDB))
+                format: "deck neutralize deck=%@ rate=×%.4f → ×1.0000 pad=%+.2fdB eq=%@",
+                journalDeckName(state), state.timePitch.rate, state.ratePadDB,
+                journalEQ(state)))
         }
         DeckChain.neutralize(timePitch: state.timePitch, eq: state.eq, delay: state.delay)
     }
@@ -1141,6 +1142,21 @@ final class PlaybackEngine: @unchecked Sendable {
     private func journalDeckName(_ state: DeckState) -> String {
         if state === segmentState { return "segment" }
         return deckStates.first { $0.value === state }?.key.rawValue ?? "?"
+    }
+
+    /// The deck's EQ band gains for a journal line — "flat" when nothing is
+    /// engaged, else the four gains with `·` for a bypassed band. Every
+    /// watery/muffled field incident so far was chased through rate and pad
+    /// because those were the only numbers the journal carried; a band left
+    /// down is the one stuck state this makes visible.
+    private func journalEQ(_ state: DeckState) -> String {
+        let bands = state.eq.bands
+        guard bands.contains(where: { !$0.bypass && abs($0.gain) > 0.1 }) else {
+            return "flat"
+        }
+        return bands.map {
+            $0.bypass ? "·" : String(format: "%+.1f", $0.gain)
+        }.joined(separator: ",")
     }
 
     // MARK: - Fader (locked)
@@ -1432,9 +1448,9 @@ final class PlaybackEngine: @unchecked Sendable {
     /// the gapless drain fallback, and the cancel paths all set it explicitly.
     private func resetDeckLocked(_ state: DeckState, keepingEchoTail: Bool = false) {
         PlaybackJournal.note(String(
-            format: "deck reset deck=%@ rate=×%.4f pad=%+.2fdB ride=%+.2fdB echoTail=%@",
+            format: "deck reset deck=%@ rate=×%.4f pad=%+.2fdB ride=%+.2fdB echoTail=%@ eq=%@",
             journalDeckName(state), state.timePitch.rate, state.ratePadDB, state.rideDB,
-            keepingEchoTail ? "kept" : "no"))
+            keepingEchoTail ? "kept" : "no", journalEQ(state)))
         state.generation += 1
         if keepingEchoTail {
             // The tail owns the fader; a pending flush restore must not fire
@@ -2574,7 +2590,9 @@ final class PlaybackEngine: @unchecked Sendable {
         to.band(.highPass).bypass = true
         PlaybackJournal.note("transition complete via=overlap "
                              + "\(tr.from.rawValue)→\(tr.to.rawValue) "
-                             + "echoTail=\(tailRinging ? "ringing" : "none") \(journalRates)")
+                             + "echoTail=\(tailRinging ? "ringing" : "none") \(journalRates) "
+                             + "eq \(tr.from.rawValue)=\(deckStates[tr.from].map(journalEQ) ?? "?") "
+                             + "\(tr.to.rawValue)=\(deckStates[tr.to].map(journalEQ) ?? "?")")
         eventContinuation.yield(.transitionCompleted(from: tr.from, to: tr.to))
 
         if case .beatMatched(let plan) = tr.plan, abs(plan.incomingRate - 1) > 0.001 {
