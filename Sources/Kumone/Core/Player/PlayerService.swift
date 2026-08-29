@@ -733,6 +733,11 @@ final class PlayerService: ObservableObject {
         // Whatever the pre-render was aiming at is void: a re-arm re-derives
         // the plan, and `updateStemPrerender` starts again from there.
         cancelStemPrerender()
+        armedScoreRefusal = nil
+        // The stability clock too, and for a reason worth naming: a seek moves
+        // the playhead this clock is read on, so a `since` taken before it is
+        // not a duration afterwards. A re-arm restarts it honestly.
+        stemPrerenderStable = nil
     }
 
     private func startPlaying(_ track: Track, indexUnchanged: Bool = false) {
@@ -1145,11 +1150,101 @@ final class PlayerService: ObservableObject {
         engine.scheduleTransition(planned, from: activeDeck, to: incoming)
         armedPlan = planned
         transitionArmed = true
+        noteArmedSignature(planned)
         pendingTransitionTrack = next.track
         publishDebugPlan(planned, next: next)
     }
 
     private func makeTransitionPlan(for next: PrefetchedNext) -> PlannedTransition {
+        vettingScore(planTransition(for: next), next: next)
+    }
+
+    /// **Compile the score at arming time, and strip it when the compiler says
+    /// no.**
+    ///
+    /// The compiler is pure — geometry, two beat grids and a lyric sidecar, all
+    /// of them in hand the moment the plan is — but until now the only thing
+    /// that ever ran it was the segment render. So a score the compiler was
+    /// always going to refuse (no bar line within half a bar of the hand-over,
+    /// a grid that drifts through the seam) still cost a spawned render task
+    /// that died on the way, once per re-arm, and reported itself to the panel
+    /// as "render produced nothing" — a sentence that names neither the reason
+    /// nor even the right layer.
+    ///
+    /// Asking first fixes all of it at once: nothing downstream ever sees a
+    /// score that cannot be performed, so there is no render to spawn, no
+    /// corpse to explain, and the seam plays today's blend — which is what it
+    /// was always going to play. The reason goes to the journal and to the
+    /// panel, once, in the words the compiler used.
+    ///
+    /// It also makes the signature honest. A score that survives this is part
+    /// of what the armed plan promises, so a re-arm that reaches the same plan
+    /// *and* the same verdict reuses the render, exactly as the settle window
+    /// wants it to.
+    private func vettingScore(_ planned: PlannedTransition,
+                              next: PrefetchedNext) -> PlannedTransition {
+        let vetted = Self.vettingScore(planned, outgoing: currentAnalysis,
+                                       incoming: next.analysis,
+                                       outgoingURL: currentLocalURL)
+        guard let refusal = vetted.refusal else {
+            armedScoreRefusal = nil
+            return vetted.planned
+        }
+        let line = "score refused: \(refusal)"
+        // Once per seam, not once per arm: the field journal's churn is ~2.9
+        // arms per seam, and three identical refusals read as three problems.
+        if armedScoreRefusal != line {
+            armedScoreRefusal = line
+            PlaybackJournal.note(line)
+        }
+        // The panel row only if the refusal is the whole story. A style that
+        // still carries a stem technique has a segment to render either way,
+        // and overwriting its `rendering`/`armed` state with a note about a
+        // gesture that was never going to run would be the same swallowing in
+        // the other direction.
+        if vetted.planned.style.stemTechnique == nil {
+            AutoMixDebugModel.shared.setPrerender(.refused(line))
+        }
+        return vetted.planned
+    }
+
+    /// The decision itself, without the reporting: the plan that will be armed,
+    /// and the compiler's sentence when the score was taken off it.
+    static func vettingScore(
+        _ planned: PlannedTransition, outgoing: TrackAnalysis?,
+        incoming: TrackAnalysis?, outgoingURL: URL?
+    ) -> (planned: PlannedTransition, refusal: String?) {
+        guard let score = planned.style.score else { return (planned, nil) }
+        func strip(_ why: String) -> (PlannedTransition, String?) {
+            var style = planned.style
+            style.score = nil
+            // The **aim stays**, and deliberately. Its arithmetic is already in
+            // the plan's entry and cannot be taken back out here; more to the
+            // point it is still true — the incoming deck is entered so that the
+            // drop falls on the hand-over, which under a blend is the predev's
+            // own aimed-blend geometry (§2.3: overlap end on T) rather than an
+            // orphan. Keeping it means the panel says "aimed at the drop, score
+            // refused" instead of quietly showing an entry nothing explains.
+            return (PlannedTransition(plan: planned.plan, style: style,
+                                      rideDB: planned.rideDB), why)
+        }
+        guard let outgoing, let incoming else {
+            return strip("乐谱要按两侧的小节网格落点，这次转场手里没有分析。")
+        }
+        let compiled = ScoreCompiler.compile(
+            score, planned: planned, outgoing: outgoing, incoming: incoming,
+            outgoingURL: outgoingURL)
+        guard compiled.didCompile else {
+            return strip(compiled.refusalReason ?? "编译器没有给出理由。")
+        }
+        return (planned, nil)
+    }
+
+    /// The last score refusal reported for the seam now armed, so a re-arm that
+    /// reaches the same verdict does not report it again. Cleared with the seam.
+    private var armedScoreRefusal: String?
+
+    private func planTransition(for next: PrefetchedNext) -> PlannedTransition {
         #if os(iOS)
         return .plain(.gapless)
         #else
@@ -1228,8 +1323,57 @@ final class PlayerService: ObservableObject {
     /// wanting both sides is ~30 s of work plus a second of rendering: a minute
     /// of lead is comfortable, and the guard is there so a machine that is
     /// busier than that never delays a hand-over — it simply gets the live one.
-    private static let stemPrerenderLead: TimeInterval = 60
+    static let stemPrerenderLead: TimeInterval = 60
     private static let stemPrerenderGuard: TimeInterval = 5
+
+    /// **How long an armed plan must hold still before its pre-render may start
+    /// early**, ahead of the lead window entirely.
+    ///
+    /// The lead window was a proxy for "the plan has stopped moving": start too
+    /// soon and a re-plan throws the render away. Six hours of field journal say
+    /// the proxy is far too expensive. 45 seams produced 130 `plan armed` lines
+    /// — ~2.9 arms per seam — and **zero** of them were a genuine "plan
+    /// replaced": the churn is the late analysis and the deadline-committed pick
+    /// landing, all of it within seconds of the first arm and none of it after
+    /// that. Meanwhile only 5 of the 45 seams got their spliced segment; the
+    /// rest ran out of runway waiting for a window that opens 60 s before a
+    /// splice a 30 s overlap needs 75 s for.
+    ///
+    /// So the trigger is stability, not proximity: twelve seconds is comfortably
+    /// past where the churn lives and still leaves minutes of runway on a
+    /// typical track. The feasibility check is unchanged and still has the last
+    /// word — starting early buys runway, it does not excuse not having any —
+    /// and a seam that moves afterwards cancels and re-renders exactly as it did.
+    static let stemPrerenderSettleSeconds: TimeInterval = 12
+
+    /// Why a pre-render started, for the journal.
+    enum StemPrerenderTrigger: String {
+        /// The armed plan held still long enough to be believed, with more than
+        /// the lead window still to go. The common case after this change.
+        case settled
+        /// The classic: the splice came inside the lead window.
+        case lead
+        /// Inside the lead window and short of it — the seam moved under a
+        /// finished render, which is what a deadline-committed pick does.
+        case late
+    }
+
+    /// Whether this tick starts the pre-render, and what to call the reason.
+    ///
+    /// Pure, and static, so the window can be tested without a player: the
+    /// caller supplies the three numbers and gets back the journal's word for
+    /// what it is about to do, or nil for "not yet, come back next tick".
+    static func stemPrerenderTrigger(
+        remaining: TimeInterval, stableFor: TimeInterval, runway: TimeInterval
+    ) -> StemPrerenderTrigger? {
+        // Feasibility first, and it is never waived. A render that cannot
+        // finish is Metal time spent on audio nobody will hear.
+        guard remaining >= runway, remaining > stemPrerenderGuard else { return nil }
+        guard remaining > stemPrerenderLead else {
+            return remaining < stemPrerenderLead - 2 ? .late : .lead
+        }
+        return stableFor >= stemPrerenderSettleSeconds ? .settled : nil
+    }
 
     /// Separation runs at roughly realtime **per side**, and a segment wants
     /// both sides of the seam.
@@ -1266,7 +1410,10 @@ final class PlayerService: ObservableObject {
         return stemPrerenderSidesPerSeam * max(0, overlapDuration) + stemPrerenderMargin
     }
 
-    private enum StemPrerenderState {
+    /// Internal rather than private only so the reuse rule below can be tested
+    /// on both of its arms: what "already have this one" means is exactly that
+    /// a finished render and an in-flight one answer `signature` alike.
+    enum StemPrerenderState {
         case idle
         /// A job is running for this seam.
         case running(TransitionSegment.Signature)
@@ -1280,6 +1427,22 @@ final class PlayerService: ObservableObject {
             case .running(let s), .settled(let s): return s
             }
         }
+    }
+
+    /// **Whether a re-arm throws away the render already held for this seam.**
+    ///
+    /// Only a signature that actually *differs* does. An identical one is not a
+    /// new seam — the splice, the entry and the overlap are the three things a
+    /// segment is rendered against, and if none of them moved then the audio in
+    /// hand is the audio wanted, whether it is finished (`.settled`) or still
+    /// being made (`.running`). The field journal's 2.9 arms per seam are almost
+    /// entirely this case, and discarding on any of them would have thrown away
+    /// work that was already correct.
+    static func stemPrerenderDiscards(
+        held: StemPrerenderState, armed: TransitionSegment.Signature
+    ) -> Bool {
+        guard let held = held.signature else { return false }
+        return held != armed
     }
 
     /// A pre-render's stop switch.
@@ -1302,6 +1465,16 @@ final class PlayerService: ObservableObject {
     private var stemPrerenderTask: Task<Void, Never>?
     private var stemPrerenderCancel: PrerenderCancel?
     private var stemPrerenderState: StemPrerenderState = .idle
+
+    /// The signature the armed plan has been carrying, and the playhead reading
+    /// at which it first appeared — the clock `stemPrerenderTrigger` reads.
+    ///
+    /// Measured in playback seconds rather than wall-clock on purpose: it is the
+    /// same clock `remaining` is measured against, so "held still for 12 s" and
+    /// "60 s of lead" are the same kind of second, and a paused player does not
+    /// accrue confidence in a seam nobody is approaching.
+    private var stemPrerenderStable: (signature: TransitionSegment.Signature,
+                                      since: TimeInterval)?
 
     /// Polled from the progress timer: start, abandon or ignore the pre-render
     /// of the armed hand-over. Cheap — a few comparisons — until the moment it
@@ -1330,7 +1503,9 @@ final class PlayerService: ObservableObject {
 
         // A re-plan (a late analysis, a degraded seam after a seek) moves the
         // splice; whatever was rendered for the old one is the wrong audio.
-        if let running = stemPrerenderState.signature, running != signature {
+        // A re-plan that lands on the *same* signature is not a move at all and
+        // is deliberately not handled here — see `noteArmedSignature`.
+        if Self.stemPrerenderDiscards(held: stemPrerenderState, armed: signature) {
             cancelStemPrerender()
         }
         let splice = signature.outPoint - TransitionSegmentRenderer.handoff
@@ -1356,15 +1531,20 @@ final class PlayerService: ObservableObject {
             }
             return
         case .idle:
-            // Too early is not a decision — come back next tick.
-            guard remaining <= Self.stemPrerenderLead else { return }
             let runway = Self.stemPrerenderRunway(
                 overlapDuration: signature.overlapDuration,
                 separatesStems: separatesStems)
-            guard remaining >= runway, remaining > Self.stemPrerenderGuard else {
-                // It genuinely does not fit. Say so with the numbers and settle
-                // — starting a render that cannot finish only burns Metal time
+            let stableFor = stemPrerenderStable.map { livePlaybackTime - $0.since } ?? 0
+            guard let trigger = Self.stemPrerenderTrigger(
+                remaining: remaining, stableFor: stableFor, runway: runway) else {
+                // Two very different "no"s, and only one of them is final.
+                // Outside the lead window this is "not yet" — the plan is still
+                // churning, or the runway has not opened — and the next tick
+                // asks again. Inside it, time only runs out from here, so it
+                // genuinely does not fit: say so with the numbers and settle,
+                // because starting a render that cannot finish burns Metal time
                 // and abandons at the guard anyway.
+                guard remaining <= Self.stemPrerenderLead else { return }
                 stemPrerenderState = .settled(signature)
                 let why = String(
                     format: "not enough runway (%.1fs left, %.1fs needed for a %.1fs overlap)",
@@ -1374,14 +1554,9 @@ final class PlayerService: ObservableObject {
                 return
             }
             PlaybackJournal.note(String(
-                format: "prerender start remaining=%.1fs runway=%.1fs overlap=%.1fs%@",
-                remaining, runway, signature.overlapDuration,
-                remaining < Self.stemPrerenderLead - 2
-                    // Started with less than the full lead: the seam moved
-                    // under a finished render, which is what a deadline-
-                    // committed pick does. Worth naming — it used to be the
-                    // moment the gesture silently vanished.
-                    ? " late (seam moved)" : ""))
+                format: "prerender start trigger=%@ remaining=%.1fs runway=%.1fs "
+                    + "overlap=%.1fs stable=%.1fs",
+                trigger.rawValue, remaining, runway, signature.overlapDuration, stableFor))
         }
 
         // A score-only segment never calls this, so a machine with no separator
@@ -1408,11 +1583,21 @@ final class PlayerService: ObservableObject {
         stemPrerenderTask = Task { [weak self] in
             // Separation is Metal work and rendering is a synchronous pull
             // loop; both belong off the main actor entirely.
-            let segment = await Task.detached(priority: .utility) { () -> TransitionSegment? in
-                try? TransitionSegmentRenderer.render(request, provider: cancellable)
+            // The error is kept, not discarded. Every refusal in there already
+            // carries a sentence (`SegmentError.errorDescription`), and
+            // throwing them away was how a compile refusal, a missing separator
+            // and a genuinely empty buffer all arrived at the panel as "render
+            // produced nothing" — the one of the three that was almost never
+            // true.
+            let outcome = await Task.detached(priority: .utility) {
+                Result { try TransitionSegmentRenderer.render(request, provider: cancellable) }
             }.value
             guard let self, !Task.isCancelled, generation == self.resolveGeneration else { return }
-            if let segment {
+            switch outcome {
+            case .failure(let error):
+                AutoMixDebugModel.shared.setPrerender(
+                    .abandoned(error.localizedDescription))
+            case .success(let segment):
                 // The engine rejects it if the seam moved underneath us or the
                 // playhead is already past the splice, and plays the live
                 // hand-over instead — this is a suggestion, not a command.
@@ -1424,11 +1609,34 @@ final class PlayerService: ObservableObject {
                     self.engine.hasArmedSegment
                         ? .armed(Self.debugSignature(signature))
                         : .refused("engine declined — seam moved or splice passed"))
-            } else {
-                AutoMixDebugModel.shared.setPrerender(.abandoned("render produced nothing"))
             }
             self.stemPrerenderTask = nil
             self.stemPrerenderState = .settled(signature)
+        }
+    }
+
+    /// The armed plan was just written or re-written: run the stability clock
+    /// the settle trigger reads, and say so when a re-arm landed on the very
+    /// render that is already in flight or already in hand.
+    ///
+    /// Reuse is structural rather than newly built — `updateStemPrerender`
+    /// cancels only on a signature that *differs* — but it was invisible, and
+    /// invisible is how 2.9 arms per seam came to look like 2.9 reasons to be
+    /// cautious. None of those arms was a real plan change; the journal now says
+    /// that out loud, per arm, so the next reading of the field data can tell a
+    /// kept render from a lucky one.
+    private func noteArmedSignature(_ planned: PlannedTransition) {
+        guard let signature = TransitionSegment.Signature(plan: planned.plan) else {
+            stemPrerenderStable = nil
+            return
+        }
+        guard stemPrerenderStable?.signature == signature else {
+            stemPrerenderStable = (signature, livePlaybackTime)
+            return
+        }
+        if let held = stemPrerenderState.signature, held == signature {
+            PlaybackJournal.note(
+                "prerender reuse signature=\(Self.debugSignature(signature))")
         }
     }
 
@@ -1544,6 +1752,7 @@ final class PlayerService: ObservableObject {
         let planned = makeTransitionPlan(for: next)
         engine.replaceTransitionPlan(planned)
         armedPlan = planned
+        noteArmedSignature(planned)
         publishDebugPlan(planned, next: next)
     }
 

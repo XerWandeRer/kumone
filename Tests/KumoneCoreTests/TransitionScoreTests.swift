@@ -1008,3 +1008,190 @@ private func aimable(bpm: Double = 120, duration: TimeInterval = 120,
                                                   separatesStems: false) == 15)
     }
 }
+
+// MARK: - Vetting the score before anything is rendered (P2 addendum)
+
+@MainActor
+@Suite struct ScoreVettingTests {
+
+    /// A score the compiler will refuse: a grid that lurches right where the
+    /// cut goes, which is the self-check of predev §4.2. A drifting grid is the
+    /// commonest real refusal and the one the field flood was made of.
+    private func ungriddable() -> (PlannedTransition, TrackAnalysis, TrackAnalysis) {
+        let planned = PlannedTransition(plan: .beatMatched(matchedPlan()),
+                                        style: scoredStyle(.cutOnOne()))
+        return (planned,
+                ScoreFixtures.analysis(bpm: 120, jitterAt: 32, jitter: 0.3),
+                ScoreFixtures.analysis(bpm: 120))
+    }
+
+    @Test func aScoreTheCompilerWillRefuseIsTakenOffThePlanBeforeArming() throws {
+        let (planned, out, inc) = ungriddable()
+        // The compiler's own verdict, first — this is the case being caught.
+        let compiled = ScoreCompiler.compile(.cutOnOne(), planned: planned,
+                                             outgoing: out, incoming: inc, outgoingURL: nil)
+        #expect(!compiled.didCompile)
+
+        let vetted = PlayerService.vettingScore(planned, outgoing: out, incoming: inc,
+                                                outgoingURL: nil)
+        // Stripped, so nothing downstream can spawn a render for it: the
+        // segment renderer's own admission is "a stem technique **or** a
+        // score", and with neither there is nothing to attempt.
+        #expect(vetted.planned.style.score == nil)
+        #expect(vetted.planned.style.stemTechnique == nil)
+        // …with the compiler's actual sentence, not a shrug. This is the string
+        // the journal's `score refused:` line and the panel both print, and it
+        // is the reason "render produced nothing" used to be standing in for.
+        let refusal = try #require(vetted.refusal)
+        #expect(refusal == compiled.refusalReason)
+        #expect(!refusal.isEmpty)
+
+        // Everything else about the plan is untouched: this removes a gesture,
+        // it does not re-decide the hand-over. The seam plays today's blend.
+        guard case .beatMatched(let before) = planned.plan,
+              case .beatMatched(let after) = vetted.planned.plan else {
+            Issue.record("both plans should be beat-matched"); return
+        }
+        #expect(after.outPoint == before.outPoint)
+        #expect(after.inPoint == before.inPoint)
+        #expect(after.overlapDuration == before.overlapDuration)
+        #expect(vetted.planned.style.outroEffect == planned.style.outroEffect)
+    }
+
+    @Test func aScoreThatCompilesIsArmedExactlyAsPlanned() {
+        let out = ScoreFixtures.analysis(bpm: 120, duration: 60)
+        let inc = ScoreFixtures.analysis(bpm: 120, duration: 60)
+        let planned = PlannedTransition(plan: .beatMatched(matchedPlan()),
+                                        style: scoredStyle(.cutOnOne()))
+        let vetted = PlayerService.vettingScore(planned, outgoing: out, incoming: inc,
+                                                outgoingURL: nil)
+        #expect(vetted.refusal == nil)
+        #expect(vetted.planned.style.score?.label == "cutOnOne")
+    }
+
+    @Test func aScoreWithNoAnalysisToPlaceItOnNeverReachesARender() throws {
+        // The other half of the same problem, and the commoner one: the toggle
+        // is flipped on a track heard for the first time. There is no grid to
+        // compile against, so there is nothing to render either.
+        let planned = PlannedTransition(plan: .beatMatched(matchedPlan()),
+                                        style: scoredStyle(.cutOnOne()))
+        let inc = ScoreFixtures.analysis(bpm: 120, duration: 60)
+        for pair in [(nil, inc), (inc, nil)] as [(TrackAnalysis?, TrackAnalysis?)] {
+            let vetted = PlayerService.vettingScore(planned, outgoing: pair.0,
+                                                    incoming: pair.1, outgoingURL: nil)
+            #expect(vetted.planned.style.score == nil)
+            #expect(vetted.refusal?.isEmpty == false)
+        }
+    }
+
+    @Test func anUnscoredPlanIsHandedBackUntouchedAndUnexplained() {
+        // Every shipped seam. The vetting has to be a no-op on it, refusal
+        // included: a `nil` there is what keeps the journal quiet.
+        let planned = PlannedTransition(plan: .beatMatched(matchedPlan()),
+                                        style: scoredStyle(nil))
+        let vetted = PlayerService.vettingScore(
+            planned, outgoing: ScoreFixtures.analysis(bpm: 120, duration: 60),
+            incoming: ScoreFixtures.analysis(bpm: 120, duration: 60), outgoingURL: nil)
+        #expect(vetted.refusal == nil)
+        #expect(vetted.planned.style.score == nil)
+    }
+
+    @Test func everySegmentRefusalCarriesASentenceForThePanel() {
+        // The panel prints `error.localizedDescription` now, so every case has
+        // to have one — the point of the change is that "render produced
+        // nothing" stops standing in for reasons it was never describing.
+        let errors: [TransitionSegmentRenderer.SegmentError] = [
+            .noOverlap, .overlapTooLong(120), .nothingToRender,
+            .stemsNotApplied("因由"), .stemsNotApplied(nil),
+            .scoreNotCompiled("因由"), .scoreNotCompiled(nil),
+            .scoreNotApplied("因由"), .scoreNotApplied(nil), .emptyRender,
+        ]
+        for error in errors {
+            #expect(error.errorDescription?.isEmpty == false)
+            #expect(error.localizedDescription == error.errorDescription)
+        }
+    }
+}
+
+// MARK: - Pre-render start (P2 addendum)
+
+@MainActor
+@Suite struct StemPrerenderStartTests {
+
+    private let lead = PlayerService.stemPrerenderLead
+    private let settle = PlayerService.stemPrerenderSettleSeconds
+
+    private func trigger(remaining: TimeInterval, stableFor: TimeInterval,
+                         runway: TimeInterval) -> PlayerService.StemPrerenderTrigger? {
+        PlayerService.stemPrerenderTrigger(remaining: remaining, stableFor: stableFor,
+                                           runway: runway)
+    }
+
+    @Test func anArmedPlanThatHoldsStillStartsAheadOfTheLeadWindow() {
+        // The change itself. Two minutes from the splice — far outside the 60 s
+        // lead — a plan that has held still for the settle window starts, and
+        // the same plan a second earlier does not.
+        #expect(trigger(remaining: 120, stableFor: settle, runway: 47) == .settled)
+        #expect(trigger(remaining: 120, stableFor: settle - 1, runway: 47) == nil)
+
+        // Why it matters: a 30 s overlap needs 75 s of runway and the lead
+        // window only ever offers 60. Before this, that seam could not be
+        // rendered at all — the window opened after the work stopped fitting,
+        // which is the arithmetic behind 5 spliced segments in 45 seams.
+        let wide = PlayerService.stemPrerenderRunway(overlapDuration: 30)
+        #expect(wide > lead)
+        #expect(trigger(remaining: wide + 1, stableFor: settle, runway: wide) == .settled)
+        #expect(trigger(remaining: lead, stableFor: settle, runway: wide) == nil)
+    }
+
+    @Test func startingEarlyDoesNotExcuseNotHavingTheRunway() {
+        // Feasibility is unchanged and is asked first: settling for an hour
+        // buys nothing when the work does not fit in what is left.
+        #expect(trigger(remaining: 46, stableFor: 600, runway: 47) == nil)
+        // Exactly enough is enough — and inside the lead window it is the lead
+        // window's own trigger that names it, settled or not.
+        #expect(trigger(remaining: 47, stableFor: 600, runway: 47) == .late)
+        #expect(trigger(remaining: lead + 1, stableFor: 600, runway: 47) == .settled)
+        // And nothing starts inside the abandon guard, however cheap it is.
+        #expect(trigger(remaining: 4, stableFor: 600, runway: 1) == nil)
+    }
+
+    @Test func theOldTriggersKeepTheirNamesAndTheirBehaviour() {
+        // Inside the lead window the settle clock is not consulted at all — a
+        // seam that arrives late arrives late, and refusing it for being new
+        // would lose the very hand-overs this window exists to catch.
+        #expect(trigger(remaining: lead, stableFor: 0, runway: 15) == .lead)
+        #expect(trigger(remaining: lead - 1, stableFor: 0, runway: 15) == .lead)
+        // Short of the full lead: the seam moved under a finished render, which
+        // is what a deadline-committed pick does.
+        #expect(trigger(remaining: lead - 3, stableFor: 0, runway: 15) == .late)
+        #expect(trigger(remaining: 20, stableFor: 600, runway: 15) == .late)
+    }
+
+    @Test func anIdenticalSignatureKeepsTheRenderFinishedOrInFlight() {
+        let signature = try! #require(
+            TransitionSegment.Signature(plan: .beatMatched(matchedPlan(overlap: 16))))
+        // The same plan, rebuilt by value — which is what every one of the 2.9
+        // arms per seam is. Both arms of "already have it" hold it.
+        let again = try! #require(
+            TransitionSegment.Signature(plan: .beatMatched(matchedPlan(overlap: 16))))
+        #expect(!PlayerService.stemPrerenderDiscards(held: .running(signature), armed: again))
+        #expect(!PlayerService.stemPrerenderDiscards(held: .settled(signature), armed: again))
+        // Nothing held is not something to discard either.
+        #expect(!PlayerService.stemPrerenderDiscards(held: .idle, armed: again))
+    }
+
+    @Test func aSeamThatActuallyMovedIsRenderedAgain() {
+        // The other half, and the one that makes the reuse safe: a splice that
+        // moved is different audio, and the render in hand is the wrong audio.
+        let held = try! #require(
+            TransitionSegment.Signature(plan: .beatMatched(matchedPlan(overlap: 16))))
+        for moved in [matchedPlan(overlap: 16, outPoint: 121),
+                      matchedPlan(overlap: 16, inPoint: 9),
+                      matchedPlan(overlap: 20)] {
+            let armed = try! #require(TransitionSegment.Signature(plan: .beatMatched(moved)))
+            #expect(PlayerService.stemPrerenderDiscards(held: .running(held), armed: armed))
+            #expect(PlayerService.stemPrerenderDiscards(held: .settled(held), armed: armed))
+        }
+    }
+}
