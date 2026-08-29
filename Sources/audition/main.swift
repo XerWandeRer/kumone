@@ -364,14 +364,21 @@ func decide(_ args: Arguments, a: URL, b: URL) -> Audition.Decision {
                  + "cut|cutOnly|throwCut|tensionCut|bedIntro")
         }
     }
-    do {
-        return try Audition.decide(outgoing: a, incoming: b,
-                                   style: style, fade: args.double("fade"), stem: stem,
-                                   score: template,
-                                   stems: stems,
-                                   config: overrides)
-    } catch {
-        fail("\(a.lastPathComponent) → \(b.lastPathComponent): \(error.localizedDescription)")
+    // One pool per decision, which is the pool every corpus walker needs:
+    // `sweep`, `--mode tempo`, `--mode gates` and `batch` all loop over pairs
+    // calling exactly this, and a decision is up to four whole-track decodes.
+    // Putting it here rather than in each of those four loops means a walker
+    // added later gets it for free.
+    return autoreleasepool {
+        do {
+            return try Audition.decide(outgoing: a, incoming: b,
+                                       style: style, fade: args.double("fade"), stem: stem,
+                                       score: template,
+                                       stems: stems,
+                                       config: overrides)
+        } catch {
+            fail("\(a.lastPathComponent) → \(b.lastPathComponent): \(error.localizedDescription)")
+        }
     }
 }
 
@@ -745,7 +752,12 @@ func runBatch(_ args: Arguments) {
     var decisions: [Audition.Decision] = []
     var renderFactors: [Double] = []
 
-    for (index, pair) in pairs.enumerated() {
+    // A pool per seam: each iteration decodes up to four whole tracks and then
+    // runs a full offline `AVAudioEngine` render, on a CLI thread with no
+    // runloop turn to drain anything between seams. Measured, this reclaims
+    // nothing today — see `TrackAnalyzer.analyze(fileAt:)` for the numbers —
+    // and it is here as the boundary, not as a fix.
+    for (index, pair) in pairs.enumerated() { autoreleasepool {
         let d = decide(args, a: pair.0, b: pair.1)
         decisions.append(d)
         let name = String(format: "%02d-%@__%@.wav", index + 1,
@@ -779,7 +791,7 @@ func runBatch(_ args: Arguments) {
                     + " | \(d.plannedStemTechnique ?? "—")"
                     + " | \(f(d.overlapDuration))s"
                     + " | \(d.outPoint.map(mmss) ?? "—") | \(rendered) |")
-    }
+    } }
 
     // Distribution: the thing to look at first after moving a threshold.
     func histogram(_ title: String, _ counts: [(String, Int)]) -> String {

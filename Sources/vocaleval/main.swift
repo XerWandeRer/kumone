@@ -106,7 +106,15 @@ func pad(_ s: String, _ w: Int) -> String {
 
 // MARK: - Audio window loader (44.1 kHz stereo)
 
+// Pooled per window: pass A calls this in a loop nested inside a corpus walk,
+// and every call opens an `AVAudioFile` and allocates one or two whole-window
+// PCM buffers. Nothing drains them otherwise — this is a CLI, off the main
+// thread, with no runloop turn between windows.
 func loadWindow(from url: URL, start: Double, length: Double) throws -> [[Float]] {
+    try autoreleasepool { try loadWindowUnpooled(from: url, start: start, length: length) }
+}
+
+private func loadWindowUnpooled(from url: URL, start: Double, length: Double) throws -> [[Float]] {
     let targetRate = 44_100.0
     let file = try AVAudioFile(forReading: url)
     let src = file.processingFormat

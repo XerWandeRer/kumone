@@ -53,13 +53,41 @@ enum TrackAnalyzer {
 
     /// Decode to 22.05 kHz mono, then analyze. CPU-bound; callers run this
     /// off the main thread.
+    ///
+    /// **On the pool, and what it is worth.** Two whole-track decodes happen
+    /// here, and every caller that matters calls this in a loop:
+    /// `QueueOrderSelector` walks its candidate pool, `audition batch` and
+    /// `sweep` walk a corpus, the app analyzes a queue — all off the main
+    /// thread, on a `Task.detached` or a plain CLI loop, where no runloop turn
+    /// ever drains the outer pool.
+    ///
+    /// The pool is here as the boundary that *bounds* that, not because it was
+    /// found to be reclaiming anything. It was measured, and it is worth
+    /// saying what the measurement said, so nobody re-derives it: over a
+    /// 20-track corpus walk in one process, peak physical footprint was
+    /// **451.9 MB** with no pools anywhere and **451.7 MB** with them —
+    /// and, decisively, the same **451.4 MB** over a 5-track walk. Nothing
+    /// accumulates across tracks. The peak is one track's own working set (the
+    /// decoded `[Float]` and the STFT feature matrices, all Swift arrays freed
+    /// deterministically by ARC), and on this path AVFoundation's `read` and
+    /// `convert` autorelease nothing that matters.
+    ///
+    /// So: a per-*chunk* pool inside `decodeMono` was tried and removed — it
+    /// bought 0.16 MB for a restructured hot loop. This per-*file* one stays,
+    /// because it costs nothing once per track and it is the right place for
+    /// the `AVAudioFile` and `AVAudioConverter` this creates. It is insurance,
+    /// not a fix, and the memory it was meant to fix was never here — see the
+    /// GPU cache note on `StemSeparator.trimCache`, which is where the
+    /// half-gigabyte actually was.
     static func analyze(fileAt url: URL) throws -> TrackAnalysis {
-        let samples = try decodeMono(url: url, targetRate: analysisSampleRate)
-        // Second, stereo decode for the mid/side vocal cue. Best-effort: a
-        // failure (or a truly mono master) simply drops the cue, and the three
-        // mono-spectral features carry the estimate on their own.
-        let midSide = try? stereoVoiceEnergies(url: url, targetRate: analysisSampleRate)
-        return analyze(samples: samples, sampleRate: analysisSampleRate, midSide: midSide)
+        try autoreleasepool {
+            let samples = try decodeMono(url: url, targetRate: analysisSampleRate)
+            // Second, stereo decode for the mid/side vocal cue. Best-effort: a
+            // failure (or a truly mono master) simply drops the cue, and the
+            // three mono-spectral features carry the estimate on their own.
+            let midSide = try? stereoVoiceEnergies(url: url, targetRate: analysisSampleRate)
+            return analyze(samples: samples, sampleRate: analysisSampleRate, midSide: midSide)
+        }
     }
 
     /// In-memory entry point (used by tests with synthetic signals).
@@ -77,6 +105,14 @@ enum TrackAnalyzer {
     /// between them is attributable to the fusion weights and the new mid/side
     /// cue alone — not to decode or windowing drift.
     static func vocalActivityAB(fileAt url: URL) throws -> VocalActivityAB {
+        // Pooled per file, for the reason `analyze(fileAt:)` is: two whole-track
+        // decodes, and `vocaleval` calls it once per corpus track in a loop.
+        try autoreleasepool {
+            try vocalActivityABUnpooled(fileAt: url)
+        }
+    }
+
+    private static func vocalActivityABUnpooled(fileAt url: URL) throws -> VocalActivityAB {
         let sr = analysisSampleRate
         let x = try decodeMono(url: url, targetRate: sr)
         let rmsEnvelope = rmsPerSecond(x, sampleRate: sr)
