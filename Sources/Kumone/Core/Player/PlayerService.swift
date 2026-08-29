@@ -1222,6 +1222,34 @@ final class PlayerService: ObservableObject {
     private static let stemPrerenderLead: TimeInterval = 60
     private static let stemPrerenderGuard: TimeInterval = 5
 
+    /// Separation runs at roughly realtime **per side**, and a segment wants
+    /// both sides of the seam.
+    private static let stemPrerenderSidesPerSeam: Double = 2
+    /// Slack on top of the separation estimate: the render pull loop, the file
+    /// writes, and a machine that is doing other things at the same time.
+    private static let stemPrerenderMargin: TimeInterval = 15
+
+    /// How much runway one seam's pre-render actually needs.
+    ///
+    /// This is the arithmetic that was hiding inside the flat 60 s lead — "a
+    /// 15 s hand-over wanting both sides is ~30 s of work plus a second of
+    /// rendering" — pulled out and made **per-seam**, so a seam that moves
+    /// underneath a finished render can be judged on whether the re-render
+    /// *fits* rather than on whether it is early.
+    ///
+    /// That distinction is the whole fix. The old code had one number doing two
+    /// jobs: "not yet" and "no longer possible". A deadline-committed pick
+    /// arrives late by construction — the winner still has to be re-downloaded
+    /// at playback quality, re-analyzed and re-planned, which moves the seam —
+    /// and the re-render was then refused for being late even when there was
+    /// ample time to do it. A 16 s overlap needs 47 s; being handed 49 s is not
+    /// a problem, and now it is not treated as one.
+    nonisolated static func stemPrerenderRunway(
+        overlapDuration: TimeInterval
+    ) -> TimeInterval {
+        stemPrerenderSidesPerSeam * max(0, overlapDuration) + stemPrerenderMargin
+    }
+
     private enum StemPrerenderState {
         case idle
         /// A job is running for this seam.
@@ -1307,8 +1335,31 @@ final class PlayerService: ObservableObject {
             }
             return
         case .idle:
-            guard remaining <= Self.stemPrerenderLead,
-                  remaining > Self.stemPrerenderGuard else { return }
+            // Too early is not a decision — come back next tick.
+            guard remaining <= Self.stemPrerenderLead else { return }
+            let runway = Self.stemPrerenderRunway(
+                overlapDuration: signature.overlapDuration)
+            guard remaining >= runway, remaining > Self.stemPrerenderGuard else {
+                // It genuinely does not fit. Say so with the numbers and settle
+                // — starting a render that cannot finish only burns Metal time
+                // and abandons at the guard anyway.
+                stemPrerenderState = .settled(signature)
+                let why = String(
+                    format: "not enough runway (%.1fs left, %.1fs needed for a %.1fs overlap)",
+                    remaining, runway, signature.overlapDuration)
+                AutoMixDebugModel.shared.setPrerender(.refused(why))
+                PlaybackJournal.note("prerender refused \(why)")
+                return
+            }
+            PlaybackJournal.note(String(
+                format: "prerender start remaining=%.1fs runway=%.1fs overlap=%.1fs%@",
+                remaining, runway, signature.overlapDuration,
+                remaining < Self.stemPrerenderLead - 2
+                    // Started with less than the full lead: the seam moved
+                    // under a finished render, which is what a deadline-
+                    // committed pick does. Worth naming — it used to be the
+                    // moment the gesture silently vanished.
+                    ? " late (seam moved)" : ""))
         }
 
         guard let provider = StemSeparation.provider else { return }
@@ -1905,10 +1956,21 @@ final class PlayerService: ObservableObject {
     /// re-resolved, downloaded at *playback* quality and re-analyzed by the
     /// ordinary prefetch path (a lossy file's beat grid may not be aligned to
     /// the real one — predev §2.2), and a stem hand-over then wants
-    /// `stemPrerenderLead` = 60 s on top. 90 s covers both with room for a
-    /// slow transfer; the fraction floor keeps a short track from deciding
-    /// before it has played at all.
-    private static let autoMixDecisionLead: TimeInterval = 90
+    /// `stemPrerenderLead` = 60 s on top.
+    ///
+    /// 90 s was sized as 30 for the first half and 60 for the second. The first
+    /// half measured 40 s and more in the field — a lossless transfer on a
+    /// domestic line plus an analyzer pass — so the pre-render was routinely
+    /// handed under 50 s and the stem gesture dropped to a whole-mix crossfade
+    /// without anyone being told. 120 s is the same arithmetic with the
+    /// measured number in it. The fraction floor keeps a short track from
+    /// deciding before it has played at all.
+    ///
+    /// This is the *worst* case, not the common one: only a deadline-committed
+    /// pick waits this long. A pick that satisfies, exhausts the queue or spends
+    /// its download budget commits as soon as it does, which on a warm pool is
+    /// within seconds of the track starting.
+    private static let autoMixDecisionLead: TimeInterval = 120
 
     private var autoMixDeadline: TimeInterval {
         max(duration - Self.autoMixDecisionLead, duration * 0.35)

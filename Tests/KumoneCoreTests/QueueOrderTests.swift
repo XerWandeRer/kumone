@@ -564,6 +564,31 @@ import Foundation
         #expect(selector.lastPick.isEmpty)
     }
 
+    // MARK: - Stem pre-render runway
+
+    @Test func theRunwayEstimateScalesWithTheSeamRatherThanBeingOneFlatNumber() {
+        // Separation is ~1× realtime per side and a segment wants both, plus a
+        // margin: a 16 s overlap needs 47 s. The point of the estimate is that
+        // 49 s of runway is *enough* for it — under the old flat 60 s lead that
+        // seam was refused, and the stem gesture silently became a whole-mix
+        // crossfade.
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 16) == 47)
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 16) < 49)
+        // The nominal seam the flat lead was sized for still fits inside it, so
+        // the ordinary path is unchanged.
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 15) == 45)
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 15) <= 60)
+        // A long overlap costs more than the lead can offer, and is refused up
+        // front rather than started and abandoned at the guard.
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 30) == 75)
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 30) > 60)
+        // Monotone, and never negative for a degenerate plan.
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 8)
+                < PlayerService.stemPrerenderRunway(overlapDuration: 9))
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: 0) == 15)
+        #expect(PlayerService.stemPrerenderRunway(overlapDuration: -5) == 15)
+    }
+
     // MARK: - Migration
 
     @Test func aSessionWrittenBeforeTheModeExistedMigratesFromItsShuffleBool() {
