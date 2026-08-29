@@ -367,16 +367,15 @@ struct AutoMixDebugPanel: View {
                 Text(verbatim: "\(model.markCount) marked this session")
                     .foregroundStyle(.tertiary)
             }
-            if seam == nil {
-                // One field, shared by every mark button on the panel: type the
-                // note, then press good/bad wherever the seam is. Cleared on
-                // write so a note never rides along with a second seam.
-                TextField(text: $markNote) {
-                    Text(verbatim: "note (optional) — applies to the next mark")
-                }
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11, design: .monospaced))
+            // One field, shared by every mark button on the panel — history
+            // entries included: type the note, then press good/bad wherever
+            // the seam is. Cleared on write so a note never rides along with
+            // a second seam.
+            TextField(text: $markNote) {
+                Text(verbatim: "note (optional) — applies to the next mark")
             }
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
         }
     }
 
