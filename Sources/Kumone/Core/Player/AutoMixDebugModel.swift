@@ -123,6 +123,12 @@ struct AutoMixDebugPlan: Equatable {
     /// `aim=none` with the reason. Nil whenever the plan carries no score,
     /// because aiming only runs under one.
     var aim: String?
+    /// **What this hand-over was for** (P3, predev §2.4) — the intent class and
+    /// the sentences that chose it. Nil whenever the intent layer did not run,
+    /// which is every shipped seam.
+    var intent: String?
+    /// Just the class, for a badge and for bucketing feedback lines later.
+    var intentClass: String?
     var rideDB: Double = 0
     /// Which structural section the out point falls in, when the outgoing
     /// analysis has sections at all (it usually does not — see `TrackAnalysis`).
@@ -768,6 +774,8 @@ extension AutoMixDebugPlan {
         aim = planned.style.aimDetail.map {
             TransitionAim.report(planned.style.aim, reason: $0)
         }
+        intent = planned.style.intent?.label
+        intentClass = planned.style.intent?.class.rawValue
         rideDB = planned.rideDB
         outSection = outPoint.flatMap { AutoMixDebugFormat.section(at: $0, in: outgoing) }
         inPointSource = inPoint.flatMap {

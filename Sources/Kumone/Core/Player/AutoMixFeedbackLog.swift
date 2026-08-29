@@ -80,6 +80,17 @@ struct AutoMixFeedbackEntry: Codable, Equatable {
     var executed: PlanRef?
     /// The stem technique the plan asked for, `nil` for a whole-mix hand-over.
     var gesture: String?
+    /// **The intent class this seam was planned under** (P3, predev §2.4) —
+    /// `standDown` / `restrained` / `blend` / `dropAlign` / `cutCulture`. Nil
+    /// on every line written before the intent layer existed and on every line
+    /// written with it off, which is the same thing said twice.
+    ///
+    /// Added rather than folded into `gesture` because the whole point is to
+    /// be able to **bucket bad-rates by class later**: "does the restrained
+    /// rule actually reduce marks on rock" is a join on this column, and a
+    /// column that sometimes holds a stem technique could not answer it. New
+    /// key, optional, so `v` stays 1 and old lines decode unchanged.
+    var intent: String?
     /// splicedSegment / liveOverlap / gapless; nil when the seam has not run
     /// yet (a mark placed on the plan that is currently armed).
     var path: String?

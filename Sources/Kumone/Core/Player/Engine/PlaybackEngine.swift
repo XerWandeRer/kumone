@@ -794,6 +794,10 @@ final class PlaybackEngine: @unchecked Sendable {
                     + "\(Self.journalPlan(resolved.plan)) "
                     + String(format: "ride=%+.2fdB ", resolved.rideDB)
                     + "stem=\(resolved.style.stemTechnique?.label ?? "none") "
+                    // Only when the intent layer ran at all: an `intent=off`
+                    // on every line of a shipped journal would be noise, and
+                    // its absence already says the layer is dark.
+                    + (resolved.style.intent.map { "\($0.label) " } ?? "")
                     + "\(self.journalRates)")
             self.startTransitionTimerLocked(interval: self.slowTickInterval)
         }

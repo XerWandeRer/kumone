@@ -1284,9 +1284,29 @@ final class PlayerService: ObservableObject {
         // actor it would have to be awaited, which would turn arming into an
         // async step for no measurable gain. Missing file → empty → the
         // pre-structure decision, unchanged.
+        // …and the two queue facts the intent layer's first rule turns on: are
+        // these two tracks the same record, and are they in that record's
+        // order. Both are read off the **listed** queue — `queue`, the order
+        // the user sees — and never off the shuffled or AutoMix-reordered one,
+        // because "an album in sequence" is a claim about the listing, not
+        // about which two tracks a reorder happened to put together.
+        //
+        // Album id 0 is the empty `AlbumRef` a search result carries, so it
+        // never counts as "the same album": two unknowns are not a record.
+        // With `intentEnabled` off — every shipped build — nothing reads
+        // either field.
+        let outgoingAlbum = currentTrack?.album.id ?? 0
+        let incomingAlbum = next.track.album.id
+        let listedAdjacent = currentTrack.flatMap { current in
+            queue.firstIndex(where: { $0.id == current.id }).map { index in
+                index + 1 < queue.count && queue[index + 1].id == next.track.id
+            }
+        } ?? false
         let context = TransitionPlanner.PlanContext(
             outgoingLyricLineEnds: currentLocalURL
-                .map { Audition.Lyrics.lineEnds(for: $0) } ?? [])
+                .map { Audition.Lyrics.lineEnds(for: $0) } ?? [],
+            sameAlbum: outgoingAlbum != 0 && outgoingAlbum == incomingAlbum,
+            listedAdjacent: listedAdjacent)
         let config = plannerConfig
         guard AutoMixDebugModel.shared.overrides.forceBeatMatch else {
             AutoMixDebugModel.shared.setForceNote(nil)
@@ -2141,6 +2161,7 @@ final class PlayerService: ObservableObject {
                       overlap: $0.executedOverlap)
             },
             gesture: seam?.gesture ?? armedPlan?.style.stemTechnique?.label,
+            intent: seam?.planned?.intentClass ?? armed?.intentClass,
             path: seam?.path,
             overrides: seam?.overrides ?? AutoMixDebugModel.shared.overrides.badges,
             config: seam.map { $0.configFingerprint.isEmpty

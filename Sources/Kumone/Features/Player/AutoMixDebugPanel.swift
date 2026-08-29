@@ -255,6 +255,12 @@ struct AutoMixDebugPanel: View {
                 // no structure to aim at — the degradation is the interesting
                 // half of the A/B.
                 if let aim = plan.aim { DebugRow("aim", aim) }
+                // **What the pair was for** (P3): the class and every reason
+                // that chose it, in the planner's own sentences. Present only
+                // with `intentEnabled` on, which is never on a shipped build —
+                // and when it is on, this row is the acceptance gate: the
+                // listener checks the class before checking the sound.
+                if let intent = plan.intent { DebugRow("intent", intent) }
                 DebugRow("ride", String(format: "%+.2f dB", plan.rideDB))
                 DebugRow("out section", plan.outSection ?? "no structure")
                 DebugRow("in source", plan.inPointSource ?? "—")
@@ -416,6 +422,10 @@ struct AutoMixDebugPanel: View {
                                 + ($0.score.map { " · score=\($0)" } ?? "")
                                 + ($0.aim.map { " · \($0)" } ?? "")
                         } ?? "—")
+                        // The intent gets its own row rather than being folded
+                        // into `planned`: it is a paragraph, not a chip, and it
+                        // is the thing a mark on this seam is mostly about.
+                        if let intent = seam.planned?.intent { DebugRow("intent", intent) }
                         DebugRow("fallback", seam.fallback ?? "none — ran as planned")
                         DebugRow("pre-render", seam.prerender)
                         if !seam.overrides.isEmpty {
