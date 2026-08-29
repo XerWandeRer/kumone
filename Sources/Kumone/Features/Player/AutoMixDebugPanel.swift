@@ -31,6 +31,7 @@ struct AutoMixDebugPanel: View {
 
     @ObservedObject private var model = AutoMixDebugModel.shared
     @State private var alwaysOnTop = false
+    @State private var showAllCandidates = false
     /// The note that will ride along with the next mark. Cleared on write, so
     /// a note is never silently attached to two different seams.
     @State private var markNote = ""
@@ -160,8 +161,22 @@ struct AutoMixDebugPanel: View {
                     DebugRow("candidates", "none scored yet")
                 } else {
                     candidateHeader
-                    ForEach(order.candidates) { candidate in
+                    // Best-first, so the chosen candidate is always in the
+                    // visible five; the rest is detail on demand.
+                    ForEach(showAllCandidates
+                            ? order.candidates
+                            : Array(order.candidates.prefix(5))) { candidate in
                         candidateRow(candidate)
+                    }
+                    if order.candidates.count > 5 {
+                        Button(showAllCandidates
+                               ? "show top 5"
+                               : "show all (\(order.candidates.count))") {
+                            showAllCandidates.toggle()
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                     }
                     Text(verbatim: "tempo / key / style / energy are 0–1 and only sort "
                          + "inside a tier; aging is unbounded, which is what keeps a "
