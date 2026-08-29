@@ -455,6 +455,145 @@ import Foundation
         #expect(selector.rounds == 1)
     }
 
+    // MARK: - Per-pick download budget
+
+    @MainActor
+    @Test func aPickThatHasSpentItsBudgetStopsBuyingAndSaysSo() {
+        let selector = QueueOrderSelector()
+        selector.config.maxDownloadsPerPick = 3
+        let remaining = (1...40).map { track($0) }
+        selector.markScannedForTesting(remaining)
+
+        // Under budget: the ladder runs as usual.
+        #expect(selector.acquire(remaining: remaining, mayDownload: false) == .deferred)
+        selector.markDownloadsForTesting(2)
+        #expect(selector.acquire(remaining: remaining, mayDownload: false) == .deferred)
+
+        // At the cap: `.spent`, which is the caller's cue to commit the best it
+        // has. Distinct from `.exhausted` on purpose — the queue still has 39
+        // unresolved tracks, they are simply not this pick's to buy.
+        selector.markDownloadsForTesting(3)
+        #expect(selector.acquire(remaining: remaining, mayDownload: true) == .spent)
+        // And no further round is opened: admitting tracks it cannot buy would
+        // only make the frontier lie.
+        let roundsAtCap = selector.rounds
+        #expect(selector.acquire(remaining: remaining, mayDownload: true) == .spent)
+        #expect(selector.rounds == roundsAtCap)
+    }
+
+    @MainActor
+    @Test func theBudgetBitesMidRoundNotAtARoundBoundary() {
+        let selector = QueueOrderSelector()
+        selector.config.maxDownloadsPerPick = 3
+        let remaining = (1...40).map { track($0) }
+        selector.markScannedForTesting(remaining)
+        // Round 1 (one track) and round 2 (four) are open: five admitted, so
+        // the cap of three falls in the middle of the second round.
+        selector.escalateForTesting(remaining: remaining)
+        selector.escalateForTesting(remaining: remaining)
+        #expect(selector.frontier(remaining: remaining).count == 5)
+
+        selector.markDownloadsForTesting(3)
+        #expect(selector.acquire(remaining: remaining, mayDownload: true) == .spent)
+        // Two of the round's tracks stay unbought — and they stay *unresolved*,
+        // which is what lets the next pick escalate into them from a pool this
+        // one made richer. The warming is spread, not lost.
+        #expect(selector.frontier(remaining: remaining)
+                    .filter { !selector.hasAnalysis(for: $0) }.count == 5)
+        selector.beginPick()
+        #expect(selector.downloadsThisPick == 0)
+        #expect(selector.acquire(remaining: remaining, mayDownload: false) == .deferred)
+        #expect(selector.rounds == 1)
+    }
+
+    @Test func theBudgetIsSweepableAndCannotBeSetToZero() {
+        #expect(QueueOrderConfig.standard.maxDownloadsPerPick == 24)
+        let moved = QueueOrderConfig.standard(overriding: ["maxDownloadsPerPick": 60])
+        #expect(moved.maxDownloadsPerPick == 60)
+        // A budget of zero would be a mode that can never buy anything; the
+        // field's own floor rules it out.
+        #expect(QueueOrderConfig.standard(
+            overriding: ["maxDownloadsPerPick": 0]).maxDownloadsPerPick == 1)
+    }
+
+    // MARK: - Lookahead chain
+
+    @MainActor
+    @Test func theChainIsPureAndNeverAgesAnything() {
+        let selector = QueueOrderSelector()
+        let head = track(1)
+        let remaining = (2...6).map { track($0) }
+        for t in [head] + remaining {
+            selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: t.id)
+        }
+        // Give the real counters a shape worth protecting.
+        selector.noteRound(chosen: track(2), pool: remaining)
+        let before = remaining.map { selector.lostRoundsForTesting($0.id) }
+        let pickBefore = selector.lastPick
+
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(!selector.lookahead.isEmpty)
+
+        // The chain ages its own private copy of the counters, so a preview
+        // cannot change the future it is previewing.
+        #expect(remaining.map { selector.lostRoundsForTesting($0.id) } == before)
+        #expect(selector.lastPick == pickBefore)
+        // Idempotent: running it twice gives the same answer, which it would
+        // not if it were leaving a mark.
+        let first = selector.lookahead
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead == first)
+    }
+
+    @MainActor
+    @Test func theChainVisitsEachTrackOnceAndStopsAtTheConfiguredDepth() {
+        let selector = QueueOrderSelector()
+        selector.config.lookaheadDepth = 3
+        let head = track(1)
+        let remaining = (2...9).map { track($0) }
+        for t in [head] + remaining {
+            selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: t.id)
+        }
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead.count == 3)
+        // The chain's own aging is what keeps it from proposing one track over
+        // and over: each step drops its winner from the pool.
+        let ids = selector.lookahead.map(\.track.id)
+        #expect(Set(ids).count == ids.count)
+        #expect(!ids.contains(head.id))
+
+        // Depth 0 turns it off outright.
+        selector.config.lookaheadDepth = 0
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead.isEmpty)
+    }
+
+    @MainActor
+    @Test func theChainOnlyEverPlansWithAnalysesItAlreadyHas() {
+        let selector = QueueOrderSelector()
+        let head = track(1)
+        let remaining = (2...9).map { track($0) }
+        // Nothing analyzed: no chain at all, rather than a chain of guesses.
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead.isEmpty)
+
+        // The pool grows by two, and the chain grows with it — this is the
+        // "recompute when the pool grows" contract, stated as an assertion
+        // about the answer rather than about the plumbing.
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 1)
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 4)
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead.map(\.track.id) == [4])
+
+        selector.injectAnalysisForTesting(makeAnalysis(), forTrackID: 7)
+        selector.recomputeLookahead(head: head, remaining: remaining)
+        #expect(selector.lookahead.map(\.track.id) == [4, 7])
+
+        // A queue edit is the same story: re-derived from what it is handed.
+        selector.recomputeLookahead(head: head, remaining: remaining.filter { $0.id != 4 })
+        #expect(selector.lookahead.map(\.track.id) == [7])
+    }
+
     @MainActor
     @Test func aQueueEditIsHandledByReDerivingNotByFixingUpIndices() {
         let selector = QueueOrderSelector()

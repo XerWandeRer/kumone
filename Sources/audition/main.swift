@@ -1233,10 +1233,10 @@ func orderShare(_ part: Int, _ whole: Int) -> Double {
 func escalationCostLine(_ e: Audition.OrderEscalation) -> String {
     guard e.picks > 0 else { return "escalation: no picks" }
     return String(
-        format: "%.2f downloads/pick (max %d, %d total over %d picks) · "
-            + "≤%d rounds · satisfied %d/%d (%.0f %%) at %@",
-        e.averageDownloads, e.maxDownloads, e.totalDownloads, e.picks, e.maxRounds,
-        e.satisfied, e.picks, orderShare(e.satisfied, e.picks), e.satisfyingTier)
+        format: "%.2f downloads/pick (max %d of %d allowed, %d total over %d picks) · "
+            + "≤%d rounds · satisfied %d/%d (%.0f %%) at %@ · budget-stopped %d",
+        e.averageDownloads, e.maxDownloads, e.budget, e.totalDownloads, e.picks, e.maxRounds,
+        e.satisfied, e.picks, orderShare(e.satisfied, e.picks), e.satisfyingTier, e.budgeted)
 }
 
 func runOrder(_ args: Arguments) {
@@ -1428,16 +1428,21 @@ func runOrder(_ args: Arguments) {
         let worst = escalations.map(\.maxDownloads).max() ?? 0
         let rounds = escalations.map(\.maxRounds).max() ?? 0
         let satisfied = escalations.reduce(0) { $0 + $1.satisfied }
+        let budgeted = escalations.reduce(0) { $0 + $1.budgeted }
         summary.append(String(
             format: "**Escalation cost** — %.2f low-bitrate downloads per pick on average "
-                + "(worst pick %d, %d in total over %d picks, at most %d rounds). "
-                + "%d/%d picks (%.0f %%) ended because a candidate reached **%@**; the rest ran "
-                + "the remaining queue out. Downloads leave analysis sidecars behind, so the "
-                + "cost is one-time per playlist and every later pick starts from a richer pool "
-                + "— the per-pick figure is an average over a run that begins cold.",
-            picks == 0 ? 0 : Double(downloads) / Double(picks), worst, downloads, picks, rounds,
+                + "(worst pick %d against a budget of %d, %d in total over %d picks, at most "
+                + "%d rounds). %d/%d picks (%.0f %%) ended because a candidate reached **%@**; "
+                + "%d stopped on the budget and the rest ran the remaining queue out. "
+                + "A budget stop is not a loss: the tracks that pick could not reach are still "
+                + "unbought at the next one, which starts from a pool it just enriched — the "
+                + "warming is amortised across songs rather than front-loaded onto the first. "
+                + "Downloads leave analysis sidecars behind, so the cost is one-time per "
+                + "playlist and the per-pick figure is an average over a run that begins cold.",
+            picks == 0 ? 0 : Double(downloads) / Double(picks), worst,
+            escalations[0].budget, downloads, picks, rounds,
             satisfied, picks, orderShare(satisfied, picks),
-            escalations[0].satisfyingTier))
+            escalations[0].satisfyingTier, budgeted))
         summary.append("")
     }
     summary += agreementLines

@@ -148,8 +148,11 @@ struct AutoMixDebugPanel: View {
                 DebugRow("state", order.state)
                 DebugRow("pool", "\(order.analyzed)/\(order.poolSize) analyzed")
                 DebugRow("escalation",
-                         "round \(order.rounds) · \(order.downloads) download"
-                         + (order.downloads == 1 ? "" : "s"))
+                         "round \(order.rounds) · \(order.downloads)/"
+                         + "\(order.downloadBudget) downloads")
+                DebugRow("lookahead", order.lookahead.isEmpty
+                         ? "—"
+                         : "provisional · " + order.lookahead.joined(separator: "  →  "))
                 DebugRow("deadline", order.deadline.map {
                     AutoMixDebugFormat.clock($0) + String(format: " (%.0fs)", $0)
                 } ?? "—")

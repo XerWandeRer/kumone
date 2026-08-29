@@ -176,6 +176,11 @@ final class QueueOrderSelector {
         /// Nothing left to admit — the remaining queue is spent. The caller
         /// should pick the best it has rather than keep waiting.
         case exhausted
+        /// This pick has spent its download budget. Same instruction to the
+        /// caller as `exhausted` — settle for the best in hand — but a very
+        /// different fact: the queue still has material, and the *next* pick
+        /// will escalate into it from a pool this one made richer.
+        case spent
     }
 
     /// Move the escalation one step (predev §2.2).
@@ -213,6 +218,16 @@ final class QueueOrderSelector {
             return .acquiring
         }
         guard !fetching else { return .acquiring }
+        // The budget is checked before the ladder, not inside it, so a spent
+        // pick opens no further round either: admitting tracks it cannot buy
+        // would only make the frontier lie.
+        guard downloadsThisPick < max(1, config.maxDownloadsPerPick) else {
+            PlaybackJournal.note(
+                "order budget spent downloads=\(downloadsThisPick) "
+                + "cap=\(config.maxDownloadsPerPick) rounds=\(rounds) "
+                + "analyzed=\(analyses.count)")
+            return .spent
+        }
 
         // Walk down the ladder: serve the admitted frontier first, and only
         // once every admitted track has resolved does the next — four times
@@ -290,6 +305,25 @@ final class QueueOrderSelector {
         plannerConfig: TransitionPlanner.Config = .standard,
         outgoingLyricLineEnds: [TimeInterval] = []
     ) -> Track? {
+        lastPick = rank(
+            outgoing: outgoing, outgoingAnalysis: outgoingAnalysis, pool: pool,
+            lostRounds: lostRounds, plannerConfig: plannerConfig,
+            outgoingLyricLineEnds: outgoingLyricLineEnds)
+        return lastPick.first?.track
+    }
+
+    /// Score a pool against one outgoing track, best first.
+    ///
+    /// **The aging counters are a parameter, not a field read.** That is what
+    /// lets the lookahead chain below replay this function against a private
+    /// copy of them: a preview that aged the real counters would be a preview
+    /// that changed the future it was previewing.
+    private func rank(
+        outgoing: Track?, outgoingAnalysis: TrackAnalysis?,
+        pool: [Track], lostRounds: [Int: Int],
+        plannerConfig: TransitionPlanner.Config,
+        outgoingLyricLineEnds: [TimeInterval]
+    ) -> [Candidate] {
         var scored: [Candidate] = []
         for track in pool {
             guard let incoming = analyses[track.id] else { continue }
@@ -305,19 +339,80 @@ final class QueueOrderSelector {
                 sharesArtist: Self.sharesArtist(outgoing, track),
                 config: config, plannerConfig: plannerConfig)))
         }
-        // Ties break on pool order — which is list order for the windowed half
-        // — so a pool the scorer cannot tell apart reproduces the user's list
-        // rather than an arbitrary permutation. `sorted` is not stable, hence
-        // the explicit index tiebreak.
-        lastPick = scored.enumerated()
+        // Ties break on pool order — which is list order — so a pool the scorer
+        // cannot tell apart reproduces the user's list rather than an arbitrary
+        // permutation. `sorted` is not stable, hence the explicit index
+        // tiebreak.
+        return scored.enumerated()
             .sorted {
                 $0.element.score.total == $1.element.score.total
                     ? $0.offset < $1.offset
                     : $0.element.score.total > $1.element.score.total
             }
             .map(\.element)
-        return lastPick.first?.track
     }
+
+    // MARK: - Lookahead chain (predev §2.1 / §2.2)
+
+    /// One provisional step of the chain.
+    struct ChainStep: Equatable {
+        let track: Track
+        let score: QueueOrderScore
+    }
+
+    /// The plan past the decided next: what the *analyzed pool alone* would
+    /// choose at each of the following `config.lookaheadDepth` seams.
+    ///
+    /// **Provisional, and labelled so everywhere it is shown.** Nothing here is
+    /// committed: each real pick is made fresh at its own decision point, from
+    /// a pool that will have grown and against a deadline this chain knows
+    /// nothing about. The chain exists so the upcoming list and the debug panel
+    /// can show a plausible run rather than a decided next followed by raw list
+    /// order — and so a listener can see the shape of what the mode is heading
+    /// towards.
+    private(set) var lookahead: [ChainStep] = []
+
+    /// Recompute the chain from `head` (the decided next) over `remaining`
+    /// (everything after it).
+    ///
+    /// Chained greedy over the analyzed pool only — no download is ever started
+    /// for a chain step, so this is some tens of `TransitionPlanner.plan` calls
+    /// and costs microseconds. Cheap enough to simply redo whenever the pool
+    /// grows or the queue is edited, which is why there is no invalidation
+    /// bookkeeping anywhere.
+    ///
+    /// Aging and the same-artist penalty are honoured, against a **copy** of
+    /// the counters — see `rank`. Lyric line ends are not: a chain step's
+    /// candidate has no local file yet, and a vocal-exchange hand-over is a
+    /// detail of a seam this chain is not promising to make.
+    func recomputeLookahead(
+        head: Track, remaining: [Track],
+        plannerConfig: TransitionPlanner.Config = .standard
+    ) {
+        var chain: [ChainStep] = []
+        var aging = lostRounds
+        var outgoing = head
+        var pool = remaining.filter { analyses[$0.id] != nil && $0.id != head.id }
+        let depth = max(0, config.lookaheadDepth)
+        while chain.count < depth, !pool.isEmpty {
+            let ranked = rank(
+                outgoing: outgoing, outgoingAnalysis: analyses[outgoing.id], pool: pool,
+                lostRounds: aging, plannerConfig: plannerConfig, outgoingLyricLineEnds: [])
+            guard let best = ranked.first else { break }
+            chain.append(ChainStep(track: best.track, score: best.score))
+            // The preview ages its own copy, exactly as a real round would, so
+            // a chain of eight does not hand the same track to every seam.
+            for candidate in ranked where candidate.track.id != best.track.id {
+                aging[candidate.track.id, default: 0] += 1
+            }
+            aging[best.track.id] = nil
+            pool.removeAll { $0.id == best.track.id }
+            outgoing = best.track
+        }
+        lookahead = chain
+    }
+
+    func clearLookahead() { lookahead = [] }
 
     /// Commit a pick: everyone else in the pool ages by one round.
     ///
@@ -339,6 +434,7 @@ final class QueueOrderSelector {
         lostRounds.removeAll()
         refused.removeAll()
         lastPick = []
+        lookahead = []
         beginPick()
     }
 
@@ -372,6 +468,11 @@ final class QueueOrderSelector {
     func markScannedForTesting(_ tracks: [Track]) {
         scanned.formUnion(tracks.map(\.id))
     }
+
+    /// Pretend this pick has already spent `n` downloads. The budget is a
+    /// count, and what it does at its limit is worth asserting on without
+    /// opening `n` real transfers.
+    func markDownloadsForTesting(_ n: Int) { downloadsThisPick = n }
 
     // MARK: - Fetching
 

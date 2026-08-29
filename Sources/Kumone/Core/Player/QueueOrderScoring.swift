@@ -142,6 +142,29 @@ struct QueueOrderConfig: Sendable, Equatable {
     /// already fine — costs exactly one download.
     var escalationFactor: Int = 4
 
+    /// The most downloads **one pick** may spend before it settles for the best
+    /// it has.
+    ///
+    /// Exponential growth against a long queue is unbounded in practice, not
+    /// just in theory: on a 220-track queue a 10-minute opening song ran five
+    /// rounds and bought 177 tracks before the deadline cut it off — nearly the
+    /// whole playlist, paid for by one seam. The escalation was doing what it
+    /// was told; what it was told had no ceiling.
+    ///
+    /// The cap is not a loss, because nothing bought is thrown away: the tail
+    /// it does not reach this pick is still unresolved at the next one, which
+    /// escalates into it from a pool that just got 24 tracks richer. The
+    /// warming is *amortised across songs* instead of front-loaded onto the
+    /// first one — same total, spread out, and the listener is not waiting on
+    /// it.
+    var maxDownloadsPerPick: Int = 24
+
+    /// How many picks past the decided next the provisional chain looks
+    /// (predev §2.1 / §2.2). Pure arithmetic over the analyzed pool — no
+    /// download, no commitment — so it costs microseconds and can be redone
+    /// whenever the pool grows. 0 turns the chain off.
+    var lookaheadDepth: Int = 8
+
     static let standard = QueueOrderConfig()
 }
 
@@ -391,6 +414,16 @@ extension QueueOrderConfig {
               min: 1, max: 8, step: 1, digits: 0,
               read: { Double($0.escalationFactor) },
               write: { $0.escalationFactor = Swift.max(1, Int($1.rounded())) }),
+        Field(name: "maxDownloadsPerPick",
+              blurb: "单次选曲最多买几首。买满就用手上最好的定下,余下的留给后面几首慢慢暖。",
+              min: 1, max: 256, step: 1, digits: 0,
+              read: { Double($0.maxDownloadsPerPick) },
+              write: { $0.maxDownloadsPerPick = Swift.max(1, Int($1.rounded())) }),
+        Field(name: "lookaheadDepth",
+              blurb: "定下下一首后,再往前预演几步(纯计算,不下载、不承诺)。0 = 关掉。",
+              min: 0, max: 32, step: 1, digits: 0,
+              read: { Double($0.lookaheadDepth) },
+              write: { $0.lookaheadDepth = Swift.max(0, Int($1.rounded())) }),
     ]
 
     var asDictionary: [String: Double] {

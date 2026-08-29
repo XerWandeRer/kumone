@@ -239,9 +239,12 @@ extension Audition {
         /// Rounds it opened at each pick.
         public let roundsPerPick: [Int]
         /// Picks that ended because a candidate reached the satisfying tier,
-        /// rather than because the queue ran out.
+        /// rather than because the queue ran out or the budget did.
         public let satisfied: Int
+        /// Picks that stopped on the per-pick download budget.
+        public let budgeted: Int
         public let satisfyingTier: String
+        public let budget: Int
 
         public var picks: Int { downloadsPerPick.count }
         public var totalDownloads: Int { downloadsPerPick.reduce(0, +) }
@@ -265,10 +268,10 @@ extension Audition {
     /// Visibility persists across picks, because sidecars do: the warming is a
     /// by-product, and it is why the per-pick cost falls as the schedule runs.
     ///
-    /// The one thing not modelled is the decision deadline, which is a clock
-    /// and has no offline meaning; the escalation here is bounded only by the
-    /// remaining queue, so these numbers are the **worst case** the deadline
-    /// would truncate, never an understatement.
+    /// The per-pick download budget **is** modelled: it is a count, not a
+    /// clock, and it is the bound that actually matters in the field. The
+    /// decision deadline is not, for the opposite reason — so these numbers are
+    /// the worst case the deadline would truncate, never an understatement.
     public static func orderEscalating(
         files: [URL],
         config: [String: Double] = [:],
@@ -279,12 +282,13 @@ extension Audition {
     ) throws -> OrderEscalation {
         let plannerConfig = TransitionPlanner.Config.standard(overriding: config)
         let queueConfig = QueueOrderConfig.standard(overriding: orderConfig)
+        let budget = max(1, queueConfig.maxDownloadsPerPick)
         guard files.count >= 2 else {
             return OrderEscalation(
                 schedule: OrderSchedule(label: label, names: files.map(displayName),
                                         tiers: [], steps: []),
-                downloadsPerPick: [], roundsPerPick: [], satisfied: 0,
-                satisfyingTier: queueConfig.satisfyingTier.label)
+                downloadsPerPick: [], roundsPerPick: [], satisfied: 0, budgeted: 0,
+                satisfyingTier: queueConfig.satisfyingTier.label, budget: budget)
         }
         var analyses: [String: TrackAnalysis] = [:]
         for file in files { analyses[file.path] = try analysis(of: file) }
@@ -298,6 +302,7 @@ extension Audition {
         var downloadsPerPick: [Int] = []
         var roundsPerPick: [Int] = []
         var satisfied = 0
+        var budgeted = 0
         /// The pool that costs nothing: everything paid for so far. The track
         /// now playing is visible because it is playing.
         var visible: Set<String> = [current.path]
@@ -344,7 +349,7 @@ extension Audition {
             // size worth of not-yet-visible tracks in list order, and the loop
             // re-scores after *every* one — so it stops mid-round, which is
             // where most of the saving is.
-            while !isSatisfied(ranked) {
+            while !isSatisfied(ranked), downloads < budget {
                 roundSize = roundSize == 0
                     ? max(1, queueConfig.escalationFirstRound)
                     : roundSize * max(1, queueConfig.escalationFactor)
@@ -355,10 +360,17 @@ extension Audition {
                     visible.insert(candidate.path)
                     downloads += 1
                     ranked = rank()
-                    if isSatisfied(ranked) { break }
+                    if isSatisfied(ranked) || downloads >= budget { break }
                 }
             }
-            if isSatisfied(ranked) { satisfied += 1 }
+            if isSatisfied(ranked) {
+                satisfied += 1
+            } else if downloads >= budget {
+                // Not a failure: the tracks this pick could not reach are still
+                // unbought at the next one, which starts from a pool this pick
+                // made `budget` tracks richer.
+                budgeted += 1
+            }
             guard let winner = ranked.first else { break }
 
             steps.append(OrderStep(
@@ -395,9 +407,11 @@ extension Audition {
         }
 
         return OrderEscalation(
-            schedule: OrderSchedule(label: label, names: names, tiers: tiers, steps: steps),
+            schedule: OrderSchedule(label: "\(label) ≤\(budget)/pick",
+                                    names: names, tiers: tiers, steps: steps),
             downloadsPerPick: downloadsPerPick, roundsPerPick: roundsPerPick,
-            satisfied: satisfied, satisfyingTier: queueConfig.satisfyingTier.label)
+            satisfied: satisfied, budgeted: budgeted,
+            satisfyingTier: queueConfig.satisfyingTier.label, budget: budget)
     }
 
     // MARK: - Low-bitrate agreement

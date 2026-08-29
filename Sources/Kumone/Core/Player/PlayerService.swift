@@ -611,6 +611,8 @@ final class PlayerService: ObservableObject {
         if let idx = autoMixQueue.firstIndex(where: { $0.id == track.id }), idx != currentIndex {
             autoMixQueue.remove(at: idx)
         }
+        // The chain may have been planning around the track that just left.
+        refreshAutoMixLookahead()
         schedulePrefetch()
     }
 
@@ -1721,6 +1723,10 @@ final class PlayerService: ObservableObject {
             poolSize: remaining.count,
             analyzed: pool.count,
             rounds: selector.rounds, downloads: selector.downloadsThisPick,
+            downloadBudget: selector.config.maxDownloadsPerPick,
+            lookahead: selector.lookahead.map {
+                "\($0.track.name) — \($0.score.tier.label)"
+            },
             deadline: duration > 0 ? autoMixDeadline : nil,
             candidates: candidates))
     }
@@ -1993,7 +1999,12 @@ final class PlayerService: ObservableObject {
             return
         }
         let selector = QueueOrderSelector()
-        selector.onCandidateReady = { [weak self] in self?.updateAutoMixPick() }
+        selector.onCandidateReady = { [weak self] in
+            self?.updateAutoMixPick()
+            // The pool just grew, so the provisional chain past the decided
+            // next may well be different now. Redoing it is microseconds.
+            self?.refreshAutoMixLookahead()
+        }
         queueOrderSelector = selector
     }
 
@@ -2042,12 +2053,16 @@ final class PlayerService: ObservableObject {
             return commitAutoMixPick(winner, pool: pool,
                                      reason: atDeadline ? "deadline" : "satisfied")
         }
-        // Nothing satisfies yet: open the next round, unless the queue is
-        // spent — in which case the best analyzed candidate is the answer, and
-        // a nil one honestly leaves the list order alone.
-        if selector.acquire(remaining: remaining,
-                            mayDownload: autoMixMayDownload) == .exhausted {
-            commitAutoMixPick(winner, pool: pool, reason: "exhausted")
+        // Nothing satisfies yet: open the next round, unless the queue is spent
+        // or this pick has spent its budget — in either case the best analyzed
+        // candidate is the answer, and a nil one honestly leaves the list order
+        // alone. The budget stop differs only in what it means: the queue still
+        // has material, and the next pick escalates into it from the pool this
+        // one just enriched.
+        switch selector.acquire(remaining: remaining, mayDownload: autoMixMayDownload) {
+        case .exhausted: commitAutoMixPick(winner, pool: pool, reason: "exhausted")
+        case .spent: commitAutoMixPick(winner, pool: pool, reason: "budget")
+        case .acquiring, .deferred: break
         }
     }
 
@@ -2084,17 +2099,56 @@ final class PlayerService: ObservableObject {
             + "downloads=\(queueOrderSelector?.downloadsThisPick ?? 0)")
         if let winner {
             queueOrderSelector?.noteRound(chosen: winner, pool: pool)
-            spliceAutoMixNext(winner)
+            spliceAutoMixPlan([winner])
         }
+        refreshAutoMixLookahead()
         schedulePrefetch()
     }
 
-    private func spliceAutoMixNext(_ track: Track) {
-        let target = currentIndex + 1
-        guard target < autoMixQueue.count,
-              let from = autoMixQueue.firstIndex(where: { $0.id == track.id }),
-              from > currentIndex, from != target else { return }
-        autoMixQueue.insert(autoMixQueue.remove(at: from), at: target)
+    /// Move `tracks` to sit at `currentIndex + 1, + 2, …` in the working list,
+    /// in the order given, leaving everything else in the order the user gave
+    /// us.
+    ///
+    /// One track is the decided next — firm. The rest is the provisional chain,
+    /// and it is shown rather than promised: the pick at each of those seams is
+    /// still made fresh at its own decision point, and a chain step that turns
+    /// out wrong is simply re-spliced then. Materializing it into the list
+    /// (rather than teaching `upcomingTracks` a second source of truth) is the
+    /// same trick the decided next already uses, so `currentIndex` stays the
+    /// only cursor there is.
+    private func spliceAutoMixPlan(_ tracks: [Track]) {
+        var target = currentIndex + 1
+        for track in tracks {
+            guard target < autoMixQueue.count,
+                  let from = autoMixQueue.firstIndex(where: { $0.id == track.id }),
+                  from > currentIndex else { continue }
+            if from != target {
+                autoMixQueue.insert(autoMixQueue.remove(at: from), at: target)
+            }
+            target += 1
+        }
+    }
+
+    /// Redo the provisional chain and lay it into the working list.
+    ///
+    /// Called on every commit, whenever a candidate analysis lands (the pool
+    /// grew) and when the queue is edited. It is pure arithmetic over the
+    /// analyzed pool — microseconds — so there is no invalidation bookkeeping:
+    /// the answer is simply recomputed rather than repaired.
+    private func refreshAutoMixLookahead() {
+        guard let selector = queueOrderSelector, queueOrder == .autoMix else { return }
+        // The chain hangs off the decided next. While the pick is still
+        // pending there is nothing to hang it off, and showing a chain from a
+        // head that is about to change would be worse than showing none.
+        guard !autoMixPickPending, currentIndex >= 0,
+              currentIndex + 1 < autoMixQueue.count else {
+            return selector.clearLookahead()
+        }
+        let head = autoMixQueue[currentIndex + 1]
+        let rest = Array(autoMixQueue[(currentIndex + 2)...])
+        selector.recomputeLookahead(head: head, remaining: rest,
+                                    plannerConfig: plannerConfig)
+        spliceAutoMixPlan([head] + selector.lookahead.map(\.track))
     }
 
     // MARK: - Persistence

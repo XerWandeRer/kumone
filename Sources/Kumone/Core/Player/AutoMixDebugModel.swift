@@ -160,9 +160,15 @@ struct AutoMixDebugOrder: Equatable {
     var poolSize = 0
     var analyzed = 0
     /// What this pick's escalation has cost so far: rounds opened and
-    /// low-bitrate downloads started (predev §2.2).
+    /// low-bitrate downloads started, against the per-pick budget (predev
+    /// §2.2).
     var rounds = 0
     var downloads = 0
+    var downloadBudget = 0
+    /// The provisional chain past the decided next: "title — tier", in play
+    /// order. **Nothing here is committed** — each of those picks is still made
+    /// fresh at its own decision point.
+    var lookahead: [String] = []
     /// Playback position by which the pick is made regardless.
     var deadline: TimeInterval?
     /// Best first.
