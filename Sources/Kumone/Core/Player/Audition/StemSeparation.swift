@@ -17,6 +17,10 @@ public enum StemSeparation {
     private final class Box: @unchecked Sendable {
         let lock = NSLock()
         var provider: VocalStemProvider?
+        /// The runtime has reported an unrecoverable error; see
+        /// `disarmRuntimeFatalHandler`.
+        var runtimeFailed = false
+        var handlerInstalled = false
     }
     private static let box = Box()
 
@@ -26,12 +30,90 @@ public enum StemSeparation {
         box.lock.lock()
         box.provider = provider
         box.lock.unlock()
+        if provider != nil { disarmRuntimeFatalHandler() }
     }
 
     public static var provider: VocalStemProvider? {
         box.lock.lock()
         defer { box.lock.unlock() }
-        return box.provider
+        // A runtime that has already died once is not asked again: the answer
+        // would be the same and the cost of asking is the whole process.
+        return box.runtimeFailed ? nil : box.provider
+    }
+
+    // MARK: - The separation runtime's fatal error handler
+
+    /// **Take the separator runtime's process-killing error handler off the
+    /// app.**
+    ///
+    /// MLX's C API ships a default error handler that prints the message to
+    /// stdout and calls `exit(-1)`. Anything the inference runtime does not like
+    /// — a Metal pipeline it cannot build, a shape it cannot broadcast, a
+    /// buffer allocation it cannot make under memory pressure — therefore
+    /// *terminates the music player*, from a background thread, with no crash
+    /// report and no chance to fall back to the plain hand-over that was armed
+    /// and ready.
+    ///
+    /// Field case (2026-08-31 00:09:06, exit status 255 — which is `exit(-1)`):
+    /// the app vanished 90 ms after `prerender start` on an `acapellaOver`
+    /// seam, mid-song, with atexit handlers running cleanly and nothing else in
+    /// the log. That signature is this handler and nothing else in the process.
+    ///
+    /// Installing our own handler makes the failure survivable rather than
+    /// fixed: the C call that raised the error still returns into a runtime
+    /// whose state we cannot trust, so the *first* error is not recovered from,
+    /// it is merely not fatal to playback. What it buys is that no *further*
+    /// separation is attempted — `provider` goes nil, so the planner stops
+    /// offering stem techniques, the pre-render stops starting, and every seam
+    /// from then on is the live hand-over, which is exactly what the app does
+    /// on a machine with no separator installed at all.
+    ///
+    /// Found by `dlsym` rather than by importing: `Cmlx` is an internal target
+    /// of the mlx-swift package with no library product, so it cannot be linked
+    /// directly, and the symbol is C and statically linked into this binary. A
+    /// runtime that does not export it (no separator built in) leaves this a
+    /// no-op, which is the correct answer there too.
+    public static func disarmRuntimeFatalHandler() {
+        box.lock.lock()
+        let already = box.handlerInstalled
+        box.handlerInstalled = true
+        box.lock.unlock()
+        guard !already else { return }
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), // RTLD_DEFAULT
+                                 "mlx_set_error_handler") else {
+            PlaybackJournal.note("stem runtime handler absent (no mlx in this build)")
+            return
+        }
+        typealias Handler = @convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void
+        typealias Destructor = @convention(c) (UnsafeMutableRawPointer?) -> Void
+        typealias SetHandler = @convention(c) (Handler?, UnsafeMutableRawPointer?, Destructor?) -> Void
+        let setHandler = unsafeBitCast(symbol, to: SetHandler.self)
+        let handler: Handler = { message, _ in
+            // No captures — this is a C function pointer, called from inside
+            // the runtime on whatever thread raised the error.
+            StemSeparation.recordRuntimeFailure(
+                message.map { String(cString: $0) } ?? "unknown")
+        }
+        setHandler(handler, nil, nil)
+        PlaybackJournal.note("stem runtime fatal handler disarmed")
+    }
+
+    /// The separation runtime raised an error. Retire it for the rest of the
+    /// process and say so; playback carries on without stems.
+    fileprivate static func recordRuntimeFailure(_ message: String) {
+        box.lock.lock()
+        let first = !box.runtimeFailed
+        box.runtimeFailed = true
+        box.lock.unlock()
+        guard first else { return }
+        PlaybackJournal.note("stem runtime failed, separation retired: \(message)")
+    }
+
+    /// Has the separation runtime died? Test/diagnostic hook.
+    public static var runtimeHasFailed: Bool {
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        return box.runtimeFailed
     }
 
     /// Whether a hand-over may be planned with `StemAvailability.ready`.

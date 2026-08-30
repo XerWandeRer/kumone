@@ -489,7 +489,7 @@ final class PlaybackEngine: @unchecked Sendable {
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
         ) { [weak self] _ in
             guard let self else { return }
-            self.queue.async { self.handleConfigurationChange() }
+            self.queue.async { self.handleConfigurationChangeNotificationLocked() }
         }
     }
 
@@ -3011,18 +3011,30 @@ final class PlaybackEngine: @unchecked Sendable {
     }
 
     private func applyOutputDeviceLocked(_ deviceID: AudioDeviceID?) {
-        guard let target = deviceID ?? AudioOutputDevices.defaultDeviceID() else { return }
+        guard let target = deviceID ?? AudioOutputDevices.defaultDeviceID() else {
+            PlaybackJournal.note("output device change skipped: no target device")
+            return
+        }
         let unit = engine.outputNode.auAudioUnit
         guard unit.deviceID != target else { return }
+        PlaybackJournal.note("output device change begin from=\(unit.deviceID) to=\(target)")
         engine.stop()
         do {
             try unit.setDeviceID(target)
         } catch {
-            PlaybackJournal.note("output device switch failed id=\(target) \(error)")
+            PlaybackJournal.note("output device change failed id=\(target) \(error)")
             // The old device is still wired; bring playback back on it rather
-            // than leaving a stopped engine behind.
+            // than leaving a stopped engine behind. Never a terminal path:
+            // whatever CoreAudio thinks of the request, the rebuild below puts
+            // the graph and both decks back on *something*.
         }
-        handleConfigurationChange()
+        // Setting the device provokes an AVAudioEngineConfigurationChange of its
+        // own. This rebuild covers it, so the notification that follows is
+        // told to stand down rather than tearing the graph down a second time
+        // a few milliseconds later.
+        ownConfigurationChangeUntil = Date().addingTimeInterval(1)
+        handleConfigurationChange(reason: "device change")
+        PlaybackJournal.note("output device change end id=\(unit.deviceID)")
     }
     #endif
 
@@ -3032,7 +3044,43 @@ final class PlaybackEngine: @unchecked Sendable {
     /// device on macOS, route change on iOS). Player-node schedules are gone;
     /// rebuild the graph and resume every active deck from its cached
     /// position.
-    private func handleConfigurationChange() {
+    /// Set by `applyOutputDeviceLocked` to the moment its own rebuild stops
+    /// covering the notification the switch provokes. Read (and cleared) by the
+    /// notification handler, which is why the window is short: a stale flag must
+    /// never swallow a *genuine* hardware change, and a second of clock is more
+    /// than CoreAudio takes to post the notification it already posted.
+    private var ownConfigurationChangeUntil: Date?
+
+    private func handleConfigurationChange(reason: String) {
+        PlaybackJournal.note("graph rebuild begin reason=\(reason) "
+                             + "paused=\(isPaused) \(journalRates)")
+        rebuildGraphLocked()
+        PlaybackJournal.note("graph rebuild end reason=\(reason) "
+                             + "running=\(engine.isRunning) \(journalRates)")
+    }
+
+    /// Test hook: run the rebuild exactly as the hardware notification does.
+    /// The notification itself cannot be provoked from a test (it is posted by
+    /// CoreAudio for a device that really changed), and the path it runs is the
+    /// one every deck has to survive.
+    func simulateConfigurationChange() {
+        queue.async { self.handleConfigurationChangeNotificationLocked() }
+    }
+
+    /// The notification's entry point: single-flight against the rebuild an
+    /// explicit device switch has just done for it.
+    private func handleConfigurationChangeNotificationLocked() {
+        if let until = ownConfigurationChangeUntil {
+            ownConfigurationChangeUntil = nil
+            if Date() < until {
+                PlaybackJournal.note("graph rebuild skipped reason=own device change")
+                return
+            }
+        }
+        handleConfigurationChange(reason: "hardware")
+    }
+
+    private func rebuildGraphLocked() {
         // An armed gapless hand-over died with the graph; disarm it so the
         // restart below doesn't blast the incoming deck from position zero.
         disarmGaplessLocked()
@@ -3059,7 +3107,15 @@ final class PlaybackEngine: @unchecked Sendable {
         }
         guard anyActive else { return }
         engine.prepare()
-        try? engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // Never terminal. The decks are rescheduled below regardless, so a
+            // later resume/seek — or the next configuration change, which a
+            // device that comes back posts — starts them; a thrown start here
+            // means the hardware is not ready, not that playback is over.
+            PlaybackJournal.note("graph rebuild engine start failed \(error)")
+        }
 
         for (deck, state) in deckStates {
             switch state.source {

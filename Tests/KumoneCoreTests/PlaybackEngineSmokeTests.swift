@@ -1490,6 +1490,61 @@ struct PlaybackEngineSmokeTests {
         }
     }
 
+    // (k2) **A hardware configuration change must not end playback — least of
+    // all on a chunk-converted deck.**
+    //
+    // A device disappearing (a monitor sleeping, headphones unplugged, an
+    // AirPlay endpoint walking out of range) stops the engine and wipes every
+    // player node's schedule. The rebuild has to put the graph back and resume
+    // each deck from its cached position, and a `.convertedFile` deck is the
+    // hard one: its feeder is mid-chunk on its own queue, and the chunks it has
+    // already handed to the engine queue belong to a node that no longer
+    // exists. Delivering one of those into the rebuilt graph would schedule
+    // audio from before the change on top of the resume.
+    //
+    // Both source paths are run, because the same rebuild covers both.
+    @Test func aConfigurationChangeResumesEveryDeckInsteadOfEndingIt() throws {
+        guard audioOutputAvailable else { return }
+        for (name, fixture) in [("converted", Fixtures.eightSecondCAF),
+                                ("stereo-file", Fixtures.eightSecondStereoCAF)] {
+            let result = withWatchdog("configChange-\(name)", timeout: 30) {
+                () -> (TimeInterval, TimeInterval, Float, Bool) in
+                let engine = PlaybackEngine()
+                let log = EventLog(engine)
+                defer { engine.stopAll() }
+                guard (try? engine.loadFile(at: fixture, on: .a)) != nil else {
+                    return (-1, -1, -1, false)
+                }
+                engine.outputVolume = 0
+                engine.play(deck: .a, from: 0)
+                let before = pollPosition(engine, deck: .a, past: 1.0, timeout: 5)
+
+                engine.simulateConfigurationChange()
+                Thread.sleep(forTimeInterval: 0.3)
+                // Playback has to *advance* from where it was, not restart and
+                // not stall: the resume is from the cached position.
+                let after = pollPosition(engine, deck: .a, past: before + 0.8, timeout: 5)
+                let volume = engine.effectSnapshot(of: .a).volume
+                // And the track still ends by itself, which is the assertion
+                // that the rebuilt schedule is a whole schedule.
+                let finished = log.wait(timeout: 15) {
+                    if case .deckFinished(.a) = $0 { return true }
+                    return false
+                }
+                return (before, after, volume, finished)
+            }
+            guard let (before, after, volume, finished) = result, before > 0 else { continue }
+            #expect(after > before + 0.8,
+                    "\(name): the deck must resume past \(before)s after the rebuild (got \(after))")
+            #expect(after < before + 6,
+                    "\(name): the deck restarted somewhere else entirely (\(before)s → \(after)s)")
+            #expect(abs(volume - 1) < 0.001,
+                    "\(name): the fader must be handed back after the rebuild (got \(volume))")
+            #expect(finished,
+                    "\(name): the rebuilt schedule must still reach the end of the file")
+        }
+    }
+
     // (l) Whatever ends a transition, the deck that is left carrying the track
     // must be *in service*: chain fully transparent and fader open. A deck is
     // reused as-is — `play(deck:from:)` does not rebuild it — so a band left
