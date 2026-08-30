@@ -197,6 +197,12 @@ struct AutoMixDebugOrder: Equatable {
 /// `PlayerService.updateStemPrerender`.
 enum AutoMixPrerenderState: Equatable {
     case idle
+    /// A hand-over is armed and there is simply nothing to pre-render for it:
+    /// the plan carries neither a stem technique nor a score. Told apart from
+    /// `.idle` (nothing armed at all) because the two answer different
+    /// questions, and because this is the state a refused score leaves behind —
+    /// a seam that will play today's blend, which is not a failure of anything.
+    case notNeeded
     /// Separation + render running for this seam. The renderer is one call, so
     /// "separating" and "rendering" are not told apart here.
     case rendering(String)
@@ -210,6 +216,7 @@ enum AutoMixPrerenderState: Equatable {
     var label: String {
         switch self {
         case .idle: return "idle"
+        case .notNeeded: return "nothing to pre-render"
         case .rendering(let s): return "rendering — \(s)"
         case .armed(let s): return "armed — \(s)"
         case .abandoned(let reason): return "abandoned — \(reason)"
@@ -310,6 +317,15 @@ struct AutoMixDebugSnapshot: Equatable {
     var next = AutoMixDebugNext()
     var plan: AutoMixDebugPlan?
     var order = AutoMixDebugOrder()
+    /// **Why the armed plan carries no score**, in the compiler's own words.
+    ///
+    /// Its own field, and read by its own row in the Plan group, because a
+    /// refusal is a *planning* verdict: the compiler was asked at arming time
+    /// and said no, so the seam plays today's blend and no render was ever
+    /// spawned. Parked in the pre-render's state row — where it used to go — it
+    /// read as "the pre-render failed", which named neither the layer nor the
+    /// outcome. Nil whenever the score compiled, and on every shipped seam.
+    var scoreRefusal: String?
     var prerender = AutoMixPrerenderState.idle
     /// Newest first; the last three seams.
     var seams: [AutoMixDebugSeam] = []
@@ -317,6 +333,21 @@ struct AutoMixDebugSnapshot: Equatable {
     /// when it was asked to. Nil while the override is off, and nil when it
     /// worked — the badge says the rest.
     var forceNote: String?
+}
+
+extension AutoMixDebugSnapshot {
+    /// **What the Plan group's `score` row prints**, in one place because it is
+    /// the one row with three states and no view has any business deciding
+    /// between them.
+    ///
+    /// The refusal wins when there is one: a plan whose score was stripped at
+    /// arming time carries `score == nil`, so without this the row would print
+    /// "none — today's blend" and swallow the reason it is a blend.
+    var scoreRow: String {
+        if let refusal = scoreRefusal { return "refused: \(refusal)" }
+        if let score = plan?.score { return "score=\(score)" }
+        return "none — today's blend"
+    }
 }
 
 @MainActor
@@ -458,6 +489,17 @@ final class AutoMixDebugModel: ObservableObject {
     func setPlan(_ plan: AutoMixDebugPlan?) {
         guard live.plan != plan else { return }
         live.plan = plan
+        publish()
+    }
+
+    /// Test hook: the score verdict as recorded, without opening a window.
+    var currentScoreRefusalForTesting: String? { live.scoreRefusal }
+
+    /// The arm-time score verdict. `nil` is "the score compiled", or "there was
+    /// no score" — both of which the row prints from the plan instead.
+    func setScoreRefusal(_ reason: String?) {
+        guard live.scoreRefusal != reason else { return }
+        live.scoreRefusal = reason
         publish()
     }
 

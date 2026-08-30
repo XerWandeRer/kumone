@@ -1145,6 +1145,57 @@ private func aimable(bpm: Double = 120, duration: TimeInterval = 120,
         #expect(vetted.planned.style.score == nil)
     }
 
+    @Test func aRefusalIsPlanNewsAndTheRenderRowSaysThereIsNothingToRender() {
+        // Fix 1, as the panel model sees it. Three states of one row, and the
+        // refusal is the one that used to be printed somewhere else entirely.
+        var snapshot = AutoMixDebugSnapshot()
+        snapshot.plan = AutoMixDebugPlan()
+        #expect(snapshot.scoreRow == "none — today's blend")
+
+        snapshot.plan?.score = "cutOnOne+echoThrow"
+        #expect(snapshot.scoreRow == "score=cutOnOne+echoThrow")
+
+        // Arming strips the score off the plan and hands back the reason, so
+        // the row is asked to print a refusal *and* a nil score at once. It
+        // must name the refusal — that is the whole content of the seam.
+        snapshot.plan?.score = nil
+        snapshot.scoreRefusal = "入曲在交接点附近的小节长度抖动 10.0%"
+        #expect(snapshot.scoreRow.hasPrefix("refused: "))
+        #expect(snapshot.scoreRow.contains("抖动"))
+
+        // And the pre-render row, which used to carry all of that, is back to
+        // its own subject: a plan with neither stems nor a score has nothing to
+        // render, which is a state and not a failure.
+        #expect(AutoMixPrerenderState.notNeeded.label == "nothing to pre-render")
+        #expect(AutoMixPrerenderState.notNeeded != .idle)
+        for failed in [AutoMixPrerenderState.refused("x"), .abandoned("x")] {
+            #expect(failed != .notNeeded)
+        }
+    }
+
+    @Test func theSameRefusalOnTheSameSeamIsOneJournalLine() {
+        // Fix 3. The key is the seam, so the ~2.9 arms per seam — and the extra
+        // disarm/re-arm pair a seek adds — write one line between them.
+        let reason = "入曲在交接点附近的小节长度抖动 10.0%"
+        func key(outgoing: Int? = 1, incoming: Int? = 2, outPoint: TimeInterval?,
+                 reason: String = reason) -> PlayerService.ScoreRefusalKey {
+            PlayerService.scoreRefusalKey(outgoing: outgoing, incoming: incoming,
+                                          outPoint: outPoint, reason: reason)
+        }
+        #expect(key(outPoint: 184.2) == key(outPoint: 184.2))
+        // A re-plan that nudges the out point by a frame is the same hand-over
+        // being re-derived; the journal must not report it as a second problem.
+        #expect(key(outPoint: 184.2) == key(outPoint: 183.9))
+
+        // What *does* earn a fresh line: a different pair, a seam that really
+        // moved, and a different verdict.
+        #expect(key(outPoint: 184.2) != key(incoming: 3, outPoint: 184.2))
+        #expect(key(outPoint: 184.2) != key(outgoing: nil, outPoint: 184.2))
+        #expect(key(outPoint: 184.2) != key(outPoint: 171))
+        #expect(key(outPoint: 184.2) != key(outPoint: 184.2, reason: "别的理由"))
+        #expect(key(outPoint: nil) != key(outPoint: 184.2))
+    }
+
     @Test func everySegmentRefusalCarriesASentenceForThePanel() {
         // The panel prints `error.localizedDescription` now, so every case has
         // to have one — the point of the change is that "render produced

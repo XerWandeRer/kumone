@@ -741,10 +741,10 @@ final class PlayerService: ObservableObject {
         pendingTransitionTrack = nil
         armedPlan = nil
         AutoMixDebugModel.shared.setPlan(nil)
+        AutoMixDebugModel.shared.setScoreRefusal(nil)
         // Whatever the pre-render was aiming at is void: a re-arm re-derives
         // the plan, and `updateStemPrerender` starts again from there.
         cancelStemPrerender()
-        armedScoreRefusal = nil
         // The stability clock too, and for a reason worth naming: a seek moves
         // the playhead this clock is read on, so a `since` taken before it is
         // not a duration afterwards. A re-arm restarts it honestly.
@@ -1192,31 +1192,54 @@ final class PlayerService: ObservableObject {
     /// of what the armed plan promises, so a re-arm that reaches the same plan
     /// *and* the same verdict reuses the render, exactly as the settle window
     /// wants it to.
+    ///
+    /// **Where the verdict goes** is two separate decisions, and conflating them
+    /// was the field report's complaint. The *panel* gets it unconditionally and
+    /// in its own row (`AutoMixDebugSnapshot.scoreRefusal`, printed in the Plan
+    /// group next to the score it explains) — a refusal is a planning verdict,
+    /// and putting it in the pre-render's state row made a correct arm-time
+    /// decision read as a render that had failed. The *journal* gets it once per
+    /// seam, not once per arm: see `journalledScoreRefusal`.
     private func vettingScore(_ planned: PlannedTransition,
                               next: PrefetchedNext) -> PlannedTransition {
         let vetted = Self.vettingScore(planned, outgoing: currentAnalysis,
                                        incoming: next.analysis,
                                        outgoingURL: currentLocalURL)
-        guard let refusal = vetted.refusal else {
-            armedScoreRefusal = nil
-            return vetted.planned
-        }
-        let line = "score refused: \(refusal)"
-        // Once per seam, not once per arm: the field journal's churn is ~2.9
-        // arms per seam, and three identical refusals read as three problems.
-        if armedScoreRefusal != line {
-            armedScoreRefusal = line
-            PlaybackJournal.note(line)
-        }
-        // The panel row only if the refusal is the whole story. A style that
-        // still carries a stem technique has a segment to render either way,
-        // and overwriting its `rendering`/`armed` state with a note about a
-        // gesture that was never going to run would be the same swallowing in
-        // the other direction.
-        if vetted.planned.style.stemTechnique == nil {
-            AutoMixDebugModel.shared.setPrerender(.refused(line))
+        AutoMixDebugModel.shared.setScoreRefusal(vetted.refusal)
+        guard let refusal = vetted.refusal else { return vetted.planned }
+        let key = Self.scoreRefusalKey(
+            outgoing: currentTrack?.id, incoming: next.track.id,
+            outPoint: vetted.planned.plan.outPoint, reason: refusal)
+        // Once per seam, not once per arm. The field journal's churn is ~2.9
+        // arms per seam and a seek adds a whole disarm/re-arm pair on top, so
+        // three identical refusals read as three problems — which is why the
+        // identity here is the *seam* (the pair of tracks and the hand-over
+        // point) rather than "since the last arm". A re-plan that genuinely
+        // moves the seam gets its own line, because that is a different seam.
+        if journalledScoreRefusal != key {
+            journalledScoreRefusal = key
+            PlaybackJournal.note("score refused: \(refusal)")
         }
         return vetted.planned
+    }
+
+    /// **Which seam a score refusal has already been journalled for.**
+    ///
+    /// The out point is quantised to whole seconds: a re-plan that nudges it by
+    /// a frame is the same hand-over being re-derived, not a new one, and the
+    /// journal should not say otherwise.
+    struct ScoreRefusalKey: Equatable {
+        var outgoing: Int?
+        var incoming: Int?
+        var outPoint: Int?
+        var reason: String
+    }
+
+    static func scoreRefusalKey(outgoing: Int?, incoming: Int?,
+                                outPoint: TimeInterval?,
+                                reason: String) -> ScoreRefusalKey {
+        ScoreRefusalKey(outgoing: outgoing, incoming: incoming,
+                        outPoint: outPoint.map { Int($0.rounded()) }, reason: reason)
     }
 
     /// The decision itself, without the reporting: the plan that will be armed,
@@ -1251,9 +1274,13 @@ final class PlayerService: ObservableObject {
         return (planned, nil)
     }
 
-    /// The last score refusal reported for the seam now armed, so a re-arm that
-    /// reaches the same verdict does not report it again. Cleared with the seam.
-    private var armedScoreRefusal: String?
+    /// The seam a `score refused:` line has already been written for.
+    ///
+    /// Deliberately **not** cleared by `disarmTransition`: a seek disarms and
+    /// re-arms the same seam, and clearing here is exactly how the field journal
+    /// came to carry the same refusal three times for one hand-over. It falls
+    /// out of date on its own, because a new seam has a new key.
+    private var journalledScoreRefusal: ScoreRefusalKey?
 
     private func planTransition(for next: PrefetchedNext) -> PlannedTransition {
         #if os(iOS)
@@ -1534,9 +1561,17 @@ final class PlayerService: ObservableObject {
                 .refused("force live path (debug override)"))
             return
         }
-        guard transitionArmed, let planned = armedPlan,
-              planned.style.stemTechnique != nil || planned.style.score != nil,
-              let signature = TransitionSegment.Signature(plan: planned.plan),
+        guard transitionArmed, let planned = armedPlan else { return }
+        // A hand-over with neither a stem technique nor a score has nothing to
+        // pre-render, and the row must say that rather than keep whatever the
+        // last seam left there. This is where a refused score lands — the plan
+        // it leaves behind is a plain blend, and a plain blend is not a failed
+        // render. The reason itself has its own row in the Plan group.
+        guard planned.style.stemTechnique != nil || planned.style.score != nil else {
+            AutoMixDebugModel.shared.setPrerender(.notNeeded)
+            return
+        }
+        guard let signature = TransitionSegment.Signature(plan: planned.plan),
               let outgoingURL = currentLocalURL, let next = prefetchedNext
         else { return }
         // A stem technique needs a separator; four of the five gestures in the

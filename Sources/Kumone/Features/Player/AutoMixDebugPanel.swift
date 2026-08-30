@@ -247,8 +247,12 @@ struct AutoMixDebugPanel: View {
                 // Only ever present with the score toggle on, and only ever
                 // *offered*: the live path blends, so what this row promises is
                 // conditional on the pre-render row below it.
-                DebugRow("score", plan.score.map { "score=\($0)" }
-                         ?? "none — today's blend")
+                //
+                // A score the compiler refused at arming time says so **here**,
+                // with the compiler's sentence. It is a planning verdict about
+                // this seam, not a pre-render failure, and it used to be printed
+                // as the latter.
+                DebugRow("score", model.snapshot.scoreRow)
                 // What that score is *aimed at* (P2): the drop, the chorus or
                 // the start of the song proper. Only ever present with a score,
                 // and it says `aim=none` out loud when the incoming track had
