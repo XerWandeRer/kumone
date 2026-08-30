@@ -1294,4 +1294,49 @@ private func aimable(bpm: Double = 120, duration: TimeInterval = 120,
             #expect(PlayerService.stemPrerenderDiscards(held: .settled(held), armed: armed))
         }
     }
+
+    @Test func aSeekThatLandsOnTheSameSeamKeepsTheRenderItParked() {
+        // Fix 2, and the exact shape of the field report: the panel's jump to
+        // the seam disarms and re-arms one second after a render started, onto
+        // a plan that answers `Signature` identically. Nothing moved, so the
+        // work in hand — in flight or finished — is the work wanted.
+        let signature = try! #require(
+            TransitionSegment.Signature(plan: .beatMatched(matchedPlan(overlap: 16))))
+        let rearmed = try! #require(
+            TransitionSegment.Signature(plan: .beatMatched(matchedPlan(overlap: 16))))
+        #expect(PlayerService.prerenderSurvivesReArm(parked: .running(signature),
+                                                     rearmed: rearmed))
+        #expect(PlayerService.prerenderSurvivesReArm(parked: .settled(signature),
+                                                     rearmed: rearmed))
+    }
+
+    @Test func aSeekThatMovesTheSeamStillThrowsTheRenderAway() {
+        // The safety half. A parked render only survives on an identical
+        // signature — a seek that degrades the plan, or that re-arms nothing at
+        // all, must not leave stale audio aimed at a splice that changed.
+        let held = try! #require(
+            TransitionSegment.Signature(plan: .beatMatched(matchedPlan(overlap: 16))))
+        for moved in [matchedPlan(overlap: 16, outPoint: 121),
+                      matchedPlan(overlap: 16, inPoint: 9),
+                      matchedPlan(overlap: 20)] {
+            let armed = try! #require(TransitionSegment.Signature(plan: .beatMatched(moved)))
+            #expect(!PlayerService.prerenderSurvivesReArm(parked: .running(held),
+                                                          rearmed: armed))
+        }
+        // No re-arm (the plan degraded to gapless, or the prefetch is gone) and
+        // nothing parked in the first place: neither is something to keep.
+        #expect(!PlayerService.prerenderSurvivesReArm(parked: .running(held), rearmed: nil))
+        #expect(!PlayerService.prerenderSurvivesReArm(parked: .idle, rearmed: held))
+
+        // The two rules are each other's complement, which is what makes the
+        // rescue safe: whatever a re-arm would have discarded, a seek does too.
+        for state in [PlayerService.StemPrerenderState.running(held), .settled(held), .idle] {
+            for plan in [matchedPlan(overlap: 16), matchedPlan(overlap: 20)] {
+                let armed = try! #require(TransitionSegment.Signature(plan: .beatMatched(plan)))
+                #expect(PlayerService.prerenderSurvivesReArm(parked: state, rearmed: armed)
+                        != PlayerService.stemPrerenderDiscards(held: state, armed: armed)
+                        || state.signature == nil)
+            }
+        }
+    }
 }

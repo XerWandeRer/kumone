@@ -513,13 +513,25 @@ final class PlayerService: ObservableObject {
         // engine (resolvePlanLocked) degrades such a plan to a tail-anchored
         // crossfade or to gapless instead of firing it on the spot — a seek
         // into the transition window must never start the next song.
+        //
+        // The stem render in flight is *parked*, not killed. A seek moves the
+        // playhead, not the seam: the panel's own jump-to-seam moves it towards
+        // the very hand-over being rendered, and re-planning from the new
+        // position almost always lands on the identical signature. Killing the
+        // render there and restarting it inside the lead window was how a jump
+        // turned a comfortable `trigger=settled` into a `trigger=late` that lost
+        // the race to its own splice. `reconcileParkedPrerender` decides after
+        // the re-arm, on the signature, and drops it if the seam really moved.
         let wasArmed = transitionArmed
-        if wasArmed { disarmTransition() }
+        if wasArmed { disarmTransition(keepingPrerender: true) }
         progress = seconds
         updateLyricsCursor(at: seconds)
         engine.seek(deck: activeDeck, to: seconds)
         NowPlayingManager.shared.updateElapsed(seconds, rate: isPlaying ? 1 : 0)
-        if wasArmed { armTransitionIfReady() }
+        if wasArmed {
+            armTransitionIfReady()
+            reconcileParkedPrerender()
+        }
         completion?()
     }
 
@@ -735,7 +747,13 @@ final class PlayerService: ObservableObject {
 
     /// Void an armed hand-over, keeping the prefetched file/analysis around
     /// so the transition can be re-armed (post-seek) without re-downloading.
-    private func disarmTransition() {
+    ///
+    /// `keepingPrerender` parks the stem render instead of killing it, for the
+    /// one caller whose disarm/re-arm pair is not a change of mind: a seek.
+    /// See `reconcileParkedPrerender` — nothing is *kept* on the strength of
+    /// this flag alone, only held long enough for the re-armed plan to be
+    /// compared against it.
+    private func disarmTransition(keepingPrerender: Bool = false) {
         engine.cancelScheduledTransition()
         transitionArmed = false
         pendingTransitionTrack = nil
@@ -744,7 +762,14 @@ final class PlayerService: ObservableObject {
         AutoMixDebugModel.shared.setScoreRefusal(nil)
         // Whatever the pre-render was aiming at is void: a re-arm re-derives
         // the plan, and `updateStemPrerender` starts again from there.
-        cancelStemPrerender()
+        //
+        // Unless the caller is only *re-deriving* this same seam — see
+        // `keepingPrerender`, and `reconcileParkedPrerender` for who decides.
+        if keepingPrerender, stemPrerenderState.signature != nil {
+            parkedPrerender = stemPrerenderState
+        } else {
+            cancelStemPrerender()
+        }
         // The stability clock too, and for a reason worth naming: a seek moves
         // the playhead this clock is read on, so a `since` taken before it is
         // not a duration afterwards. A re-arm restarts it honestly.
@@ -1737,7 +1762,54 @@ final class PlayerService: ObservableObject {
         stemPrerenderTask?.cancel()
         stemPrerenderTask = nil
         stemPrerenderState = .idle
+        parkedPrerender = nil
         AutoMixDebugModel.shared.setPrerender(.idle)
+    }
+
+    /// A render held across a disarm/re-arm pair, waiting to find out whether
+    /// the seam that comes back is the seam it was made for.
+    private var parkedPrerender: StemPrerenderState?
+
+    /// **Whether a parked render survives the re-arm.**
+    ///
+    /// The same rule as `stemPrerenderDiscards`, from the other side: the splice,
+    /// the entry and the overlap are the three things a segment is rendered
+    /// against, so a re-armed plan that answers `Signature` identically wants
+    /// exactly the audio already in hand — finished or still being made.
+    ///
+    /// A seek used to lose that unconditionally. The field journal shows the
+    /// cost: a jump to the seam starts a render at `trigger=settled` with 159 s
+    /// of runway, the jump disarms and re-arms one second later onto the *same*
+    /// signature, and the replacement starts at `trigger=late` with 29 s — which
+    /// then loses the race and reaches the engine after the splice, as
+    /// `engine declined — seam moved or splice passed`. Nothing had moved.
+    static func prerenderSurvivesReArm(
+        parked: StemPrerenderState, rearmed: TransitionSegment.Signature?
+    ) -> Bool {
+        guard let held = parked.signature, let rearmed else { return false }
+        return held == rearmed
+    }
+
+    /// Settle a parked render against whatever was just re-armed: keep it when
+    /// the signature is unchanged, drop it otherwise. Called after the re-arm,
+    /// and unconditionally — a re-arm that never happened (no prefetched track
+    /// left) has no plan to match, so the render goes.
+    ///
+    /// The engine-side offer is untouched by any of this. When the finished
+    /// segment is handed over it is still checked against the live plan and the
+    /// live playhead, and still declined if the splice really has passed — the
+    /// rescue is about not throwing away correct work, not about forcing it in.
+    private func reconcileParkedPrerender() {
+        guard let parked = parkedPrerender else { return }
+        parkedPrerender = nil
+        let rearmed = armedPlan.flatMap { TransitionSegment.Signature(plan: $0.plan) }
+        guard Self.prerenderSurvivesReArm(parked: parked, rearmed: rearmed),
+              let held = parked.signature else {
+            cancelStemPrerender()
+            return
+        }
+        PlaybackJournal.note(
+            "prerender kept across seek signature=\(Self.debugSignature(held))")
     }
 
     /// `Config.standard` with the one knob the user can see: the planner's
