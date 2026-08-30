@@ -59,6 +59,16 @@ cp -a "$SPARKLE_FW" "$APP_BUNDLE/Contents/Frameworks/"
 METALLIB="$(find "$ROOT/.build" -name 'mlx.metallib' -print -quit 2>/dev/null || true)"
 if [ -n "$METALLIB" ]; then
   cp "$METALLIB" "$APP_BUNDLE/Contents/MacOS/mlx.metallib"
+else
+  # Shipping without the kernels silently disables every stem hand-over and
+  # is indistinguishable from a planner bug in the field (2026-08-31: a day
+  # of "everything falls to stagedEQ" traced back to exactly this). Fail
+  # loudly instead; a clean of .build eats the metallib, and the fix is one
+  # command.
+  echo "error: mlx.metallib not found under .build — the app would ship with" >&2
+  echo "       stem separation disabled. Run Scripts/fetch-mlx-metallib.sh" >&2
+  echo "       (after 'swift build -c release --product stemtool') first." >&2
+  exit 1
 fi
 
 # Localization tables → Bundle.main
