@@ -268,7 +268,7 @@ struct AutoMixDebugSeam: Identifiable, Equatable {
 /// they shadow, so "default off" and "byte-identical" are the same statement —
 /// a switch that defaulted to the config's own `true` would have to be kept in
 /// sync with it forever.
-struct AutoMixOverrides: Equatable {
+struct AutoMixOverrides: Equatable, Codable {
     var forceBeatMatch = false
     var disableTempoRamp = false
     var disableDominantDeckBlend = false
@@ -386,11 +386,32 @@ final class AutoMixDebugModel: ObservableObject {
     /// on demand instead of hunting the library for a pair that passes.
     ///
     /// Published because these are controls, not mirrors — flipping one must
-    /// move its checkbox and its badge. Deliberately **not** persisted: an
-    /// overridden plan is not one the shipped player would have made, and an
-    /// override that survived a relaunch would eventually be mistaken for an
-    /// organic result.
-    @Published private(set) var overrides = AutoMixOverrides()
+    /// move its checkbox and its badge.
+    ///
+    /// **Persisted across launches** (a reversal of the original design, at the
+    /// listening owner's request 2026-08-31: a week of package swaps kept
+    /// silently resetting the score toggle, and hours of listening were spent
+    /// on a configuration nobody had chosen). The original worry — an override
+    /// surviving a relaunch being mistaken for an organic result — is covered
+    /// by the badges: every seam mark and every panel row names the overrides
+    /// that were live when it was made.
+    @Published private(set) var overrides = AutoMixDebugModel.restoredOverrides()
+
+    private static let overridesKey = "automix.debug.overrides"
+
+    private static func restoredOverrides() -> AutoMixOverrides {
+        guard let data = UserDefaults.standard.data(forKey: overridesKey),
+              let stored = try? JSONDecoder().decode(AutoMixOverrides.self, from: data)
+        else {
+            // First run (nothing stored): the listening machine wants the
+            // score path audible by default — that is what the panel exists
+            // to evaluate. Everything else starts off, as always.
+            var fresh = AutoMixOverrides()
+            fresh.enableScore = true
+            return fresh
+        }
+        return stored
+    }
 
     /// Go through `PlayerService.setOverrides` instead of calling this: the
     /// flags alone leave the seam that is *already* armed on its old plan, and
@@ -399,6 +420,9 @@ final class AutoMixDebugModel: ObservableObject {
         guard overrides != new else { return }
         overrides = new
         if !new.forceBeatMatch { setForceNote(nil) }
+        if let data = try? JSONEncoder().encode(new) {
+            UserDefaults.standard.set(data, forKey: Self.overridesKey)
+        }
     }
 
     /// How the seam a replay just re-planned differs from the one it was asked
