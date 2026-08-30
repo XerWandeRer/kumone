@@ -1718,13 +1718,15 @@ final class PlayerService: ObservableObject {
                 // playhead is already past the splice, and plays the live
                 // hand-over instead — this is a suggestion, not a command.
                 self.engine.armTransitionSegment(segment)
-                // The rejection is silent by design, so the only way to report
-                // it is to ask afterwards. `hasArmedSegment` is the engine's
-                // existing read-only hook, one queue hop, once per seam.
+                // The offer is fire-and-forget, so the outcome is asked for
+                // afterwards — but the engine now says *which* guard declined
+                // rather than leaving the panel to guess, which is how a render
+                // that finished 27 s early came to be reported as a seam that
+                // had moved. One queue hop, once per seam.
                 AutoMixDebugModel.shared.setPrerender(
-                    self.engine.hasArmedSegment
-                        ? .armed(Self.debugSignature(signature))
-                        : .refused("engine declined — seam moved or splice passed"))
+                    self.engine.lastSegmentDecline.map {
+                        .refused("engine declined — \($0.explanation)")
+                    } ?? .armed(Self.debugSignature(signature)))
             }
             self.stemPrerenderTask = nil
             self.stemPrerenderState = .settled(signature)
@@ -1781,8 +1783,9 @@ final class PlayerService: ObservableObject {
     /// cost: a jump to the seam starts a render at `trigger=settled` with 159 s
     /// of runway, the jump disarms and re-arms one second later onto the *same*
     /// signature, and the replacement starts at `trigger=late` with 29 s — which
-    /// then loses the race and reaches the engine after the splice, as
-    /// `engine declined — seam moved or splice passed`. Nothing had moved.
+    /// then loses the race and reaches the engine after the splice — which the
+    /// panel of the day reported as `seam moved or splice passed`, a guess it
+    /// no longer has to make (`PlaybackEngine.SegmentDecline`). Nothing had moved.
     static func prerenderSurvivesReArm(
         parked: StemPrerenderState, rearmed: TransitionSegment.Signature?
     ) -> Bool {

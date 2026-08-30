@@ -40,6 +40,29 @@ final class FileFeeder: @unchecked Sendable {
     private let maxInFlight = 8
     private var generation = 0
 
+    /// `generation`, readable from the callback queue.
+    ///
+    /// A chunk is handed to `callbackQueue.async` while it is still current and
+    /// can arrive after a `start(from:)`/`stop()` has moved on — audio from the
+    /// old position, scheduled onto a deck that has been re-cued. The engine
+    /// cannot filter it (its own deck generation is a different counter), so the
+    /// feeder does, at the moment of delivery.
+    private let generationLock = NSLock()
+    private var _liveGeneration = 0
+    private var liveGeneration: Int {
+        get { generationLock.lock(); defer { generationLock.unlock() }; return _liveGeneration }
+        set { generationLock.lock(); _liveGeneration = newValue; generationLock.unlock() }
+    }
+
+    /// Deliver on the callback queue, unless the run that produced this has
+    /// since been superseded.
+    private func deliver(generation: Int, _ body: @escaping () -> Void) {
+        callbackQueue.async { [weak self] in
+            guard let self, self.liveGeneration == generation else { return }
+            body()
+        }
+    }
+
     init(file: AVAudioFile, output: AVAudioFormat, queue: DispatchQueue) {
         self.fileURL = file.url
         self.outputFormat = output
@@ -49,22 +72,50 @@ final class FileFeeder: @unchecked Sendable {
 
     /// (Re)start delivery from `seconds` in file time. Any earlier run's
     /// pending chunks are discarded.
+    ///
+    /// The seek is frame-accurate **at the file's own rate** — the position is
+    /// rounded to one source frame and the converter is rebuilt from scratch
+    /// there, so the first delivered sample is the requested instant to within
+    /// half a source frame plus the resampler's own phase (tens of
+    /// microseconds at any rate the graph accepts). That is what lets a
+    /// converted deck be cued for a splice's hand-back, where the segment's
+    /// half-second identity crossfade absorbs the remainder.
     func start(from seconds: TimeInterval) {
         workQueue.async {
             self.generation += 1
+            self.liveGeneration = self.generation
+            let generation = self.generation
             self.ended = false
             self.inFlight = 0
             guard let file = try? AVAudioFile(forReading: self.fileURL) else {
                 self.ended = true
                 let cb = self.onEnded
-                self.callbackQueue.async { cb?() }
+                self.deliver(generation: generation) { cb?() }
                 return
             }
             let frame = AVAudioFramePosition((max(0, seconds) * file.processingFormat.sampleRate).rounded())
             file.framePosition = min(frame, file.length)
             self.file = file
             self.converter = AVAudioConverter(from: file.processingFormat, to: self.outputFormat)
-            self.fillOnQueue(generation: self.generation)
+            self.fillOnQueue(generation: generation)
+        }
+    }
+
+    /// Halt delivery without retiring the feeder: pending chunks are dropped
+    /// and nothing more is read until the next `start(from:)`.
+    ///
+    /// Distinct from `cancel()`, which is terminal (a cancelled feeder never
+    /// feeds again — `resetDeckLocked` uses it when the deck's track is gone).
+    /// This is for a cue that was set up and then not used: the splice tail that
+    /// was pre-rolled and then disarmed still has the same track on the deck.
+    func stop() {
+        workQueue.async {
+            self.generation += 1
+            self.liveGeneration = self.generation
+            self.inFlight = 0
+            self.ended = false
+            self.file = nil
+            self.converter = nil
         }
     }
 
@@ -80,6 +131,7 @@ final class FileFeeder: @unchecked Sendable {
         workQueue.async {
             self.cancelled = true
             self.generation += 1
+            self.liveGeneration = self.generation
             self.file = nil
             self.converter = nil
         }
@@ -106,13 +158,13 @@ final class FileFeeder: @unchecked Sendable {
                     }
                     if out.frameLength > 0 {
                         let cb = onBuffer
-                        callbackQueue.async { cb?(out) }
+                        deliver(generation: generation) { cb?(out) }
                     }
                     if status != .haveData { break }
                 }
                 ended = true
                 let cb = onEnded
-                callbackQueue.async { cb?() }
+                deliver(generation: generation) { cb?() }
                 return
             }
             guard let src = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
@@ -122,7 +174,7 @@ final class FileFeeder: @unchecked Sendable {
             } catch {
                 ended = true
                 let cb = onEnded
-                callbackQueue.async { cb?() }
+                deliver(generation: generation) { cb?() }
                 return
             }
             guard src.frameLength > 0 else { continue }
@@ -145,13 +197,13 @@ final class FileFeeder: @unchecked Sendable {
             guard status != .error else {
                 ended = true
                 let cb = onEnded
-                callbackQueue.async { cb?() }
+                deliver(generation: generation) { cb?() }
                 return
             }
             guard out.frameLength > 0 else { continue }
             inFlight += 1
             let cb = onBuffer
-            callbackQueue.async { cb?(out) }
+            deliver(generation: generation) { cb?(out) }
         }
     }
 }

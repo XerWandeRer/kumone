@@ -120,6 +120,16 @@ final class PlaybackEngine: @unchecked Sendable {
         var generation = 0
         /// Logical intent: the deck should be sounding (modulo global pause).
         var isPlaying = false
+        /// This deck's node is (or is about to be) started by a `play(at:)` on
+        /// the host clock, so nobody else may start it.
+        ///
+        /// Only the splice's tail sets this, and only for a converted-file
+        /// deck: that deck is cued by pre-rolling its feeder, whose chunks
+        /// arrive on this queue and would otherwise call
+        /// `startNodeIfNeededLocked` and open the hand-back early. Guarding the
+        /// one function every start goes through is what makes the pre-roll
+        /// safe against every caller rather than against the one we thought of.
+        var hostScheduledStart = false
         /// Non-nil while a re-schedule (seek) flush window is open: the fader
         /// level to hand back once the stale audio still inside the effect
         /// chain has been pushed out. See `beginFaderFlushLocked`.
@@ -266,6 +276,17 @@ final class PlaybackEngine: @unchecked Sendable {
     /// runs at 50 Hz — a quarter second is an order of magnitude more slack
     /// than either needs, and the segment simply idles until its moment.
     private static let segmentArmLead: TimeInterval = 0.25
+    /// How far ahead of the splice's hand-back a converted-file incoming deck
+    /// has its feeder re-cued.
+    ///
+    /// Unlike a `.file` deck — cued by one synchronous `scheduleSegment` at the
+    /// arm lead — a feeder opens the file, seeks and converts on its own queue,
+    /// so it needs real time rather than clock slack. A second and a half is two
+    /// orders of magnitude more than a chunk takes and still lands inside every
+    /// segment we render (head + overlap + tail is never under three seconds);
+    /// the pre-rolled chunks simply queue up on the stopped node until the tail
+    /// releases them.
+    private static let segmentTailPreroll: TimeInterval = 1.5
     /// Longest crossfade a degraded plan falls back to.
     private static let fallbackCrossfadeDuration: TimeInterval = 4
     /// Slack the fallback crossfade needs beyond its own length; below this
@@ -305,6 +326,11 @@ final class PlaybackEngine: @unchecked Sendable {
         /// finished in time. Nil is the ordinary case and means the live
         /// two-deck overlap below runs, unchanged.
         var segment: TransitionSegment?
+        /// A converted-file incoming deck has had its feeder re-cued to the
+        /// segment's hand-back position and is holding converted chunks on a
+        /// stopped node, waiting for the tail's `play(at:)`. Always false for a
+        /// `.file` incoming deck, which is cued in one call at the tail itself.
+        var tailPrerolled = false
         /// `.echoOut`: the delay has been thrown and the outgoing deck is
         /// being cut; set once, at `echoStopOffset`.
         var echoThrown = false
@@ -803,30 +829,96 @@ final class PlaybackEngine: @unchecked Sendable {
         }
     }
 
+    /// Why an offered `TransitionSegment` was not taken.
+    ///
+    /// The offer is fire-and-forget by design — the pre-render hands the engine
+    /// a suggestion and the live hand-over is always still armed behind it — so
+    /// the *reason* used to be unrecoverable, and the caller reported a guess.
+    /// Field journals then read `engine declined — seam moved or splice passed`
+    /// for renders that finished half a minute early onto a seam nothing had
+    /// touched, which is the opposite of what had happened. Each case below is
+    /// one guard in `acceptSegmentLocked`, and nothing else declines.
+    enum SegmentDecline: String, Sendable {
+        /// No plan is waiting, or the hand-over has already started running.
+        case wrongPhase
+        /// This seam already holds a segment.
+        case alreadyArmed
+        /// The segment was cut for different geometry than the armed plan's —
+        /// a seek degraded the plan, or a late re-plan moved the seam.
+        case signatureMismatch
+        /// The incoming deck has nothing a splice can hand back to: a
+        /// progressive stream (no frame-accurate resume) or no source at all.
+        case unsupportedSource
+        /// The outgoing deck is already at or past the splice point — the
+        /// render finished too late to be used.
+        case splicePassed
+
+        /// One clause, for the debug panel.
+        var explanation: String {
+            switch self {
+            case .wrongPhase: return "no seam is waiting"
+            case .alreadyArmed: return "this seam already holds a segment"
+            case .signatureMismatch: return "the seam moved under the render"
+            case .unsupportedSource: return "the incoming deck cannot be spliced onto"
+            case .splicePassed: return "the splice point had already passed"
+            }
+        }
+    }
+
+    /// Why the last offered segment was declined; nil when it was taken. Read
+    /// back the same way `hasArmedSegment` is — one queue hop, once per seam.
+    private var segmentDecline: SegmentDecline?
+
     /// Hand the engine a pre-rendered hand-over to play in place of the live
     /// overlap of the transition it currently has waiting.
     ///
-    /// Rejected — silently, leaving the live path armed — unless the segment
-    /// belongs to *this* plan and the outgoing deck has not yet reached the
-    /// splice point. Both are the same rule: a segment is audio cut for one
-    /// exact seam, so anything that has moved the seam (a seek that degraded
-    /// the plan, a late re-plan, a pre-render that finished too late) makes it
-    /// the wrong audio, and the live path is always still there.
+    /// Rejected — leaving the live path armed — unless the segment belongs to
+    /// *this* plan and the outgoing deck has not yet reached the splice point.
+    /// Both are the same rule: a segment is audio cut for one exact seam, so
+    /// anything that has moved the seam (a seek that degraded the plan, a late
+    /// re-plan, a pre-render that finished too late) makes it the wrong audio,
+    /// and the live path is always still there.
+    ///
+    /// A rejection is no longer silent: it names itself in the journal at the
+    /// moment it happens and stays readable in `lastSegmentDecline`.
     func armTransitionSegment(_ segment: TransitionSegment) {
         queue.async {
-            guard let tr = self.transition, tr.phase == .waiting, tr.segment == nil,
-                  let signature = TransitionSegment.Signature(plan: tr.plan),
-                  signature == segment.signature,
-                  case .file = self.deckStates[tr.to]!.source
-            else { return }
-            let position = self.livePositionLocked(self.deckStates[tr.from]!)
-            guard position < segment.spliceStart - Self.segmentArmLead else { return }
-            tr.segment = segment
+            let decline = self.acceptSegmentLocked(segment)
+            self.segmentDecline = decline
+            guard let decline else { return }
+            PlaybackJournal.note(String(
+                format: "splice declined reason=%@ spliceStart=%.3f ",
+                decline.rawValue, segment.spliceStart) + self.journalRates)
         }
+    }
+
+    /// The arming rules, one guard each, so the caller can be told which one
+    /// said no. Returns nil when the segment was taken.
+    private func acceptSegmentLocked(_ segment: TransitionSegment) -> SegmentDecline? {
+        guard let tr = transition, tr.phase == .waiting else { return .wrongPhase }
+        guard tr.segment == nil else { return .alreadyArmed }
+        guard let signature = TransitionSegment.Signature(plan: tr.plan),
+              signature == segment.signature else { return .signatureMismatch }
+        switch deckStates[tr.to]!.source {
+        case .file, .convertedFile:
+            // Both can be cued to an exact source frame and released on the
+            // render clock — see `startIncomingFromSegmentLocked`.
+            break
+        case .stream, .none:
+            return .unsupportedSource
+        }
+        let position = livePositionLocked(deckStates[tr.from]!)
+        guard position < segment.spliceStart - Self.segmentArmLead else { return .splicePassed }
+        tr.segment = segment
+        return nil
     }
 
     /// Test hook: is a pre-rendered segment armed for the pending transition?
     var hasArmedSegment: Bool { queue.sync { transition?.segment != nil } }
+
+    /// Why the last `armTransitionSegment` offer was declined, or nil if it was
+    /// taken. Same read-back shape as `hasArmedSegment`.
+    var lastSegmentDecline: SegmentDecline? { queue.sync { segmentDecline } }
 
     /// Test hook: is a pre-rendered segment currently carrying the hand-over?
     /// The phase a test has to wait for before it can say anything about the
@@ -1117,6 +1209,7 @@ final class PlaybackEngine: @unchecked Sendable {
     }
 
     private func startNodeIfNeededLocked(_ state: DeckState) {
+        guard !state.hostScheduledStart else { return }
         guard state.isPlaying, !isPaused, state.isConnected, engine.isRunning else { return }
         if !state.player.isPlaying { state.player.play() }
     }
@@ -1522,6 +1615,7 @@ final class PlaybackEngine: @unchecked Sendable {
         // deliberately left at the level the overlap ended on).
         clearRideStateLocked(state)
         state.isPlaying = false
+        state.hostScheduledStart = false
         state.startOffset = 0
         state.lastKnownPosition = 0
         state.pendingStreamBuffers = 0
@@ -1610,6 +1704,7 @@ final class PlaybackEngine: @unchecked Sendable {
 
     private func scheduleSegmentLocked(_ state: DeckState, file: AVAudioFile,
                                        from seconds: TimeInterval, deck: Deck) {
+        state.hostScheduledStart = false
         state.generation += 1
         let generation = state.generation
         beginFaderFlushLocked(state)
@@ -1696,6 +1791,9 @@ final class PlaybackEngine: @unchecked Sendable {
 
     /// Restart a converted-file deck's chunk delivery from `seconds`.
     private func seekFeederLocked(_ state: DeckState, feeder: FileFeeder, to seconds: TimeInterval) {
+        // An explicit re-cue takes the deck back from whatever host-clock start
+        // was waiting on it (a splice tail pre-roll is the only one).
+        state.hostScheduledStart = false
         state.generation += 1
         beginFaderFlushLocked(state)
         state.player.stop()
@@ -2253,12 +2351,18 @@ final class PlaybackEngine: @unchecked Sendable {
     /// Undo an incoming deck that has been scheduled for the segment's tail but
     /// has not started sounding yet — its `play(at:)` is on the host clock,
     /// which keeps running while the engine is paused.
+    ///
+    /// A converted deck's pre-roll goes with it: the node is stopped either way,
+    /// so its queued chunks are gone, and `updateSegmentLocked` re-cues both
+    /// from scratch once the segment's clock is running again.
     private func disarmSegmentTailLocked() {
         guard let tr = transition, tr.phase == .segmentPlaying,
               let segment = tr.segment,
               let elapsed = segmentElapsedLocked(), elapsed < segment.handoffOutStart
         else { return }
         let to = deckStates[tr.to]!
+        guard to.isPlaying || tr.tailPrerolled else { return }
+        cancelTailPrerollLocked(tr)
         guard to.isPlaying else { return }
         to.generation += 1
         hardSilenceFaderLocked(to)
@@ -2308,6 +2412,11 @@ final class PlaybackEngine: @unchecked Sendable {
         // the segment's own clock, playing the same audio the segment's last
         // half second carries, and the two are crossfaded the same way.
         let tailStart = segment.handoffOutStart
+        if !to.isPlaying, !tr.tailPrerolled, case .convertedFile(let feeder) = to.source,
+           elapsed >= tailStart - Self.segmentTailPreroll {
+            tr.tailPrerolled = true
+            prerollIncomingFeederLocked(to, feeder: feeder, at: segment.incomingResume)
+        }
         if !to.isPlaying, elapsed >= tailStart - Self.segmentArmLead {
             startIncomingFromSegmentLocked(tr, segment: segment)
         }
@@ -2353,26 +2462,98 @@ final class PlaybackEngine: @unchecked Sendable {
         state.isPlaying = false
     }
 
+    /// Cue a converted-file incoming deck for the segment's hand-back *without*
+    /// starting it.
+    ///
+    /// A `.file` deck is cued and released in one breath, because
+    /// `scheduleSegment` is synchronous and frame-exact. A feeder is neither: it
+    /// opens the file, seeks and resamples on its own queue, so it is started
+    /// here — up to `segmentTailPreroll` before the tail — and its chunks pile
+    /// up on a node that is still stopped. `hostScheduledStart` is what keeps
+    /// them piling instead of playing: the feeder's delivery callback ends in
+    /// `startNodeIfNeededLocked`, which would otherwise open the hand-back the
+    /// moment the first chunk landed.
+    ///
+    /// No `beginFaderFlushLocked`, unlike the seek path this otherwise mirrors:
+    /// the deck is silent and stopped, there is nothing in its chain to push
+    /// out, and a flush window would still be holding the fader down when the
+    /// tail crossfade tries to raise it.
+    private func prerollIncomingFeederLocked(_ state: DeckState, feeder: FileFeeder,
+                                             at seconds: TimeInterval) {
+        state.generation += 1
+        state.player.stop()
+        state.pendingStreamBuffers = 0
+        state.streamEnded = false
+        state.streamStalled = false
+        state.startOffset = seconds
+        state.lastKnownPosition = seconds
+        state.hostScheduledStart = true
+        feeder.start(from: seconds)
+        PlaybackJournal.note(String(
+            format: "splice tail preroll deck=%@ resume=%.3f ",
+            journalDeckName(state), seconds) + journalRates)
+    }
+
+    /// Undo a pre-roll that will not be used: the feeder is halted (not
+    /// cancelled — the deck still holds the track) and the chunks queued on the
+    /// node are flushed. Safe to call when nothing was pre-rolled.
+    private func cancelTailPrerollLocked(_ tr: TransitionState) {
+        guard tr.tailPrerolled else { return }
+        tr.tailPrerolled = false
+        let to = deckStates[tr.to]!
+        to.hostScheduledStart = false
+        guard case .convertedFile(let feeder) = to.source else { return }
+        to.generation += 1
+        feeder.stop()
+        to.player.stop()
+        to.pendingStreamBuffers = 0
+        to.streamEnded = false
+        to.streamStalled = false
+    }
+
     /// Cue the incoming deck to where the segment's tail is and start it on the
     /// render clock, so the deck and the segment are playing the same samples
     /// at the same time.
+    ///
+    /// Both local sources get the same host-time release; they differ only in
+    /// how they were cued. A `.file` deck is scheduled here, frame-exact. A
+    /// converted one was pre-rolled above and is waiting with chunks in hand —
+    /// frame-exact at the file's own rate, which after the resampler is within
+    /// a fraction of a millisecond of the requested instant, and the segment's
+    /// half-second identity crossfade is there to absorb exactly that.
     private func startIncomingFromSegmentLocked(_ tr: TransitionState,
                                                 segment: TransitionSegment) {
         let to = deckStates[tr.to]!
-        guard case .file(let file) = to.source else { return }
+        switch to.source {
+        case .file:
+            break
+        case .convertedFile:
+            // Nothing to release yet: the pre-roll has not produced its first
+            // chunk. The next tick asks again, and `finishSegmentLocked` still
+            // covers a pre-roll that never arrives at all.
+            guard tr.tailPrerolled, to.pendingStreamBuffers > 0 else { return }
+        case .stream, .none:
+            return
+        }
         let sampleRate = graphFormat.sampleRate
         let frame = AVAudioFramePosition((segment.handoffOutStart * sampleRate).rounded())
         guard let start = segmentState.player.nodeTime(
                 forPlayerTime: AVAudioTime(sampleTime: frame, atRate: sampleRate)),
               start.isHostTimeValid, start.hostTime > mach_absolute_time()
         else { return }
-        scheduleSegmentLocked(to, file: file, from: segment.incomingResume, deck: tr.to)
+        if case .file(let file) = to.source {
+            scheduleSegmentLocked(to, file: file, from: segment.incomingResume, deck: tr.to)
+        }
         // The ride is still unwinding where the segment ends; the deck picks it
         // up at that value and finishes the release on its own glide timer.
         setRideLocked(to, db: segment.incomingRideDB)
         setFaderLocked(to, 0)
-        to.isPlaying = true
         to.player.play(at: start)
+        // Only now: `play(at:)` has claimed the node, so an ordinary start can
+        // no longer jump ahead of the host clock, and the deck has to look
+        // playing to the rest of the engine (the fader flush, the pause path).
+        to.hostScheduledStart = false
+        to.isPlaying = true
         PlaybackJournal.note(String(
             format: "splice tail start deck=%@ resume=%.3f ride=%+.2fdB ",
             tr.to.rawValue, segment.incomingResume, segment.incomingRideDB) + journalRates)
@@ -2391,13 +2572,26 @@ final class PlaybackEngine: @unchecked Sendable {
             // The tail never started (the clock was unavailable at the arm
             // point). Start the incoming deck now: a few milliseconds of seam
             // is worth more than a silent deck.
-            if case .file(let file) = to.source {
+            cancelTailPrerollLocked(tr)
+            switch to.source {
+            case .file(let file):
                 scheduleSegmentLocked(to, file: file, from: segment.incomingResume, deck: tr.to)
                 setRideLocked(to, db: segment.incomingRideDB)
                 to.isPlaying = true
                 startNodeIfNeededLocked(to)
+            case .convertedFile(let feeder):
+                // The pre-roll is re-run rather than released: it was cued for a
+                // host time that never came, and `seekFeederLocked` is the one
+                // path that puts a converted deck on the air from a standstill.
+                seekFeederLocked(to, feeder: feeder, to: segment.incomingResume)
+                setRideLocked(to, db: segment.incomingRideDB)
+                to.isPlaying = true
+                startNodeIfNeededLocked(to)
+            case .stream, .none:
+                break
             }
         }
+        tr.tailPrerolled = false
         setFaderLocked(to, 1)
         releaseRideLocked(to)
         // The segment rendered its own rate release, so the deck picking the
@@ -2431,12 +2625,24 @@ final class PlaybackEngine: @unchecked Sendable {
         parkSegmentLocked()
 
         if tr.midpointSent {
-            if !to.isPlaying, case .file(let file) = to.source {
-                scheduleSegmentLocked(to, file: file,
-                                      from: segment.incomingTime(at: elapsed), deck: tr.to)
-                setRideLocked(to, db: segment.incomingRideDB)
-                to.isPlaying = true
-                startNodeIfNeededLocked(to)
+            if !to.isPlaying {
+                cancelTailPrerollLocked(tr)
+                var cued = true
+                switch to.source {
+                case .file(let file):
+                    scheduleSegmentLocked(to, file: file,
+                                          from: segment.incomingTime(at: elapsed), deck: tr.to)
+                case .convertedFile(let feeder):
+                    seekFeederLocked(to, feeder: feeder,
+                                     to: segment.incomingTime(at: elapsed))
+                case .stream, .none:
+                    cued = false
+                }
+                if cued {
+                    setRideLocked(to, db: segment.incomingRideDB)
+                    to.isPlaying = true
+                    startNodeIfNeededLocked(to)
+                }
             }
             setFaderLocked(to, 1)
             // Same as a normal finish: this deck is the track now, so both of
@@ -2451,7 +2657,10 @@ final class PlaybackEngine: @unchecked Sendable {
 
         // The hand-over never became audible: the incoming deck goes back to
         // parked-and-loaded, and the outgoing one resumes where the segment
-        // had got to in its own track.
+        // had got to in its own track. A pre-roll that had been cued for the
+        // tail is part of "parked": left running it would keep converting into
+        // a node this deck's next caller expects to find empty.
+        cancelTailPrerollLocked(tr)
         if to.isPlaying {
             to.generation += 1
             hardSilenceFaderLocked(to)

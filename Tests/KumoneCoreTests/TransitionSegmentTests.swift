@@ -28,10 +28,18 @@ private enum SegmentFixtures {
     static let outgoing: URL = try! sine(hz: 440, seconds: 10, name: "seg-out")
     static let incoming: URL = try! sine(hz: 660, seconds: 10, name: "seg-in")
 
-    static func sine(hz: Double, seconds: Double, name: String) throws -> URL {
+    /// The same incoming track at 96 kHz — the format the graph does *not*
+    /// run at, so the deck loads it as `.convertedFile` and the splice has to
+    /// hand back through a feeder instead of a frame-exact `scheduleSegment`.
+    /// About two fifths of a real library is hi-res, and every one of those
+    /// seams used to lose its pre-rendered segment.
+    static let incomingHiRes: URL =
+        try! sine(hz: 660, seconds: 10, sampleRate: 96_000, name: "seg-in-96k")
+
+    static func sine(hz: Double, seconds: Double, sampleRate: Double = 44_100,
+                     name: String) throws -> URL {
         let url = dir.appendingPathComponent("\(name).caf")
         if FileManager.default.fileExists(atPath: url.path) { return url }
-        let sampleRate = 44_100.0
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
         let file = try AVAudioFile(forWriting: url, settings: format.settings,
                                    commonFormat: .pcmFormatFloat32, interleaved: false)
@@ -76,10 +84,12 @@ private func plan(overlap: TimeInterval = 2, outPoint: TimeInterval = 5,
         style: style)
 }
 
-private func request(_ planned: PlannedTransition) -> TransitionSegmentRenderer.Request {
+private func request(_ planned: PlannedTransition,
+                     incoming: URL = SegmentFixtures.incoming
+) -> TransitionSegmentRenderer.Request {
     TransitionSegmentRenderer.Request(
         planned: planned,
-        outgoingURL: SegmentFixtures.outgoing, incomingURL: SegmentFixtures.incoming)
+        outgoingURL: SegmentFixtures.outgoing, incomingURL: incoming)
 }
 
 /// Runs `body` on its own thread, failing the test rather than hanging the run.
@@ -655,6 +665,187 @@ struct TransitionSegmentTests {
                 #expect(worst.neutral, "\(coloured)")
             }
         }
+    }
+
+    // MARK: - A hi-res incoming deck
+
+    /// **The splice must survive an incoming track the graph cannot play
+    /// natively.**
+    ///
+    /// A file whose rate or channel count differs from the 44.1 kHz stereo graph
+    /// loads as `.convertedFile`, because reconnecting a running graph throws.
+    /// The engine used to refuse every pre-rendered segment aimed at such a
+    /// deck — silently, and reported as "the seam moved" — so on a library that
+    /// is roughly two fifths hi-res, two fifths of all stem hand-overs were
+    /// quietly never performed.
+    ///
+    /// The hand-back is the whole difficulty: a `.file` deck is cued frame-exact
+    /// in one call, a feeder has to be pre-rolled and then released on the same
+    /// host clock. So this asks the two questions that separates a working
+    /// splice from a plausible one — did it complete with both decks clean, and
+    /// did the incoming deck come back at the position the segment handed it.
+    @Test func aHiResIncomingDeckIsSplicedAndResumesWhereTheSegmentLeftIt() throws {
+        guard audioOutputAvailable else { return }
+        let planned = plan(overlap: 2, outPoint: 4)
+        let segment = try TransitionSegmentRenderer.render(
+            request(planned, incoming: SegmentFixtures.incomingHiRes),
+            provider: silentVocals)
+
+        struct Outcome {
+            var declined: PlaybackEngine.SegmentDecline?
+            var armed = false
+            var completed = false
+            var positionAtCompletion: TimeInterval = 0
+            var deckA: PlaybackEngine.DeckEffectSnapshot?
+            var deckB: PlaybackEngine.DeckEffectSnapshot?
+        }
+
+        let result = withWatchdog("hiResSplice", timeout: 45) { () -> Outcome? in
+            var outcome = Outcome()
+            let engine = PlaybackEngine()
+            let events = SegmentEventLog(engine)
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: SegmentFixtures.outgoing, on: .a)) != nil,
+                  (try? engine.loadFile(at: SegmentFixtures.incomingHiRes, on: .b)) != nil
+            else { return nil }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 1.5)
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 0.3)
+            engine.armTransitionSegment(segment)
+            outcome.declined = engine.lastSegmentDecline
+            outcome.armed = engine.hasArmedSegment
+            guard outcome.armed else { return outcome }
+            outcome.completed = events.wait(timeout: 25) {
+                if case .transitionCompleted(from: .a, to: .b) = $0 { return true }
+                return false
+            }
+            // Read the hand-back position first and the chains after: the
+            // position is the perishable one.
+            outcome.positionAtCompletion = engine.position(of: .b)
+            Thread.sleep(forTimeInterval: 1.0)
+            outcome.deckA = engine.effectSnapshot(of: .a)
+            outcome.deckB = engine.effectSnapshot(of: .b)
+            return outcome
+        }
+        guard let outcome = result ?? nil else { return }
+
+        let notDeclined = "a hi-res incoming deck must not be a reason to decline a "
+            + "segment (got \(String(describing: outcome.declined)))"
+        #expect(outcome.declined == nil, "\(notDeclined)")
+        #expect(outcome.armed, "the segment should have been armed")
+        guard outcome.armed else { return }
+        #expect(outcome.completed, "the spliced hand-over should complete on its own")
+
+        // Where the deck should be when the splice finishes: the segment handed
+        // it the track at `incomingResume` and it has been playing the tail
+        // window since. The tolerance is the event's own delivery latency, not
+        // the feeder's accuracy — a feeder that resumed at the wrong *place*
+        // would be out by whole seconds, which is the failure this catches.
+        let expected = segment.incomingResume + segment.handoffOut
+        let drifted = "the incoming deck resumed at \(outcome.positionAtCompletion)s, "
+            + "but the segment handed it the track at \(segment.incomingResume)s and the "
+            + "tail is \(segment.handoffOut)s long (expected ≈\(expected)s)"
+        #expect(abs(outcome.positionAtCompletion - expected) < 0.4, "\(drifted)")
+
+        // And the splice left both decks as clean as the live overlap does.
+        if let deckB = outcome.deckB {
+            #expect(abs(deckB.rate - 1) < 0.001,
+                    "the incoming deck is detuned after the splice (\(deckB.rate))")
+            #expect(deckB.effectsAreNeutral,
+                    "the incoming deck kept a chain the splice never handed back")
+        }
+        if let deckA = outcome.deckA {
+            #expect(abs(deckA.rate - 1) < 0.001,
+                    "the retired deck is detuned after the splice (\(deckA.rate))")
+            #expect(deckA.effectsAreNeutral,
+                    "the retired deck kept a chain the splice never handed back")
+        }
+    }
+
+    // MARK: - Honest refusals
+
+    /// **Every decline says which rule declined it.**
+    ///
+    /// The offer is fire-and-forget, so for a long time the caller reported a
+    /// guess — one sentence covering four different rules — and the field
+    /// journal duly recorded renders that had finished half a minute early as
+    /// seams that had moved. Each case below trips exactly one guard.
+    @Test func aDeclinedSegmentSaysWhichRuleDeclinedIt() throws {
+        guard audioOutputAvailable else { return }
+        let planned = plan(overlap: 2, outPoint: 4)
+        let segment = try TransitionSegmentRenderer.render(request(planned),
+                                                           provider: silentVocals)
+        let foreign = try TransitionSegmentRenderer.render(
+            request(plan(overlap: 2, outPoint: 7)), provider: silentVocals)
+
+        typealias Decline = PlaybackEngine.SegmentDecline
+        struct Seen {
+            var noPlan: Decline?
+            var deckEmpty: Decline?
+            var otherSeam: Decline?
+            var accepted: Decline?
+            var offeredTwice: Decline?
+            var tooLate: Decline?
+        }
+        let result = withWatchdog("declineReasons", timeout: 40) { () -> Seen? in
+            var seen = Seen()
+            let engine = PlaybackEngine()
+            defer { engine.stopAll() }
+            guard (try? engine.loadFile(at: SegmentFixtures.outgoing, on: .a)) != nil
+            else { return nil }
+            engine.outputVolume = 0
+            engine.play(deck: .a, from: 0)
+            Thread.sleep(forTimeInterval: 0.2)
+
+            // No plan is waiting at all.
+            engine.armTransitionSegment(segment)
+            seen.noPlan = engine.lastSegmentDecline
+
+            // A plan is waiting, but its incoming deck was never loaded, so
+            // there is nothing for the segment's tail to hand back to.
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 0.2)
+            engine.armTransitionSegment(segment)
+            seen.deckEmpty = engine.lastSegmentDecline
+
+            // Loaded now, but with a segment cut for a different seam.
+            guard (try? engine.loadFile(at: SegmentFixtures.incoming, on: .b)) != nil
+            else { return nil }
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 0.2)
+            engine.armTransitionSegment(foreign)
+            seen.otherSeam = engine.lastSegmentDecline
+
+            // The right segment is taken, and a second offer of it is not.
+            engine.armTransitionSegment(segment)
+            seen.accepted = engine.lastSegmentDecline
+            engine.armTransitionSegment(segment)
+            seen.offeredTwice = engine.lastSegmentDecline
+
+            // A genuinely late render: the playhead is already past the point
+            // where the segment would have taken over. (`spliceStart` is one
+            // half-second head window before the 4 s out point.)
+            engine.cancelScheduledTransition()
+            engine.play(deck: .a, from: 3.6)
+            engine.scheduleTransition(planned, from: .a, to: .b)
+            Thread.sleep(forTimeInterval: 0.2)
+            engine.armTransitionSegment(segment)
+            seen.tooLate = engine.lastSegmentDecline
+            return seen
+        }
+        guard let seen = result ?? nil else { return }
+
+        #expect(seen.noPlan == .wrongPhase)
+        #expect(seen.deckEmpty == .unsupportedSource)
+        #expect(seen.otherSeam == .signatureMismatch)
+        let taken = "the matching segment should have been taken "
+            + "(declined: \(String(describing: seen.accepted)))"
+        #expect(seen.accepted == nil, "\(taken)")
+        #expect(seen.offeredTwice == .alreadyArmed)
+        let late = "a render that lands after the splice point must say so, got "
+            + "\(String(describing: seen.tooLate))"
+        #expect(seen.tooLate == .splicePassed, "\(late)")
     }
 }
 
