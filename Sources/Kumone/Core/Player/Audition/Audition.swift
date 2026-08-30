@@ -451,6 +451,17 @@ public enum Audition {
         public let scoreLines: [String]
         /// The compiled lanes the render will actually perform.
         let scoreLanes: WholeMixLanes?
+        /// **Where the compile put the seam**, on each song's own clock.
+        ///
+        /// Internal, and it exists for one caller: `gridReport`, the mode the
+        /// grid self-check is calibrated on. The check is measured around the
+        /// *snapped* seam, which after the aim and the phrase snap can sit
+        /// several bars off the planner's own cue point — so a calibration
+        /// table built from `outPoint` / `inPoint` would be quoting jitter from
+        /// a window the compiler never looked at. Measuring the general to
+        /// judge the specific is precisely the error that put this cap at 3 %;
+        /// making the same mistake in the tool that fixes it would be worse.
+        let scoreSeam: (outgoing: TimeInterval, incoming: TimeInterval)?
         /// **Whether this score is the one deciding the hand-over's gain.**
         ///
         /// True for every score that ends the outgoing track — those write two
@@ -737,6 +748,13 @@ public enum Audition {
             scoreCompiled: scoreCompilation?.didCompile ?? false,
             scoreLines: scoreCompilation.map(describe) ?? [],
             scoreLanes: scoreCompilation?.lanes,
+            // Present on a refusal too, whenever the compile got far enough to
+            // resolve the seam — that is exactly the case a calibration run
+            // cares about, since every grid refusal happens after it.
+            scoreSeam: scoreCompilation.flatMap {
+                $0.seamOutgoing > 0 || $0.seamIncoming > 0
+                    ? ($0.seamOutgoing, $0.seamIncoming) : nil
+            },
             scoreOwnsGainLaw: scoreCompilation?.lanes?.ownsGainLaw ?? false,
             intentClass: planned.style.intent?.class.rawValue,
             intentReasons: planned.style.intent?.reasons ?? [],

@@ -36,45 +36,165 @@ enum ScoreCompiler {
     /// at a bar that is no longer the hand-over.
     static let aimSnapBars: Double = 1.0
 
-    /// Grid self-check (predev §4.2): bar lengths around the seam must agree to
-    /// within this fraction, or the grid is drifting and a cut on it would land
-    /// off the beat.
+    // MARK: - The grid self-check, in two layers
+    //
+    // The predev (§4.2) asks for one number — "adjacent intervals jumping more
+    // than 3 %" — and P1–P4 shipped it as one: the worst bar-length deviation
+    // in a window either side of the seam, capped at 3 %. In the field that
+    // check refused essentially every score-eligible seam it ever saw (3.6 %,
+    // 4.2 %, 10 % on one day's listening), and both halves of why are
+    // measurable.
+    //
+    // **It guarded a risk the placement does not have.** Every event below is
+    // anchored on a *measured* downbeat — `inDownbeats[index]`,
+    // `outDownbeats[index]` — never on bar 0 plus N times an assumed bar
+    // length. So a window whose bars run 1.9 s, 2.1 s, 2.0 s does not displace
+    // a cut at all: the cut lands on the downbeat that is there. Window-wide
+    // jitter is evidence *about* the detector, not a displacement of the
+    // gesture. The residual risks are strictly local to the anchor — a
+    // mis-**detected** downbeat (the half-beat error this file's header calls
+    // the one unforgivable one), and a downbeat that the beat list does not
+    // agree is a downbeat — and a window statistic cannot see either.
+    //
+    // **And the 3 % was calibrated on the wrong population.** It came off 214
+    // generic whole-track windows (median 1.0 %, p95 3.3 %). Scores do not live
+    // in generic windows; they live in *edge* windows — the outro neighbourhood
+    // the out point comes from and the intro neighbourhood the in point comes
+    // from — where a track is ritarding, breaking down, or has not settled yet.
+    // Re-measured over the owner's cache on exactly those windows — 86 analyzed
+    // tracks, 752 exit- and entry-side windows, `audition grid --all-pairs`:
+    //
+    //     median 1.60 %   p75 3.36 %   p90 6.29 %   p95 8.11 %   p99 12.55 %
+    //
+    // A 3 % cap sits at the **p73** of the population it is actually applied
+    // to. It was never a tail-catcher there; it refused 217 of those 752
+    // windows — 29 % — by construction, and 3.6 % / 4.2 % are ordinary material
+    // rather than a finding about anything.
+    //
+    // So the check splits. The strict half moves to the anchors, where the real
+    // risk is; the window statistic stays as a loose backstop for "the detector
+    // has lost the plot". Over every ordered pair the cache can make (667
+    // beat-matched seams), the two layers land like this:
+    //
+    //     seam window CV    seams   compiled   refused by anchor / backstop
+    //       0 – 3 %          334      100 %          0     0
+    //       3 – 5 %           63       95 %          3     0
+    //       5 – 8 %          106       91 %         10     0
+    //       8 – 10 %          43        0 %          0    43
+    //      10 %+              71        0 %          0    71
+    //
+    // Which is the whole design in one table. The old cap admitted the first
+    // row and nothing else — half of all seams. The split admits 73 %, and the
+    // 169 seams it newly lets through are vetted one anchor at a time rather
+    // than by the window they happen to sit in: 13 of them are still refused,
+    // by the layer that can actually see a mis-placed downbeat. Nothing at 8 %
+    // or over compiles either way.
+
+    /// **Backstop**: the worst bar-length deviation in a window either side of
+    /// the seam, past which the downbeat detector is not to be believed at all.
     ///
-    /// **Measured on bars, not beats, and that is not a softening.** The predev
-    /// writes the check as "adjacent intervals jumping more than 3 %", and on
-    /// the *beat* list that fires on everything: eight quantized dance tracks
-    /// out of the user's own cache carry a 5–13 % worst beat interval and an
-    /// 8 % typical one, because the tracker snaps each beat to an onset and the
-    /// onsets are where the performance is, not where the clock is. That noise
-    /// is the analyzer's, and a check that measures the analyzer refuses every
-    /// score for no musical reason. The bar grid over the same eight tracks
-    /// separates cleanly instead — 0.7–3.4 % around the seam for six of them,
-    /// 12 % and 13 % for the two whose downbeats really do wander — and the bar
-    /// grid is also what a score is addressed on, so it is the grid whose
-    /// trustworthiness the gesture actually depends on.
-    static let gridJitterTolerance: Double = 0.03
-    /// How many bars either side of the seam the self-check looks at.
+    /// Calibrated the same way the old 3 % was — the p95 of the measured
+    /// distribution — but of the *edge* windows a score actually lands in
+    /// rather than of generic whole-track ones. Edge p95 is 8.11 %, so 8 %.
+    /// Same construction, right population; that substitution is the whole
+    /// correction.
+    ///
+    /// This is deliberately not a precision instrument. It refuses the top
+    /// ~5 % of edge windows, which in this corpus is the same tail the old
+    /// comment already identified by hand ("12 % and 13 % for the two whose
+    /// downbeats really do wander"), and it still refuses every seam entering
+    /// the track that read 10 % on the day this was recalibrated. Everything
+    /// between 3 % and 8 % is now judged by the anchor check below, which
+    /// measures the thing that can actually move a cut.
+    static let gridJitterTolerance: Double = 0.08
+    /// How many bars either side of the seam the backstop looks at.
     static let gridCheckBars = 4
 
-    /// **How much looser the self-check is for a score that does not cut.**
+    /// **Anchor check**: how far the two bars *touching* an event's anchoring
+    /// downbeat may disagree with each other.
     ///
-    /// The check above exists for one reason, and the predev states it as one:
-    /// a cut on a drifting grid lands on the wrong beat, and half a beat out is
-    /// the error the gesture cannot survive. Every number in it is calibrated
-    /// against an 8 ms edge landing on the one.
+    /// This is the one that guards the cut, and unlike the window statistic it
+    /// has a derivation rather than a percentile. A correctly detected downbeat
+    /// sits between two bars of roughly equal length. A downbeat detected `δ`
+    /// seconds off its true position *shortens the bar before it by δ and
+    /// lengthens the bar after it by δ* — the neighbours absorb the whole
+    /// error — so the disagreement between the flanking bars is `2δ / bar`, and
+    /// the quantity is a direct read of how far the anchor has moved.
     ///
-    /// A decorating score has no such edge. `bedIntro`'s only event is a
-    /// singer joining over 30 ms on a bar line the **aim** already chose and
-    /// the aim's own half-bar snap already vetted; a 5 % wobble in the bars
-    /// either side of it moves that instant by tens of milliseconds inside a
-    /// gesture whose whole shape is bars long. Holding it to the cut's
-    /// tolerance is not caution, it is measuring the wrong thing — and
-    /// measurably so: over the user's 121-track cache the three pairs that
-    /// ever reach a bed compile were refused at 3.3 %, 3.3 % and 4.3 %, which
-    /// is the check rejecting a gesture it was not written about.
+    /// Half a beat is `bar / 8`, and half a beat out is the error this file
+    /// exists to prevent: it shows up here as 25 %. Holding the anchor to an
+    /// **eighth** of a beat — `δ = bar / 32` — is a 4× margin on the
+    /// unforgivable error and gives `2/32` = 6.25 %.
     ///
-    /// Twice the cut's line, and no looser: past ~6 % the bar grid is not a bar
-    /// grid, and an aim placed on it is pointing at nothing in particular.
+    /// The margin is affordable because the measurement says so: over the same
+    /// 752 edge windows the flanking disagreement runs median 0.68 %, p75
+    /// 1.74 %, p90 3.93 %, p95 6.47 %, p99 10.88 %. So 6.25 % sits just under
+    /// the p95 and refuses 5.2 % of anchors — a real gate that costs sound
+    /// material almost nothing, and the reason a 4 %-jitter *window* now
+    /// compiles while its anchor is still vetted at a thirty-second of a bar.
+    ///
+    /// That the two layers refuse a near-identical share of the corpus (5.2 %
+    /// each) and yet disagree about *which* windows is the point: they are not
+    /// two strictnesses of the same measurement, they are two measurements.
+    static let anchorFlankTolerance: Double = 0.0625
+
+    /// How far one beat interval inside the anchor's own two bars may deviate
+    /// from their median before the beat grid is judged to have skipped.
+    ///
+    /// Loose on purpose, and the old comment said why: the tracker snaps each
+    /// beat to an onset, so beat intervals carry the performance's noise and
+    /// not the clock's. Measured on the anchor's flanking bars across the edge
+    /// corpus that noise runs median 4.35 %, p90 10.0 %, p95 13.1 %, p99
+    /// 21.5 %, **max 25.5 %**.
+    ///
+    /// The failure this is looking for is categorically bigger than that noise.
+    /// A beat dropped by the tracker merges two intervals (+100 %); a beat
+    /// inserted splits one (−50 %); a beat placed half a period out reads
+    /// ±50 % on the pair it sits between. So natural noise tops out at 25 % and
+    /// the fault floor is 50 %, with nothing in between — 35 % is the middle of
+    /// an empty band rather than a percentile of anything.
+    static let anchorBeatOutlierTolerance: Double = 0.35
+
+    /// How near a beat an anchoring downbeat has to be, as a fraction of one
+    /// beat, for the two grids to be describing the same music.
+    ///
+    /// **Today this check cannot fail, and it is here for the day it can.**
+    /// `TrackAnalyzer.estimateDownbeats` picks a phase and takes every fourth
+    /// beat, so on all 86 analyzed sidecars in the owner's cache the downbeats
+    /// are literally a subsequence of the beats: coincidence is exactly 0.0 and
+    /// the beat count between adjacent downbeats is exactly 4, without
+    /// exception. A tautology is a cheap thing to assert and an expensive thing
+    /// to be missing — it fails closed on a corrupt sidecar, on a hand-built
+    /// grid, and on the first analyzer that detects downbeats independently
+    /// instead of deriving them, which is exactly when a half-beat phase error
+    /// becomes possible for the first time.
+    ///
+    /// A quarter of a beat because the error being caught is half of one: a
+    /// downbeat that has slipped a whole beat off the beat grid is not a
+    /// rounding difference, it is a different reading of the bar.
+    static let anchorBeatCoincidence: Double = 0.25
+
+    /// **How much looser the anchor check is for a score that does not cut.**
+    ///
+    /// The strictness above is calibrated against one thing: an 8 ms edge
+    /// landing on the one, and half a beat being the error it cannot survive.
+    ///
+    /// A decorating score has no such edge. `bedIntro`'s only event is a singer
+    /// joining over 30 ms on a bar line the **aim** already chose and the aim's
+    /// own half-bar snap already vetted; a wobble that moves that instant by
+    /// tens of milliseconds inside a bars-long gesture is not the failure the
+    /// cut's tolerance was written about. Over the owner's cache the three
+    /// pairs that ever reached a bed compile were refused at 3.3 %, 3.3 % and
+    /// 4.3 % — the check rejecting a gesture it had nothing to say about.
+    ///
+    /// It multiplies the **anchor** tolerance and not the backstop, which is
+    /// the correction this recalibration makes to P4's version of the same
+    /// idea. The backstop now means "the detector is broken", and a broken
+    /// detector is no better a place to put a bed than a cut. The anchor check
+    /// is the one carrying cut-grade precision, so it is the one a gesture
+    /// without a cut in it is allowed to be relaxed against. Twice, and no
+    /// looser: 12.5 % is a quarter-beat anchor displacement, still 2× inside
+    /// the half-beat signature.
     static let decoratingJitterMultiple: Double = 2
 
     /// One phrase, in bars — the unit the slam prefers to land on (see the seam
@@ -219,11 +339,19 @@ enum ScoreCompiler {
     static func compile(_ score: TransitionScore, planned: PlannedTransition,
                         outgoing: TrackAnalysis, incoming: TrackAnalysis,
                         outgoingURL: URL?) -> Compilation {
+        // Set the moment the seam is resolved, and read back by `refuse` — a
+        // refusal that names a jitter percentage without saying *where* it
+        // measured it cannot be checked, and the self-check's whole calibration
+        // is a question about which windows it was reading.
+        var seamSoFar: (outgoing: TimeInterval, incoming: TimeInterval)?
         func refuse(_ reason: String) -> Compilation {
             // The aim rides along even on a refusal: "what did this seam want
             // to land on, and why did it not" is one question, and a report
             // that dropped half of it would be answering the easier one.
-            Compilation(label: score.label, aim: planned.style.aim,
+            Compilation(label: score.label,
+                        seamOutgoing: seamSoFar?.outgoing ?? 0,
+                        seamIncoming: seamSoFar?.incoming ?? 0,
+                        aim: planned.style.aim,
                         aimNote: planned.style.aimDetail,
                         runwayClass: score.runwayClass, refusalReason: reason)
         }
@@ -378,20 +506,21 @@ enum ScoreCompiler {
             }
         }
         let seamOutgoing = outgoingSource(seamOffset)
+        seamSoFar = (seamOutgoing, seamIncoming)
 
-        // --- Grid self-check, both sides: a cut on a drifting grid is a cut on
-        // the wrong beat, and the drift is measurable before anything is
-        // rendered.
-        let jitterLimit = gridJitterTolerance
-            * (score.ownsSeam ? 1 : decoratingJitterMultiple)
+        // --- Grid self-check, layer 1 of 2: the backstop.
+        //
+        // A window statistic, and it is read as one — not "would this cut land
+        // on the beat" (the anchors below answer that) but "is this a bar grid
+        // at all". Both sides, because a score spans both.
         for (label, grid, at) in [("出曲", outDownbeats, seamOutgoing),
                                   ("入曲", inDownbeats, seamIncoming)] {
             guard let jitter = worstJitter(grid, around: at, bars: gridCheckBars)
             else { continue }
-            guard jitter <= jitterLimit else {
-                return refuse(String(format: "%@在交接点附近的小节长度抖动 %.1f%%，超过 %.1f%% 的上限，"
-                                     + "格点不可信。", label, jitter * 100,
-                                     jitterLimit * 100))
+            guard jitter <= gridJitterTolerance else {
+                return refuse(String(format: "[backstop] %@在交接点附近的小节长度抖动 %.1f%%，"
+                                     + "超过 %.1f%% 的上限，这一段的小节线已经不成网格。",
+                                     label, jitter * 100, gridJitterTolerance * 100))
             }
         }
 
@@ -458,6 +587,46 @@ enum ScoreCompiler {
                                      + "整谱作废。", scored.at.bar, offset, overlap))
             }
             placed.append(Placed(event: scored.event.label, at: scored.at, offset: offset))
+        }
+
+        // --- Grid self-check, layer 2 of 2: the anchors.
+        //
+        // The strict half, and the one the cut actually depends on. Every
+        // instant above was placed *on a downbeat the detector reported*, so
+        // what has to be true is not that the neighbourhood is metronomic but
+        // that each downbeat carrying an event is a real one. Checked only
+        // where an event lands: a wobble three bars from anything is not this
+        // gesture's problem, and refusing on it is what the old window check
+        // was doing wrong.
+        //
+        // The seam's own two anchors are always in the list even when no event
+        // sits exactly on `.seam` — every other position on both grids is
+        // counted from them, and the echo throw's engage point and the tension
+        // cut's silence are measured back from `seamOutgoing` rather than
+        // placed, so the seam anchor is the thing vetting them.
+        var anchors: [(label: String, side: Bool, index: Int)] = [
+            ("交接点（入曲）", true, seamIndex), ("交接点（出曲）", false, outSeamIndex),
+        ]
+        for scored in events {
+            let onIncoming = scored.at.bar >= 0
+            anchors.append(("\(scored.event.label) @ bar \(scored.at.bar)", onIncoming,
+                            (onIncoming ? seamIndex : outSeamIndex) + scored.at.bar))
+            // A silence walks back off the seam by up to a whole bar, so the
+            // bar it starts in is an anchor of its own.
+            if case .silence = scored.event { anchors.append(("silence 起点", false,
+                                                              outSeamIndex - 1)) }
+        }
+        let flankLimit = anchorFlankTolerance
+            * (score.ownsSeam ? 1 : decoratingJitterMultiple)
+        var vetted = Set<String>()
+        for anchor in anchors {
+            guard vetted.insert("\(anchor.side)/\(anchor.index)").inserted else { continue }
+            let grid = anchor.side ? inDownbeats : outDownbeats
+            let beats = anchor.side ? incoming.beats : outgoing.beats
+            if let fault = anchorFault(downbeats: grid, beats: beats, index: anchor.index,
+                                       flankTolerance: flankLimit) {
+                return refuse("[anchor] \(anchor.label)：\(fault)")
+            }
         }
 
         // --- The echo throw's anchor, and the discipline P2 puts on it.
@@ -663,6 +832,87 @@ enum ScoreCompiler {
         let median = intervals.sorted()[intervals.count / 2]
         guard median > 1e-6 else { return nil }
         return intervals.map { abs($0 - median) / median }.max()
+    }
+
+    /// **Is the downbeat at `index` one an event may be hung on?** Nil when it
+    /// is; otherwise the sentence saying what is wrong with it.
+    ///
+    /// Four questions, cheapest and most damning first. The first two ask the
+    /// beat grid whether it agrees this is a downbeat at all — free today (see
+    /// `anchorBeatCoincidence`) and the only things that can catch a phase
+    /// error. The last two ask whether the anchor sits where a real bar line
+    /// would: bars of equal length either side of it, and no skipped beat
+    /// inside them.
+    ///
+    /// A grid too short to judge is *not* a fault. The score's span was checked
+    /// against both grids before this runs, and inventing a refusal out of a
+    /// missing neighbour would refuse the first and last bar of every track for
+    /// no evidence at all.
+    static func anchorFault(downbeats: [TimeInterval], beats: [TimeInterval],
+                            index: Int, flankTolerance: Double) -> String? {
+        guard index > 0, index + 1 < downbeats.count else { return nil }
+        let anchor = downbeats[index]
+        let before = anchor - downbeats[index - 1]
+        let after = downbeats[index + 1] - anchor
+        guard before > 1e-6, after > 1e-6 else {
+            return "两侧的小节线不是递增的，这一格不是小节线。"
+        }
+        let bar = (before + after) / 2
+        let beat = bar / Double(TransitionScore.beatsPerBar)
+
+        if !beats.isEmpty, let nearest = nearestIndex(beats, to: anchor) {
+            // 1. The beat grid has to agree there is a beat here at all.
+            let off = abs(beats[nearest] - anchor) / beat
+            guard off <= anchorBeatCoincidence else {
+                return String(format: "小节线离最近的拍点 %.2f 拍，两套网格说的不是同一段音乐，"
+                              + "落刀点可能整整错了半拍。", off)
+            }
+            // 2. …and that the bars either side of it hold a bar's worth.
+            let spans = beats.contains { $0 <= downbeats[index - 1] + 1e-6 }
+                && beats.contains { $0 >= downbeats[index + 1] - 1e-6 }
+            if spans {
+                let bpb = TransitionScore.beatsPerBar
+                for (name, lo, hi) in [("前", downbeats[index - 1], anchor),
+                                       ("后", anchor, downbeats[index + 1])] {
+                    let count = beats.filter { $0 >= lo - 1e-6 && $0 < hi - 1e-6 }.count
+                    guard count == bpb else {
+                        return "\(name)一小节里有 \(count) 拍而不是 \(bpb) 拍，"
+                            + "小节线和拍点对不上，这一格不可信。"
+                    }
+                }
+            }
+        }
+
+        // 3. A mis-placed downbeat shortens the bar before it and lengthens the
+        // one after it by the same amount — this reads that off directly.
+        let flank = abs(before - after) / bar
+        guard flank <= flankTolerance else {
+            return String(format: "前后两小节差 %.1f%%（上限 %.1f%%），"
+                          + "这条小节线大约偏了 %.0f 毫秒，切在这里会掉拍。",
+                          flank * 100, flankTolerance * 100, flank * bar / 2 * 1000)
+        }
+
+        // 4. …and a beat the tracker dropped or doubled inside those two bars
+        // moves every grid point counted off them.
+        if !beats.isEmpty {
+            let local = beats.filter { $0 >= downbeats[index - 1] - 1e-6
+                                       && $0 <= downbeats[index + 1] + 1e-6 }
+            var intervals: [TimeInterval] = []
+            for i in 0..<max(0, local.count - 1) where local[i + 1] > local[i] {
+                intervals.append(local[i + 1] - local[i])
+            }
+            if intervals.count >= 3 {
+                let median = intervals.sorted()[intervals.count / 2]
+                if median > 1e-6,
+                   let worst = intervals.map({ abs($0 - median) / median }).max(),
+                   worst > anchorBeatOutlierTolerance {
+                    return String(format: "锚点所在的两小节里有一个拍间隔偏了 %.0f%%"
+                                  + "（上限 %.0f%%），拍点在这里丢了或多了一个。",
+                                  worst * 100, anchorBeatOutlierTolerance * 100)
+                }
+            }
+        }
+        return nil
     }
 
     /// The outgoing lyric line end nearest `seam`, and only if it is inside

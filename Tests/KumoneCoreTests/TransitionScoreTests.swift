@@ -1340,3 +1340,267 @@ private func aimable(bpm: Double = 120, duration: TimeInterval = 120,
         }
     }
 }
+
+// MARK: - The grid self-check, in two layers
+
+/// The recalibration of `ScoreCompiler`'s grid self-check: a loose window
+/// backstop for "this is not a bar grid", and a strict anchor-local check on
+/// the downbeats that actually carry events.
+///
+/// The layers are tested apart because the bug being fixed was that there was
+/// only one of them. A single window statistic cannot see a mis-detected
+/// downbeat — the tests below synthesize two kinds and the window reads 0 %
+/// jitter through both — and it fires on window-wide wobble that never moves a
+/// cut, because every event here is anchored on a *measured* downbeat rather
+/// than extrapolated from a bar length.
+@Suite struct ScoreGridSelfCheckTests {
+
+    /// An analysis with the two grids given explicitly, so a test can make them
+    /// disagree. `ScoreFixtures.analysis` derives downbeats from beats — which
+    /// is what the shipping analyzer does, and therefore exactly what cannot
+    /// express the fault this check exists for.
+    static func analysis(beats: [TimeInterval], downbeats: [TimeInterval],
+                         bpm: Double = 120, duration: TimeInterval = 30) -> TrackAnalysis {
+        TrackAnalysis(
+            version: TrackAnalysis.currentVersion, bpm: bpm, bpmConfidence: 0.95,
+            beats: beats, downbeats: downbeats, phraseBoundaries: downbeats,
+            rmsEnvelope: [Float](repeating: 0.5, count: Int(duration)),
+            outroFadeStart: nil, introEnd: 0, duration: duration,
+            melProfile: [], keyPitchClass: nil, keyIsMinor: false, keyConfidence: 0,
+            vocalActivity: [Float](repeating: 0.5, count: Int(duration)))
+    }
+
+    /// A clean 120 BPM grid: a beat every 0.5 s, a downbeat every 2 s.
+    static func clean(duration: TimeInterval = 30)
+    -> (beats: [TimeInterval], downbeats: [TimeInterval]) {
+        let beats = stride(from: 0.0, to: duration, by: 0.5).map { $0 }
+        return (beats, stride(from: 0, to: beats.count, by: 4).map { beats[$0] })
+    }
+
+    /// `matchedPlan()` puts the swap 8 s into a 16 s overlap and the incoming
+    /// in point at 0, so the seam lands on the incoming downbeat at 8 s —
+    /// index 4, whose flanking bars are `[6, 8]` and `[8, 10]`.
+    static func compileCut(outgoing: TrackAnalysis,
+                           incoming: TrackAnalysis) -> ScoreCompiler.Compilation {
+        let planned = PlannedTransition(plan: .beatMatched(matchedPlan()),
+                                        style: scoredStyle(.cutOnOne()))
+        return ScoreCompiler.compile(.cutOnOne(), planned: planned,
+                                     outgoing: outgoing, incoming: incoming,
+                                     outgoingURL: nil)
+    }
+
+    // MARK: The relaxation this recalibration is for
+
+    @Test func aWobblyWindowWithASoundAnchorNowCompiles() throws {
+        // The field case, and the whole point of splitting the check: a window
+        // that reads ~5 % because a bar three bars from the cut is long, while
+        // the bar line the cut actually lands on is exact.
+        //
+        // The old single check refused this at 3 % and refused essentially
+        // every score-eligible seam with it. Nothing about the cut is worse
+        // here than on a metronomic grid — `place` reads
+        // `inDownbeats[seamIndex]`, which is 8.0 either way.
+        let drifting = ScoreFixtures.analysis(bpm: 120, jitterAt: 24, jitter: 0.10)
+        let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                incoming: drifting)
+        #expect(c.didCompile, "\(c.refusalReason ?? "")")
+        #expect(abs(c.seamIncoming - 8) < 1e-6)
+
+        // …and the window really is jittery enough that the old cap would have
+        // thrown it away, so this is testing the relaxation and not the absence
+        // of a fault.
+        let jitter = try #require(ScoreCompiler.worstJitter(
+            drifting.downbeats, around: 8, bars: ScoreCompiler.gridCheckBars))
+        #expect(jitter > 0.03 && jitter < ScoreCompiler.gridJitterTolerance,
+                "window CV \(jitter)")
+    }
+
+    // MARK: The backstop
+
+    @Test func theBackstopStillRefusesAGridThatIsNotOne() {
+        // 12.5 % of a bar, four bars from the cut. Past the point where the
+        // detector is describing bars at all, and the layer that says so names
+        // itself.
+        let broken = ScoreFixtures.analysis(bpm: 120, jitterAt: 24, jitter: 0.25)
+        let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                incoming: broken)
+        #expect(!c.didCompile)
+        let reason = c.refusalReason ?? ""
+        #expect(reason.contains("[backstop]"), "\(reason)")
+        #expect(!reason.contains("[anchor]"), "\(reason)")
+    }
+
+    @Test func theBackstopFiresExactlyAtItsCap() {
+        // The cap is a number in a comment until something pins it. Just under
+        // compiles, just over does not — scaled off the constant itself, so the
+        // test cannot drift away from the check.
+        let bar = 2.0
+        for (jitter, shouldCompile) in [(ScoreCompiler.gridJitterTolerance * 0.9, true),
+                                        (ScoreCompiler.gridJitterTolerance * 1.1, false)] {
+            let grid = ScoreFixtures.analysis(bpm: 120, jitterAt: 24, jitter: jitter * bar)
+            let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120), incoming: grid)
+            #expect(c.didCompile == shouldCompile,
+                    "at \(jitter * 100) %: \(c.refusalReason ?? "compiled")")
+        }
+    }
+
+    // MARK: The anchor — a downbeat the beat grid disagrees with
+
+    @Test func aDownbeatGridHalfABeatOutOfPhaseIsCaught() {
+        // **The one unforgivable error, and the one a window statistic is
+        // blind to.** Every downbeat is shifted half a beat off the beats. The
+        // bar lengths are all still exactly 2 s, so the backstop reads 0 %
+        // jitter and has nothing to say; the cut would land squarely on the
+        // and-of-four.
+        //
+        // Today's analyzer cannot produce this — it takes every fourth beat, so
+        // the two grids agree by construction — which is the point: this fails
+        // closed on a corrupt sidecar and on the first analyzer that detects
+        // downbeats independently instead of deriving them.
+        let (beats, downbeats) = Self.clean()
+        let outOfPhase = Self.analysis(beats: beats, downbeats: downbeats.map { $0 + 0.25 })
+        #expect(ScoreCompiler.worstJitter(outOfPhase.downbeats, around: 8,
+                                          bars: ScoreCompiler.gridCheckBars) ?? 1 < 1e-9,
+                "the window has to be clean, or this tests the wrong layer")
+
+        let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                incoming: outOfPhase)
+        #expect(!c.didCompile)
+        let reason = c.refusalReason ?? ""
+        #expect(reason.contains("[anchor]"), "\(reason)")
+        #expect(reason.contains("半拍"), "\(reason)")
+    }
+
+    @Test func aBarHoldingFiveBeatsIsCaught() {
+        // The other way the grids can disagree while every bar stays 2 s long:
+        // the tracker put five beats in the bar the cut lands on. The downbeat
+        // still coincides with a beat, so the phase check passes and the meter
+        // check is the one that has to fire.
+        let (beats, downbeats) = Self.clean()
+        let miscounted = Self.analysis(beats: (beats + [8.25]).sorted(),
+                                       downbeats: downbeats)
+        #expect(ScoreCompiler.worstJitter(miscounted.downbeats, around: 8,
+                                          bars: ScoreCompiler.gridCheckBars) ?? 1 < 1e-9)
+
+        let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                incoming: miscounted)
+        #expect(!c.didCompile)
+        let reason = c.refusalReason ?? ""
+        #expect(reason.contains("[anchor]"), "\(reason)")
+        #expect(reason.contains("5 拍"), "\(reason)")
+    }
+
+    // MARK: The anchor — a beat interval that skipped
+
+    @Test func aBeatIntervalOutlierAtTheAnchorIsCaught() {
+        // Four beats in the bar, on an evenly spaced downbeat grid, but the
+        // tracker clearly lost one: 0.9 s then 0.1 s where 0.5 s belongs. Every
+        // other check passes and the window reads exactly 0 %.
+        let (beats, downbeats) = Self.clean()
+        let skipped = Self.analysis(beats: beats.map { $0 == 8.5 ? 8.9 : $0 },
+                                    downbeats: downbeats)
+        #expect(ScoreCompiler.worstJitter(skipped.downbeats, around: 8,
+                                          bars: ScoreCompiler.gridCheckBars) ?? 1 < 1e-9)
+
+        let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                incoming: skipped)
+        #expect(!c.didCompile)
+        let reason = c.refusalReason ?? ""
+        #expect(reason.contains("[anchor]"), "\(reason)")
+        #expect(reason.contains("拍间隔"), "\(reason)")
+    }
+
+    @Test func theAnchorCheckLooksAtTheAnchorAndNotTheNeighbourhood() {
+        // The same skipped beat, four bars from the cut instead of on it. The
+        // anchor is sound, so the score compiles — a check that refused this
+        // would be the window check again under another name.
+        let (beats, downbeats) = Self.clean()
+        let c = Self.compileCut(
+            outgoing: ScoreFixtures.analysis(bpm: 120),
+            incoming: Self.analysis(beats: beats.map { $0 == 16.5 ? 16.9 : $0 },
+                                    downbeats: downbeats))
+        #expect(c.didCompile, "\(c.refusalReason ?? "")")
+    }
+
+    @Test func aCleanGridPassesBothLayers() {
+        let (beats, downbeats) = Self.clean()
+        let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                incoming: Self.analysis(beats: beats, downbeats: downbeats))
+        #expect(c.didCompile, "\(c.refusalReason ?? "")")
+    }
+
+    // MARK: Which layer fired
+
+    @Test func everyGridRefusalNamesItsLayer() {
+        // A report that only says "the grid was bad" leaves the reader unable
+        // to tell a broken detector from one mis-placed bar line, which are
+        // different problems with different answers.
+        let (beats, downbeats) = Self.clean()
+        let cases: [(String, TrackAnalysis)] = [
+            ("[backstop]", ScoreFixtures.analysis(bpm: 120, jitterAt: 24, jitter: 0.25)),
+            ("[anchor]", Self.analysis(beats: beats,
+                                       downbeats: downbeats.map { $0 + 0.25 })),
+        ]
+        for (layer, incoming) in cases {
+            let c = Self.compileCut(outgoing: ScoreFixtures.analysis(bpm: 120),
+                                    incoming: incoming)
+            #expect(!c.didCompile)
+            #expect(c.refusalReason?.hasPrefix(layer) == true, "\(c.refusalReason ?? "")")
+        }
+    }
+
+    // MARK: The anchor helper, directly
+
+    @Test func theAnchorToleranceIsAFractionOfTheHalfBeatItGuards() {
+        // The derivation, asserted rather than described. A downbeat detected
+        // `δ` off shortens one flanking bar by `δ` and lengthens the other by
+        // `δ`, so the disagreement is `2δ/bar` — half a beat (bar/8) reads
+        // 25 %, and the tolerance is set at an eighth of a beat, 4× inside it.
+        let bar = 2.0
+        #expect(abs(ScoreCompiler.anchorFlankTolerance - 2.0 / 32) < 1e-12)
+        #expect(2 * (bar / 8) / bar / ScoreCompiler.anchorFlankTolerance == 4)
+
+        // And it reads that displacement back off a grid: a downbeat moved by
+        // an eighth of a beat is inside the line, a quarter-beat is over it.
+        //
+        // Moved *earlier*, so that the flank check is what answers. A downbeat
+        // dragged the same distance the other way slides past the beat it sits
+        // on and puts five beats in the bar behind it, which the meter check
+        // catches first — the layers overlap in the direction of a real fault,
+        // which is the right way round, but it makes for a poor unit test of
+        // either one.
+        let (beats, _) = Self.clean()
+        for (shift, faulted) in [(bar / 32 * 0.9, false), (bar / 16, true)] {
+            var downbeats = stride(from: 0.0, to: 30.0, by: 2).map { $0 }
+            downbeats[4] -= shift
+            let fault = ScoreCompiler.anchorFault(
+                downbeats: downbeats, beats: beats, index: 4,
+                flankTolerance: ScoreCompiler.anchorFlankTolerance)
+            #expect((fault != nil) == faulted, "shift \(shift): \(fault ?? "sound")")
+        }
+    }
+
+    @Test func aGridTooShortToJudgeIsNotAFault() {
+        // The score's span is checked against both grids before the anchors
+        // are, so a missing neighbour here means "the first or last bar of the
+        // track", not "a bad anchor". Inventing a refusal out of absent
+        // evidence is the failure mode this whole recalibration is about.
+        let (beats, downbeats) = Self.clean()
+        #expect(ScoreCompiler.anchorFault(downbeats: downbeats, beats: beats, index: 0,
+                                          flankTolerance: 0.0625) == nil)
+        #expect(ScoreCompiler.anchorFault(downbeats: downbeats, beats: [], index: 4,
+                                          flankTolerance: 0.0625) == nil)
+        #expect(ScoreCompiler.anchorFault(downbeats: [], beats: beats, index: 0,
+                                          flankTolerance: 0.0625) == nil)
+    }
+
+    @Test func aDecoratingScoreIsLoosenedOnTheAnchorAndNotTheBackstop() {
+        // P4's relaxation, moved onto the layer that carries cut-grade
+        // precision. A bed does not need the cut's tolerance at its landing —
+        // but a bar grid the detector has lost is no better a place for a bed
+        // than for a cut, so the backstop is not doubled for anybody.
+        #expect(ScoreCompiler.decoratingJitterMultiple == 2)
+        #expect(ScoreCompiler.anchorFlankTolerance * ScoreCompiler.decoratingJitterMultiple
+                < 2 * (2.0 / 8) / 2.0, "a doubled anchor line must stay inside a half beat")
+    }
+}

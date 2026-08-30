@@ -275,6 +275,8 @@ audition serve  [--corpus DIR] [--port 8766] [--host 127.0.0.1,10.147.19.10]
 audition sweep  <corpusDir> [-o report.md] [--set name=value,...]
 audition order  <cacheOrCorpusDir> [-o report.md] [--window 4] [--limit N]
                 [--candidates 6] [--low-dir DIR] [--set ...] [--order-set ...]
+audition grid   <cacheOrCorpusDir> [--limit N] [--all-pairs] [--band LO:HI]
+                [--set ...]
 audition knobs  [--json]
 ```
 
@@ -341,6 +343,73 @@ tier read off a low-bitrate analysis — which is all the *scorer* ever sees —
 matches the one read off the playback file the *plan* is built on. Without it
 the check runs on any track the corpus itself holds at two quality levels, and
 says so when there are none.
+
+### `grid` — what the score compiler's self-check is calibrated on
+
+`ScoreCompiler` refuses to place a score on a bar grid it does not trust. `grid`
+is the measurement behind the two numbers that decision turns on, kept as a
+command so they can be re-derived instead of believed.
+
+The mode exists because the first version of that check was calibrated on the
+wrong population. It capped the worst bar-length deviation in a window either
+side of the seam at 3 %, a figure taken from 214 generic **whole-track**
+windows (median 1.0 %, p95 3.3 %). But a score never lands in the middle of a
+track — it lands where the planner put the out point, in the outro
+neighbourhood, and where it put the in point, in the intro neighbourhood, and
+those edges jitter for musical reasons that a whole-track statistic averages
+away. Measured on exactly those windows across the owner's cache (86 analyzed
+tracks, 752 windows):
+
+```
+median 1.60 %   p75 3.36 %   p90 6.29 %   p95 8.11 %   p99 12.55 %
+```
+
+A 3 % cap sits at the p73 of the population it is applied to. It refused 29 %
+of all edge windows by construction, which in the field meant refusing
+essentially every score-eligible seam — 3.6 %, 4.2 % and 10 % on one day's
+listening, of which only the last was a real finding.
+
+So the check is now two checks, and `grid` reports both:
+
+- **the backstop** — the same window statistic, capped at the edge
+  distribution's p95 (8 %). It answers "is this a bar grid at all", nothing
+  finer. Deliberately loose.
+- **the anchor check** — the strict one, and the one a cut depends on. Every
+  event a score places is anchored on a *measured* downbeat, so window-wide
+  jitter does not displace it; what can is a mis-detected downbeat at the
+  anchor itself. A downbeat detected `δ` off shortens the bar before it by `δ`
+  and lengthens the bar after it by `δ`, so the flanking-bar disagreement
+  `2δ/bar` reads that displacement directly. Half a beat — the one error a cut
+  cannot survive — is 25 %; the tolerance is set at an eighth of a beat, 6.25 %,
+  a 4× margin. Over the same windows that disagreement runs median 0.68 %,
+  p95 6.47 %, so the line costs sound material almost nothing.
+
+`--all-pairs` compiles a plain `cutOnOne` on every ordered pair the cache can
+make rather than only the alphabetical adjacency, and tables the verdict by
+jitter band — which is the whole design in one table:
+
+```
+seam window CV    seams   compiled   refused by anchor / backstop
+  0 – 3 %          334      100 %          0     0
+  3 – 5 %           63       95 %          3     0
+  5 – 8 %          106       91 %         10     0
+  8 – 10 %          43        0 %          0    43
+ 10 %+              71        0 %          0    71
+```
+
+The old cap admitted the first row and nothing else — half of all seams. The
+split admits 73 %, and the seams it newly lets through are vetted one anchor at
+a time rather than by the window they happen to sit in: 13 of them are still
+refused, by the layer that can actually see a mis-placed downbeat. Nothing at
+8 % or over compiles either way.
+
+`--band LO:HI` lists the individual seams inside a band with the verdict on
+each, which is how a jitter figure read off a console gets traced back to the
+two tracks that produced it. Every refusal names its layer — `[anchor]` or
+`[backstop]` — so a report can never say only "the grid was bad", which leaves
+a broken detector and one mis-placed bar line looking identical.
+
+Offline and read-only like `intent` and `order`: sidecars only, never analyzes.
 
 ### `sweep` — what the structure layer moved
 

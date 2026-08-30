@@ -69,6 +69,7 @@ usage:
                   [--candidates 6] [--low-dir DIR] [--bench]
                   [--set ...] [--order-set ...]
   audition intent <cacheOrCorpusDir> [--limit N] [--set ...]
+  audition grid   <cacheOrCorpusDir> [--limit N] [--all-pairs] [--set ...]
   audition knobs  [--json]
 
   intent    classify the material (docs/automix-score-predev.md §2.4). Two
@@ -84,6 +85,31 @@ usage:
             never renders. This is the gate to read **before** listening — a
             wrong bucket is cheap on paper and expensive in the ears.
             --limit   use only the first N tracks of the schedule
+
+  grid      measure the population `ScoreCompiler`'s grid self-check is
+            calibrated on, and re-derive both its layers' numbers. Three
+            tables: the bar-length CV of every **edge** window in the corpus
+            (the outro neighbourhood out points come from, the intro
+            neighbourhood in points come from — the only places a score ever
+            lands, and much jitterier than the whole-track windows the original
+            3 % cap was calibrated on); the anchor-local measures over the same
+            windows (the flanking-bar disagreement and the beat outlier the
+            strict layer reads); and a plain `cutOnOne` compiled on every
+            adjacent beat-matched pair with the layer that refused it named.
+            `scoreEnabled` is forced on for the run. Offline and read-only —
+            sidecars only, never analyzes. Point it at
+            ~/Library/Caches/Kumone/Audio.
+            --limit      use only the first N tracks of the schedule
+            --all-pairs  compile every *ordered* pair rather than only the
+                         alphabetical adjacency, and table the verdict by
+                         jitter band instead of per seam. The order a corpus
+                         directory implies is nobody's listening order, so this
+                         is the sample to read when the question is what the
+                         check does to the seams a listener actually reaches.
+            --band LO:HI list the seams whose seam-window jitter falls between
+                         LO and HI per cent, with the verdict on each — how a
+                         percentage someone read off a console is traced back
+                         to the pair that produced it. Needs --all-pairs.
 
   order     run the AutoMix queue-reorder greedy over a directory of locally
             cached, already analyzed tracks and table what it did to the tier
@@ -1467,6 +1493,163 @@ func runIntent(_ args: Arguments) {
                      : 100 * Double(report.movedPairs) / Double(report.pairs.count)))
 }
 
+func runGrid(_ args: Arguments) {
+    guard let dirArg = args.positional.first else { fail(usage) }
+    let corpus = url(dirArg)
+    let all = analyzedCorpus(corpus)
+    guard all.count >= 2 else {
+        fail("need at least two analyzed tracks in \(corpus.path) (found \(all.count)); "
+             + "`grid` never analyzes — it reads `.analysis.json` sidecars")
+    }
+    // One row per track at its best cached quality, exactly as `intent` and
+    // `order` do it: three bitrates of one song would triple-count its grid.
+    var byTrack: [String: [(level: String, url: URL)]] = [:]
+    var schedule: [URL] = []
+    for file in all {
+        if let parts = cacheKeyParts(file) {
+            byTrack[parts.trackID, default: []].append((parts.level, file))
+        } else {
+            schedule.append(file)
+        }
+    }
+    for (_, entries) in byTrack {
+        schedule.append(entries.sorted { levelRank($0.level) < levelRank($1.level) }.last!.url)
+    }
+    schedule.sort { $0.lastPathComponent < $1.lastPathComponent }
+    if let limit = args.double("limit").map({ Int($0) }), limit > 0, limit < schedule.count {
+        schedule = Array(schedule.prefix(limit))
+    }
+
+    let report: Audition.GridReport
+    do {
+        report = try Audition.gridReport(files: schedule,
+                                         allPairs: args.flags["all-pairs"] != nil,
+                                         config: configOverrides(args))
+    } catch {
+        fail("grid: \(error.localizedDescription)")
+    }
+
+    func percentile(_ values: [Double], _ p: Double) -> Double {
+        guard !values.isEmpty else { return .nan }
+        let sorted = values.sorted()
+        let k = (Double(sorted.count) - 1) * p / 100
+        let lo = Int(k), hi = min(lo + 1, sorted.count - 1)
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * (k - Double(lo))
+    }
+    func pad(_ s: String, _ width: Int) -> String {
+        let clipped = String(s.prefix(width))
+        return clipped + String(repeating: " ", count: max(0, width - clipped.count))
+    }
+    func dist(_ name: String, _ values: [Double?]) {
+        let v = values.compactMap { $0 }
+        guard !v.isEmpty else { print("  " + pad(name, 24) + " —"); return }
+        print("  " + pad(name, 24)
+              + String(format: "n=%4d  med %5.2f%%  p75 %5.2f%%  p90 %5.2f%%  "
+                       + "p95 %5.2f%%  p99 %5.2f%%  max %6.2f%%", v.count,
+                       percentile(v, 50) * 100, percentile(v, 75) * 100,
+                       percentile(v, 90) * 100, percentile(v, 95) * 100,
+                       percentile(v, 99) * 100, (v.max() ?? 0) * 100))
+    }
+
+    let exit = report.windows.filter { $0.side == "exit" }
+    let entry = report.windows.filter { $0.side == "entry" }
+    print("\nedge-window bar-length CV — \(report.windows.count) windows "
+          + "(\(exit.count) exit / \(entry.count) entry)")
+    print("  the population the backstop is calibrated on. A score lands here and")
+    print("  nowhere else, so this — not a whole-track statistic — is the tail to cut.")
+    dist("EXIT (outro side)", exit.map(\.windowCV))
+    dist("ENTRY (intro side)", entry.map(\.windowCV))
+    dist("all edge windows", report.windows.map(\.windowCV))
+
+    print("\nanchor-local measures over the same windows")
+    print("  what the strict layer reads: the two bars touching the anchoring downbeat.")
+    dist("flanking bar disagree", report.windows.map(\.anchorFlank))
+    dist("beat outlier @ anchor", report.windows.map(\.anchorBeatOutlier))
+
+    let cvs = report.windows.compactMap(\.windowCV)
+    let overBackstop = cvs.filter { $0 > report.backstopTolerance }.count
+    let faulted = report.windows.filter { $0.anchorFault != nil }.count
+    print(String(format: "\n  backstop  > %.0f%%  refuses %d/%d edge windows (%.1f %%)",
+                 report.backstopTolerance * 100, overBackstop, cvs.count,
+                 cvs.isEmpty ? 0 : 100 * Double(overBackstop) / Double(cvs.count)))
+    print(String(format: "  anchor    > %.2f%% flank  refuses %d/%d anchors (%.1f %%)",
+                 report.anchorFlankTolerance * 100, faulted, report.windows.count,
+                 report.windows.isEmpty ? 0
+                     : 100 * Double(faulted) / Double(report.windows.count)))
+    let oldCap = 0.03
+    let overOld = cvs.filter { $0 > oldCap }.count
+    print(String(format: "  (the 3 %% cap this replaced refused %d/%d = %.1f %% of the same "
+                 + "windows)", overOld, cvs.count,
+                 cvs.isEmpty ? 0 : 100 * Double(overOld) / Double(cvs.count)))
+
+    func padLeft(_ s: String, _ width: Int) -> String {
+        String(repeating: " ", count: max(0, width - s.count)) + String(s.prefix(width))
+    }
+    func cv(_ v: Double?) -> String {
+        padLeft(v.map { String(format: "%.1f%%", $0 * 100) } ?? "—", 6)
+    }
+    let scored = report.pairs.filter { $0.planKind == "beatMatched" }
+    let everyPair = args.flags["all-pairs"] != nil
+    print("\ncutOnOne on \(everyPair ? "every ordered pair" : "every adjacent pair") — "
+          + "\(report.pairs.count) seams, \(scored.count) beat-matched")
+    print("  seam-out/seam-in are the backstop's own windows, around the snapped seam —")
+    print("  not the planner's cue points, which the aim and the phrase snap move off.")
+
+    // The seam's worst side is what the backstop actually decides on, so that
+    // is the number a seam is filed under here.
+    func worst(_ p: Audition.GridPairRow) -> Double? {
+        [p.exitCV, p.entryCV].compactMap { $0 }.max()
+    }
+    if everyPair {
+        // Too many rows to print, so the shape instead: what the check does
+        // across the whole cross product, banded by the jitter it is reading.
+        dist("seam window CV", scored.map(worst))
+        print("\n  verdict by seam jitter band")
+        for (lo, hi) in [(0.0, 0.03), (0.03, 0.05), (0.05, 0.08), (0.08, 0.10), (0.10, 1.0)] {
+            let band = scored.filter { (worst($0) ?? -1) >= lo && (worst($0) ?? -1) < hi }
+            guard !band.isEmpty else { continue }
+            let ok = band.filter(\.compiled).count
+            let anchor = band.filter { $0.refusal?.contains("[anchor]") == true }.count
+            let back = band.filter { $0.refusal?.contains("[backstop]") == true }.count
+            print(String(format: "    %4.1f–%4.1f%%  n=%4d   compiled %4d (%3.0f %%)   "
+                         + "anchor %3d   backstop %3d   other %3d",
+                         lo * 100, hi * 100, band.count, ok,
+                         100 * Double(ok) / Double(band.count), anchor, back,
+                         band.count - ok - anchor - back))
+        }
+        // A band is a count until you can see which seams are in it. `--band
+        // 3.4:3.8` is how a jitter figure someone read off a console gets
+        // traced back to the two tracks that produced it.
+        if let spec = args.flags["band"] {
+            let ends = spec.split(separator: ":").compactMap { Double($0) }
+            if ends.count == 2 {
+                let rows = scored.filter {
+                    guard let w = worst($0) else { return false }
+                    return w >= ends[0] / 100 && w <= ends[1] / 100
+                }
+                print("\n  seams with a \(spec) % seam window — \(rows.count)")
+                for pair in rows.prefix(40) {
+                    print("  " + pad(pair.outgoing, 28) + " → " + pad(pair.incoming, 28)
+                          + "  seam-out " + cv(pair.exitCV) + "  seam-in " + cv(pair.entryCV)
+                          + "  " + (pair.compiled ? "compiled" : "REFUSED"))
+                    if let refusal = pair.refusal { print("      · \(refusal)") }
+                }
+            }
+        }
+    } else {
+        for pair in scored {
+            print("  " + pad(pair.outgoing, 28) + " → " + pad(pair.incoming, 28)
+                  + "  seam-out " + cv(pair.exitCV) + "  seam-in " + cv(pair.entryCV)
+                  + "  " + (pair.compiled ? "compiled" : "REFUSED"))
+            if let refusal = pair.refusal { print("      · \(refusal)") }
+        }
+    }
+    let compiled = scored.filter(\.compiled).count
+    print(String(format: "\n  %d of %d beat-matched seams compile (%.0f %%)",
+                 compiled, scored.count,
+                 scored.isEmpty ? 0 : 100 * Double(compiled) / Double(scored.count)))
+}
+
 func runOrder(_ args: Arguments) {
     guard let dirArg = args.positional.first else { fail(usage) }
     let corpus = url(dirArg)
@@ -1764,6 +1947,7 @@ case "serve": runServe(args)
 case "sweep": runSweep(args)
 case "order": runOrder(args)
 case "intent": runIntent(args)
+case "grid": runGrid(args)
 case "knobs": runKnobs(args)
 case "-h", "--help", "help": print(usage)
 default: fail("unknown command '\(command)'\n\n" + usage)
