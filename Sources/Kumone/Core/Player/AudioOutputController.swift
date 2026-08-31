@@ -29,6 +29,15 @@ final class AudioOutputController: ObservableObject {
     private var resolvedDeviceID: AudioDeviceID?
     private var listening = false
 
+    /// When a hardware-driven route change is allowed to reach the engine;
+    /// see `OutputRouteChangeDamper` for what it is defending against.
+    private var damper = OutputRouteChangeDamper()
+    /// The single pending "ask the damper again" timer.
+    private var settleTask: Task<Void, Never>?
+    /// The breaker opening this controller has already journalled, so a held
+    /// route says so once rather than on every suppressed change.
+    private var announcedBreakerUntil: Date?
+
     private init() {}
 
     /// The name shown on the button/menu label: the chosen device, or the
@@ -63,16 +72,17 @@ final class AudioOutputController: ObservableObject {
             installListeners()
             let restored = AudioOutputSelection(
                 storageValue: SettingsManager.shared.outputDeviceUID)
-            handle(state.restore(restored, from: devices))
+            handle(state.restore(restored, from: devices), damped: false)
         } else {
             apply(resolvedDeviceID)
+            damper.noteApplied(effectiveTarget())
         }
     }
 
     /// The user picked a menu row.
     func select(_ selection: AudioOutputSelection) {
         refreshDevices()
-        handle(state.select(selection, from: devices))
+        handle(state.select(selection, from: devices), damped: false)
     }
 
     // MARK: - Internals
@@ -82,7 +92,11 @@ final class AudioOutputController: ObservableObject {
         if next != devices { devices = next }
     }
 
-    private func handle(_ outcome: AudioOutputSelectionState.Outcome) {
+    /// Menu state and persistence always follow the outcome immediately; only
+    /// the engine-side route change is ever held back, and `damped` says
+    /// whether this outcome is eligible for that.
+    private func handle(_ outcome: AudioOutputSelectionState.Outcome, damped: Bool) {
+        var lost = false
         switch outcome {
         case .followDefault:
             resolvedDeviceID = nil
@@ -90,12 +104,69 @@ final class AudioOutputController: ObservableObject {
             resolvedDeviceID = device.id
         case .lost(let name):
             resolvedDeviceID = nil
+            lost = true
             ToastCenter.shared.show(
                 String(localized: "“\(name)”已断开，已切换到系统默认输出"))
         }
         selection = state.selection
         SettingsManager.shared.outputDeviceUID = selection.storageValue
-        apply?(resolvedDeviceID)
+
+        // A vanished device is silence until we move, so it jumps the queue
+        // however badly the hardware is behaving.
+        guard damped, !lost else {
+            perform(damper.userSelected(effectiveTarget(), at: Date()))
+            return
+        }
+        perform(damper.hardwareChanged(to: effectiveTarget(), at: Date()))
+    }
+
+    /// The concrete device the engine should be on right now. Resolving
+    /// `.systemDefault` here rather than leaving it to
+    /// `PlaybackEngine.applyOutputDeviceLocked` is what lets the damper hold a
+    /// route: a held `nil` would just be re-resolved to the flapping device.
+    private func effectiveTarget() -> AudioDeviceID? {
+        resolvedDeviceID ?? AudioOutputDevices.defaultDeviceID()
+    }
+
+    private func perform(_ decision: OutputRouteChangeDamper.Decision) {
+        switch decision {
+        case .ignore:
+            break
+        case .apply(let id):
+            settleTask?.cancel()
+            settleTask = nil
+            announcedBreakerUntil = nil
+            apply?(id)
+        case .coalesce(let fireAt):
+            scheduleSettle(at: fireAt)
+        case .suppressed(let retryAt):
+            if announcedBreakerUntil != retryAt {
+                announcedBreakerUntil = retryAt
+                PlaybackJournal.note("output device change suppressed (flapping)")
+            }
+            scheduleSettle(at: retryAt)
+        }
+    }
+
+    private func scheduleSettle(at date: Date) {
+        settleTask?.cancel()
+        let delay = max(0, date.timeIntervalSinceNow)
+        settleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.settleFired()
+        }
+    }
+
+    /// The settle window (or the breaker's backoff) elapsed. Re-read the route
+    /// first: the whole point of waiting was to act on where the hardware ended
+    /// up, not on where it was when the storm started.
+    private func settleFired() {
+        settleTask = nil
+        let now = Date()
+        refreshDevices()
+        _ = damper.hardwareChanged(to: effectiveTarget(), at: now)
+        perform(damper.settled(at: now))
     }
 
     /// Device arrivals/departures, plus default-output changes (which matter
@@ -121,7 +192,7 @@ final class AudioOutputController: ObservableObject {
 
     private func hardwareChanged() {
         refreshDevices()
-        handle(state.reconcile(with: devices))
+        handle(state.reconcile(with: devices), damped: true)
     }
 }
 #endif
