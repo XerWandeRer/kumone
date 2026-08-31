@@ -889,6 +889,16 @@ final class PlayerService: ObservableObject {
 
         consecutiveFailures = 0
         servedQuality = resolved.level
+        // The one line that would have caught the silent quality fallback: a
+        // preferred-level refusal degrades to `standard`, which now always
+        // cache-hits the escalation's scoring copy — a whole muffled song with
+        // clean engine telemetry. Journal the level actually served, every
+        // start, so "整首闷" is answerable with one grep.
+        PlaybackJournal.note(
+            "now playing id=\(track.id) level=\(resolved.level ?? "?") "
+            + "wanted=\(SettingsManager.shared.audioQuality.rawValue) "
+            + (resolved.unblockSource.map { "unblock=\($0) " } ?? "")
+            + (resolved.isTrial ? "trial " : ""))
         unblockSource = resolved.unblockSource
         if let source = resolved.unblockSource {
             ToastCenter.shared.show(String(localized: "已使用第三方音源：\(source)"))
@@ -1958,6 +1968,10 @@ final class PlayerService: ObservableObject {
         currentRemoteURL = nil
         currentAnalysis = prefetchedNext?.analysis
         servedQuality = prefetchedNext?.level
+        // Same telemetry as the direct-start path: most tracks arrive here.
+        PlaybackJournal.note(
+            "now playing id=\(next.id) level=\(prefetchedNext?.level ?? "?") "
+            + "wanted=\(SettingsManager.shared.audioQuality.rawValue) via=handover")
         unblockSource = prefetchedNext?.unblockSource
         isTrial = false
         isPlaying = true
