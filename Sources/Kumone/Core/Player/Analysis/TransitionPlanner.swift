@@ -899,25 +899,84 @@ enum TransitionPlanner {
         // The reason the layer is allowed to *subtract* where aiming may only
         // *choose* is that subtraction is the safe direction: the worst a wrong
         // restraint can do is play today's shorter hand-over.
-        let intent: TransitionIntent? = config.intentEnabled
-            ? TransitionIntent.classify(
-                outgoing: outgoing, incoming: incoming,
-                // The edge windows, anchored on the geometry the candidate
-                // layer has already proposed — the best out-point candidate and
-                // the chosen in point. Not the final seam (that is what the
-                // beat-match search is about to decide), but the same part of
-                // each song to within a bar or two, and a whole-track statistic
-                // would answer a different question entirely.
-                outgoingEdge: .outgoing(outgoing,
-                                        exitAt: candidates.points.first
-                                            ?? outgoing.outroFadeStart ?? outgoing.duration,
-                                        config: config),
-                incomingEdge: .incoming(incoming, entryAt: inChoice.point, config: config),
-                context: context, config: config)
+        //
+        // The edge windows, anchored on the geometry the candidate layer has
+        // already proposed — the best out-point candidate and the chosen in
+        // point. Not the final seam (that is what the beat-match search is
+        // about to decide), but the same part of each song to within a bar or
+        // two, and a whole-track statistic would answer a different question
+        // entirely. Held in locals because the stem request below is the *same*
+        // finding as the reason sentence, read off the same two profiles.
+        let outgoingEdge: MaterialProfile? = config.intentEnabled
+            ? .outgoing(outgoing,
+                        exitAt: candidates.points.first
+                            ?? outgoing.outroFadeStart ?? outgoing.duration,
+                        config: config)
             : nil
+        let incomingEdge: MaterialProfile? = config.intentEnabled
+            ? .incoming(incoming, entryAt: inChoice.point, config: config)
+            : nil
+        let intent: TransitionIntent? = {
+            guard config.intentEnabled, let outgoingEdge, let incomingEdge else { return nil }
+            return TransitionIntent.classify(
+                outgoing: outgoing, incoming: incoming,
+                outgoingEdge: outgoingEdge, incomingEdge: incomingEdge,
+                context: context, stems: stems, config: config)
+        }()
         if let intent {
             _ = note(&trace, .intent, "intentClass", intent.class != .standDown,
                      intent.budget, nil, intent.label)
+        }
+        // --- The intent-driven stem request (the P3→S1 seam).
+        //
+        // The intent layer's rule 6 can find that both edges are sung and say
+        // so; until now nothing acted on it, because the stem layer qualified
+        // an out point on `stemVocalActiveRatio` (1.15) — "is this window a
+        // vocal hot spot", an S1 question — and an ordinary sung edge sits at
+        // 1.0–1.1 and never clears it. So the one case `.vocalExchange` was
+        // built for, two vocal-active windows with a hand-over to orchestrate
+        // between them, was the case it could not be reached from.
+        //
+        // When the finding fires on a `blend` and a separator is ready, the
+        // planner therefore *requests* the exchange, and the request carries
+        // the intent layer's own definition of "sung"
+        // (`intentInstrumentalEdgeRatio`) down to the stem search in place of
+        // the hot-spot pair. Not a second definition of singing: the same
+        // number rule 5 already refuses to cut above.
+        //
+        // Everything else the stem layer insists on is untouched —
+        // `stemMinOverlap`, the tail-window/out-point geometry, the stability
+        // bars on the 8/16-bar upgrades — and the request still has to *find* a
+        // qualifying out point in the real overlap window; it is a relaxed
+        // threshold, not a bypass of the search. Downstream, `.vocalExchange`
+        // remains a marker that `Audition.decide` compiles against the outgoing
+        // lyrics and degrades, visibly, to `.vocalDuck` when there is nothing to
+        // hand over on.
+        //
+        // Restricted to `.blend` on purpose. `cutCulture` cannot produce the
+        // finding (it requires instrumental edges), `restrained` and
+        // `standDown` are the two classes that exist to spend *less* gesture,
+        // and `dropAlign` is aiming at a drop rather than managing two voices.
+        let intentVocalRequest: Double? = {
+            guard let intent, intent.class == .blend, stems == .ready,
+                  let outgoingEdge, let incomingEdge,
+                  TransitionIntent.bothEdgesSung(outgoingEdge, incomingEdge,
+                                                 config: config) != nil
+            else { return nil }
+            return config.intentInstrumentalEdgeRatio
+        }()
+        if config.intentEnabled {
+            _ = note(&trace, .intent, "intentStemRequest", intentVocalRequest != nil,
+                     intentVocalRequest, config.stemVocalActiveRatio,
+                     intentVocalRequest != nil
+                         ? String(format: "both edges sung on a blend and a separator is ready — "
+                                  + "vocalExchange requested at the intent layer's own %.2f "
+                                  + "line instead of the %.2f hot-spot gate",
+                                  config.intentInstrumentalEdgeRatio,
+                                  config.stemVocalActiveRatio)
+                         : (stems == .ready
+                            ? "no vocal-managed blend to request an exchange for"
+                            : "no separator available, so the stem layer is not asked"))
         }
         // `standDown` **is** the plain path, not a shorter version of the
         // AutoMix one: `.plain(.gapless)` is precisely what this function
@@ -941,7 +1000,8 @@ enum TransitionPlanner {
         if tier == .compatible, !restrained {
             matched = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
                                       candidates: candidates.points, inAnchor: inChoice.point,
-                                      stems: stems, config: config, trace: &trace)
+                                      stems: stems, intentVocalRequest: intentVocalRequest,
+                                      config: config, trace: &trace)
         } else if trace != nil {
             // The tier already ended this pair's beat-match hopes, so the rest
             // of the chain never runs for real. Walk it anyway into a side
@@ -952,7 +1012,8 @@ enum TransitionPlanner {
             var shadow: PlanTrace? = PlanTrace()
             _ = beatMatchedPlan(outgoing: outgoing, incoming: incoming,
                                 candidates: candidates.points, inAnchor: inChoice.point,
-                                stems: stems, config: config, trace: &shadow)
+                                stems: stems, intentVocalRequest: intentVocalRequest,
+                                config: config, trace: &shadow)
             trace?.shadowGates = shadow?.gates ?? []
         }
         // One last structure note, once the seam is final: whether the point
@@ -1080,7 +1141,8 @@ enum TransitionPlanner {
         if restrained { cap = Swift.min(cap, config.neutralOverlapCap) }
         let crossfade = crossfadePlan(outgoing: outgoing, incoming: incoming,
                                       candidates: candidates.points, inPoint: inChoice.point,
-                                      tierCap: cap, tier: tier, stems: stems, config: config)
+                                      tierCap: cap, tier: tier, stems: stems,
+                                      intentVocalRequest: intentVocalRequest, config: config)
         // Same composition rule as above: the stem technique never replaces
         // the outro effect or the staged-EQ decision, it sits beneath them.
         // So a ducked vocal under a filter sweep is a swept exit whose vocal
@@ -1360,12 +1422,44 @@ enum TransitionPlanner {
     /// Pick a vocal-carrying out point out of `candidates` (tail-window phrase
     /// boundaries that fit `overlap`, best-scored first) and name the technique
     /// its structure implies; nil when nothing here is worth a separation pass.
+    /// - Parameter intentVocalRequest: non-nil when the intent layer found both
+    ///   edges sung on a `blend` and a separator is ready — the value is the
+    ///   layer's own "sung" line (`intentInstrumentalEdgeRatio`), which stands
+    ///   in for the two hot-spot thresholds on this path only. Nil (every
+    ///   `intentEnabled == false` call, and every other class) leaves the rules
+    ///   exactly as they were.
     private static func stemChoice(
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
         candidates: [TimeInterval], inPoint: TimeInterval, overlap: TimeInterval,
-        tier: CompatibilityTier, config: Config
+        tier: CompatibilityTier, intentVocalRequest: Double? = nil, config: Config
     ) -> StemChoice? {
         guard overlap >= config.stemMinOverlap else { return nil }
+
+        // --- The intent request, checked first and only ever *additive*: if it
+        // does not produce an exchange it falls through to the rules below,
+        // unchanged, rather than handing the relaxed line to `acapellaOver`.
+        // The request is for one technique, so it may only ever grant that one.
+        //
+        // Both lines move together, and both have to. 1.15 and 1.10 are S1
+        // hot-spot numbers — "is this window noticeably more sung than the song
+        // is on average" — and the question this path asks is the simpler one
+        // the exchange was actually built around: is anyone singing on either
+        // side of the seam. The field's confirmed case measured 1.06/1.04 and
+        // cleared neither number, which is precisely why it arrived as
+        // `stem=none` under a reason sentence promising vocal management.
+        //
+        // Measured on the real seam windows, not inherited from the intent
+        // layer's edge windows: the finding licenses the request, the geometry
+        // still has to be there where the hand-over will actually happen.
+        if let line = intentVocalRequest,
+           let outPoint = candidates.first(where: {
+               (vocalScore(outgoing, from: $0, length: overlap) ?? 0) >= line
+           }),
+           let incomingScore = vocalScore(incoming, from: inPoint, length: overlap),
+           incomingScore > line {
+            return StemChoice(outPoint: outPoint, technique: .vocalExchange)
+        }
+
         // Best-scored boundary that actually carries the outgoing vocal — the
         // exact opposite of the whole-mix rule below, which prefers a window
         // where the vocals have already finished.
@@ -2135,7 +2229,7 @@ enum TransitionPlanner {
     private static func beatMatchedPlan(
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
         candidates: [TimeInterval], inAnchor: TimeInterval,
-        stems: StemAvailability, config: Config,
+        stems: StemAvailability, intentVocalRequest: Double? = nil, config: Config,
         trace: inout PlanTrace?
     ) -> (plan: BeatMatchedPlan, stem: StemTechnique?)? {
         guard note(&trace, .beatMatch, "bpmConfidence",
@@ -2379,7 +2473,8 @@ enum TransitionPlanner {
                     outgoing: outgoing, incoming: incoming,
                     candidates: stemCandidates(outgoing, candidates: candidates,
                                                overlap: overlap, config: config),
-                    inPoint: inPoint, overlap: overlap, tier: .compatible, config: config)
+                    inPoint: inPoint, overlap: overlap, tier: .compatible,
+                    intentVocalRequest: intentVocalRequest, config: config)
             else { continue }
             if candidate > 4 {
                 guard isStable(outgoing, outgoing.rmsEnvelope, from: choice.outPoint,
@@ -2526,7 +2621,7 @@ enum TransitionPlanner {
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
         candidates: [TimeInterval], inPoint: TimeInterval,
         tierCap: TimeInterval, tier: CompatibilityTier,
-        stems: StemAvailability, config: Config
+        stems: StemAvailability, intentVocalRequest: Double? = nil, config: Config
     ) -> (plan: TransitionPlan, stem: StemTechnique?) {
         // `inPoint` is the structure layer's answer (`inPointChoice`), which is
         // `introEnd` whenever there is no structure to read — and it is the same
@@ -2568,7 +2663,8 @@ enum TransitionPlanner {
             outgoing: outgoing, incoming: incoming,
             candidates: stemCandidates(outgoing, candidates: candidates,
                                        overlap: fade, config: config),
-            inPoint: inPoint, overlap: fade, tier: tier, config: config) {
+            inPoint: inPoint, overlap: fade, tier: tier,
+            intentVocalRequest: intentVocalRequest, config: config) {
             return (.crossfade(duration: fade, outPoint: choice.outPoint, inPoint: inPoint),
                     choice.technique)
         }

@@ -326,6 +326,130 @@ import Foundation
         }
     }
 
+    /// The same pin with a separator in the room — the case the intent-driven
+    /// stem request added. With the layer off, the stem layer is governed by
+    /// `stemVocalActiveRatio` alone, exactly as it was before P3, and no
+    /// intent knob (`intentInstrumentalEdgeRatio` above all) may reach it.
+    @Test func withTheLayerOffTheStemRulesAreTheOldOnes() {
+        var absurd = TransitionPlanner.Config.standard
+        absurd.intentEnabled = false
+        absurd.intentInstrumentalEdgeRatio = 0.01   // "everything is sung"
+        absurd.intentEdgeWindowSeconds = 5
+        absurd.intentHardGridCV = 0.9
+
+        let fixtures: [(TrackAnalysis, TrackAnalysis)] = [
+            // Ordinary sung edges: ratio 1.0 on both sides — over the intent
+            // layer's line, under the 1.15 hot-spot gate. The pair the request
+            // exists for, and the one that must not move with the layer off.
+            (makeAnalysis(vocalActivity: flatVocal(240, level: 0.8)),
+             makeAnalysis(bpm: 130, vocalActivity: flatVocal(240, level: 0.8))),
+            (makeAnalysis(vocalActivity: edgesInstrumental(240)),
+             makeAnalysis(vocalActivity: edgesInstrumental(240))),
+            (makeAnalysis(), makeAnalysis(bpm: 130)),
+        ]
+        for (outgoing, incoming) in fixtures {
+            let shipped = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                                 stems: .ready)
+            let twisted = TransitionPlanner.plan(outgoing: outgoing, incoming: incoming,
+                                                 stems: .ready, config: absurd)
+            #expect(describe(shipped) == describe(twisted))
+            #expect(shipped.style.intent == nil)
+        }
+    }
+
+    // MARK: - 7. The intent-driven stem request
+
+    /// Two ordinary sung edges — ratio 1.00 on each side, which is over the
+    /// intent layer's 0.50 "sung" line and under the stem layer's 1.15
+    /// hot-spot gate. This is the field's `intent=blend (… both edges are sung
+    /// …)` / `stem=none` seam in miniature: before the request, the reason text
+    /// promised vocal management and the plan delivered a bare fader law.
+    private func sungBothSides() -> (TrackAnalysis, TrackAnalysis) {
+        (makeAnalysis(vocalActivity: flatVocal(240, level: 0.8)),
+         makeAnalysis(bpm: 130, vocalActivity: flatVocal(240, level: 0.8)))
+    }
+
+    @Test func bothEdgesSungWithStemsReadyRequestsAnExchange() {
+        let (a, b) = sungBothSides()
+        // The gap, first: neither edge clears the hot-spot gate, so the old
+        // rules name no technique even with a separator standing by.
+        let ungoverned = TransitionPlanner.plan(outgoing: a, incoming: b, stems: .ready)
+        #expect(ungoverned.style.stemTechnique == nil)
+
+        let requested = TransitionPlanner.plan(outgoing: a, incoming: b, stems: .ready,
+                                               config: intentOn)
+        #expect(requested.style.intent?.class == .blend)
+        #expect(requested.style.stemTechnique == .vocalExchange)
+        #expect(requested.style.intent?.reasons
+            .contains { $0.contains("vocalExchange requested") } == true)
+        // …and the class stops claiming to be yesterday's plan, because on this
+        // one branch it is not.
+        #expect(requested.style.intent?.reasons
+            .contains { $0.contains("field-for-field") } == false)
+    }
+
+    /// No separator, no promise. The class and the finding are unchanged — the
+    /// pair really is two singing edges — but the sentence now says so instead
+    /// of claiming a management that nothing performs, and the plan is
+    /// field-for-field the one the layer-off build makes.
+    @Test func bothEdgesSungWithoutStemsSaysUnmanaged() {
+        let (a, b) = sungBothSides()
+        let on = TransitionPlanner.plan(outgoing: a, incoming: b, config: intentOn)
+        #expect(on.style.intent?.class == .blend)
+        #expect(on.style.stemTechnique == nil)
+        #expect(on.style.intent?.reasons
+            .contains { $0.contains("no separator, unmanaged") } == true)
+        #expect(on.style.intent?.reasons
+            .contains { $0.contains("vocalExchange requested") } == false)
+        #expect(on.style.intent?.reasons
+            .contains { $0.contains("field-for-field") } == true)
+        #expect(describe(TransitionPlanner.plan(outgoing: a, incoming: b)) == describe(on))
+    }
+
+    /// One instrumental edge and the finding never fires, so neither does the
+    /// request: the stem layer is left to the 1.15 gate it always had.
+    @Test func oneInstrumentalEdgeChangesNothing() {
+        let a = makeAnalysis(vocalActivity: flatVocal(240, level: 0.8))
+        let b = makeAnalysis(bpm: 130, vocalActivity: edgesInstrumental(240))
+        let off = TransitionPlanner.plan(outgoing: a, incoming: b, stems: .ready)
+        let on = TransitionPlanner.plan(outgoing: a, incoming: b, stems: .ready,
+                                        config: intentOn)
+        #expect(on.style.intent?.class == .blend)
+        #expect(on.style.intent?.reasons
+            .contains { $0.contains("both edges are sung") } == false)
+        #expect(describe(off) == describe(on))
+    }
+
+    /// The request relaxes a threshold; it does not suspend the rest of the
+    /// stem layer. `stemMinOverlap` past the overlap and the pair falls back to
+    /// the whole-mix decision, request or no request.
+    @Test func theRequestStillObeysTheOtherStemPreconditions() {
+        let (a, b) = sungBothSides()
+        var strict = intentOn
+        strict.stemMinOverlap = 120
+        let planned = TransitionPlanner.plan(outgoing: a, incoming: b, stems: .ready,
+                                             config: strict)
+        #expect(planned.style.stemTechnique == nil)
+        // The sentence still tells the truth about what was asked for.
+        #expect(planned.style.intent?.reasons
+            .contains { $0.contains("vocalExchange requested") } == true)
+    }
+
+    /// The finding is one function, shared by the sentence and the request, so
+    /// it cannot say two different things — and it abstains rather than
+    /// asserting when a side has no usable vocal contour.
+    @Test func theSungFindingIsOneDefinition() {
+        let config = intentOn
+        let sung = MaterialProfile.wholeTrack(
+            makeAnalysis(vocalActivity: flatVocal(240, level: 0.8)), config: config)
+        let silent = MaterialProfile.wholeTrack(makeAnalysis(), config: config)
+        #expect(TransitionIntent.bothEdgesSung(sung, sung, config: config) != nil)
+        #expect(TransitionIntent.bothEdgesSung(sung, silent, config: config) == nil)
+        #expect(TransitionIntent.bothEdgesSung(silent, silent, config: config) == nil)
+        // …and it is the negation of the line rule 5 refuses to cut above.
+        #expect(config.intentInstrumentalEdgeRatio == 0.5)
+    }
+
     /// …and a pair the layer classifies `blend` gets the identical plan with it
     /// on. The default branch is not "close to" today, it is today.
     @Test func theBlendClassChangesNothing() {

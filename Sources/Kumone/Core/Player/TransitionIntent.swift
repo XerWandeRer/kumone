@@ -394,6 +394,7 @@ extension TransitionIntent {
         outgoing: TrackAnalysis, incoming: TrackAnalysis,
         outgoingEdge: MaterialProfile, incomingEdge: MaterialProfile,
         context: TransitionPlanner.PlanContext,
+        stems: StemAvailability = .none,
         config: TransitionPlanner.Config
     ) -> TransitionIntent {
         let grids = String(format: "grids %@/%@ (conf %.2f/%.2f)",
@@ -482,18 +483,65 @@ extension TransitionIntent {
         // --- 6. When in doubt, blend. The predev's first rule, and the only
         // branch here that changes nothing at all.
         var reasons = [grids]
-        if let outVocal = outgoingEdge.vocalRatio, let inVocal = incomingEdge.vocalRatio,
-           outVocal > config.intentInstrumentalEdgeRatio,
-           inVocal > config.intentInstrumentalEdgeRatio {
+        var requested = false
+        if let sung = bothEdgesSung(outgoingEdge, incomingEdge, config: config) {
+            requested = stems == .ready
+            // The sentence has to name what actually happens downstream. Before
+            // this branch existed the layer promised "a vocal-managed blend" and
+            // then, at `stems == .none` or behind the 1.15 hot-spot gate,
+            // managed nothing — the reader was told about a technique that was
+            // never asked for. So the promise now ends in whichever of the two
+            // things is true.
             reasons.append(String(format: "both edges are sung (vocal %.2f/%.2f) — "
-                                  + "a vocal-managed blend", outVocal, inVocal))
+                                  + "a vocal-managed blend, %@", sung.outgoing, sung.incoming,
+                                  stems == .ready
+                                      ? "vocalExchange requested"
+                                      : "no separator, unmanaged"))
         } else if !hardGrids {
             reasons.append("grids are not hard enough on both sides to cut on")
         } else {
             reasons.append("nothing here asks for a gesture")
         }
-        reasons.append("blend, field-for-field what this pair got before the intent layer")
+        // The closing line is the class's own claim about itself, and it stops
+        // being true the moment the layer asks for something. A requested
+        // exchange is the one branch of `blend` that is *not* field-for-field
+        // yesterday's plan, so it does not get to say it is.
+        reasons.append(requested
+                       ? "blend, with the vocal hand-over managed by the stem layer rather "
+                       + "than left to the fader"
+                       : "blend, field-for-field what this pair got before the intent layer")
         return TransitionIntent(.blend, reasons: reasons)
+    }
+
+    /// **The "both edges are sung" finding**, as one function so that the
+    /// sentence the layer prints and the stem technique the planner requests
+    /// cannot come from two different readings of the same two profiles.
+    ///
+    /// The threshold is `intentInstrumentalEdgeRatio` (0.5) and it is *not* a
+    /// new one: rule 5 refuses to cut unless both edges sit at or below it, so
+    /// "sung" here is exactly the negation of the "instrumental" the cut rule
+    /// already uses. Nil when either side has no usable vocal contour — an
+    /// abstention, never an assertion that nobody is singing.
+    ///
+    /// Note that this is a much weaker claim than the stem layer's own
+    /// `stemVocalActiveRatio` (1.15), and deliberately so. 1.15 asks "is this
+    /// window a vocal *hot spot* for this song" — an S1-era question, asked
+    /// when a stem technique had to justify a separation pass on a hunch. The
+    /// question a hand-over between two singing tracks actually poses is "is
+    /// anyone singing on either side of this seam", and an ordinary sung edge
+    /// answers yes at 1.0–1.1 while never clearing 1.15. That gap is what left
+    /// the field's three `intent=blend … both edges are sung` seams at
+    /// `stem=none`, with two lead vocals over a 20 s overlap and nothing but
+    /// the fader law between them.
+    static func bothEdgesSung(
+        _ outgoingEdge: MaterialProfile, _ incomingEdge: MaterialProfile,
+        config: TransitionPlanner.Config
+    ) -> (outgoing: Double, incoming: Double)? {
+        guard let out = outgoingEdge.vocalRatio, let incoming = incomingEdge.vocalRatio,
+              out > config.intentInstrumentalEdgeRatio,
+              incoming > config.intentInstrumentalEdgeRatio
+        else { return nil }
+        return (out, incoming)
     }
 
     /// Both sides quantized *and* confidently tracked — the precondition every

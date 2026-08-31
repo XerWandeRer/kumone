@@ -922,6 +922,12 @@ extension Audition {
             + "）且这一对很搭，就让出曲的清唱飘在入曲上（acapella over）。"
             + "两条都不成立就完全不用 stem。instrumental out 从不自动选（S1 盲听里一次没赢过），"
             + "只保留手动挑选。"
+            + String(format: "　还有一条来自意图层：意图判成 blend、两侧边缘都在唱（各自均值的 "
+                     + "%.2f 倍以上）、而且分离器就绪时，规划器会直接点名 vocal exchange —— "
+                     + "这条路上 %.2f 的“热点门槛”和 %.2f 的打架线都换成意图层自己的 %.2f 线，"
+                     + "因为普通的“有人在唱”本来就到不了 1.15。意图层关掉时这条完全不存在。",
+                     c.intentInstrumentalEdgeRatio, c.stemVocalActiveRatio,
+                     c.vocalClashRatio, c.intentInstrumentalEdgeRatio)
 
         guard d.stemsReady else {
             return ChainStep(
