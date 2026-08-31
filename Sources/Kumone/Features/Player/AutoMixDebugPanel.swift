@@ -313,6 +313,7 @@ struct AutoMixDebugPanel: View {
             overrideToggle("Disable dominant-deck blend", \.disableDominantDeckBlend)
             overrideToggle("Disable two-clock exchange", \.disableTwoClockExchange)
             overrideToggle("Transition score (cut / throw / tension cut / bed)", \.enableScore)
+            overrideToggle("Intent layer (material decides the family)", \.enableIntent)
             if model.overrides.enableScore {
                 DebugRow("score", "one template off the ladder its intent class allows;"
                          + " the live path still blends unless the segment arms")

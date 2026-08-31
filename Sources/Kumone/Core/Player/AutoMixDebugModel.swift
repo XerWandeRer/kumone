@@ -279,6 +279,16 @@ struct AutoMixOverrides: Equatable, Codable {
     /// On, a qualifying seam is offered a cut-on-one — performed only if the
     /// pre-rendered segment arms, because the live path never approximates one.
     var enableScore = false
+    /// **Intent layer (P3)** — material semantics decide which transition
+    /// family a pair is even offered (rock → restraint, club → cut culture,
+    /// default → blend). Off, an enabled score falls back to P1's raw rule —
+    /// "any hard grid gets a cut" — which is exactly the combination the
+    /// listening owner called 莫名其妙: gestures without the layer that gives
+    /// them meaning. False here so the neutral struct still mirrors
+    /// `Config.standard` (the invariant every override test pins); the
+    /// listening machine gets it turned on by `restoredOverrides`'s fresh
+    /// defaults, exactly like `enableScore`.
+    var enableIntent = false
     /// Not a planner knob: skips the stem pre-render entirely so the seam is
     /// carried by the live two-deck path — which is the *approximation* of a
     /// stem hand-over, and the thing an A/B wants to compare against.
@@ -294,6 +304,7 @@ struct AutoMixOverrides: Equatable, Codable {
         if disableDominantDeckBlend { names.append("noDominantDeck") }
         if disableTwoClockExchange { names.append("noTwoClock") }
         if enableScore { names.append("score") }
+        if enableIntent { names.append("intent") }
         if forceLivePath { names.append("forceLivePath") }
         return names
     }
@@ -309,6 +320,7 @@ struct AutoMixOverrides: Equatable, Codable {
     /// turned off. An A/B that plays the old take is worse than no A/B.
     func needsReArm(comparedTo other: AutoMixOverrides) -> Bool {
         forceLivePath != other.forceLivePath || enableScore != other.enableScore
+            || enableIntent != other.enableIntent
     }
 }
 
@@ -408,6 +420,7 @@ final class AutoMixDebugModel: ObservableObject {
             // to evaluate. Everything else starts off, as always.
             var fresh = AutoMixOverrides()
             fresh.enableScore = true
+            fresh.enableIntent = true
             return fresh
         }
         return stored
@@ -625,9 +638,10 @@ enum AutoMixDebugOverrides {
         if overrides.disableTempoRamp { config.tempoRampEnabled = false }
         if overrides.disableDominantDeckBlend { config.dominantDeckBlend = false }
         if overrides.disableTwoClockExchange { config.twoClockExchange = false }
-        // The only *enable*: `scoreEnabled` ships false, so a switch spelled as
-        // a disable would have nothing to disable.
+        // Enables: `scoreEnabled` and `intentEnabled` both ship false in
+        // `Config.standard`, so these switches are spelled as enables.
         if overrides.enableScore { config.scoreEnabled = true }
+        if overrides.enableIntent { config.intentEnabled = true }
         return config
     }
 }
